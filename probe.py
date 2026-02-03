@@ -123,7 +123,7 @@ class BZRNetProbe:
         ctrl_frame = ttk.Frame(frame)
         ctrl_frame.pack(fill="x", pady=5)
         ttk.Button(ctrl_frame, text="Extract & Analyze Hex", command=self.parse_logs).pack(side="left")
-        ttk.Button(ctrl_frame, text="Watch battlezone.log", command=self.toggle_log_watch).pack(side="left", padx=10)
+        ttk.Button(ctrl_frame, text="Watch bzlogger.txt", command=self.toggle_log_watch).pack(side="left", padx=10)
         self.log_status_lbl = ttk.Label(ctrl_frame, text="Not watching")
         self.log_status_lbl.pack(side="left")
         
@@ -146,13 +146,22 @@ class BZRNetProbe:
         flags_frame.pack(fill="x", padx=10, pady=5)
         
         self.flag_netpktlog = tk.BooleanVar()
-        self.flag_bzrnetlog = tk.BooleanVar()
+        self.val_netlog = tk.StringVar()
+        self.val_bzrnetlog = tk.StringVar()
         self.flag_console = tk.BooleanVar()
         self.flag_nointro = tk.BooleanVar()
         self.flag_ipdirect = tk.BooleanVar()
         
+        self.val_netlog.set("3")
+        self.val_bzrnetlog.set("3")
+        
         ttk.Checkbutton(flags_frame, text="/netpktlog (Packet Log)", variable=self.flag_netpktlog).grid(row=0, column=0, sticky="w", padx=5)
-        ttk.Checkbutton(flags_frame, text="/bzrnetlog (BZRNet Log)", variable=self.flag_bzrnetlog).grid(row=0, column=1, sticky="w", padx=5)
+        log_level_frame = ttk.Frame(flags_frame)
+        log_level_frame.grid(row=0, column=1, sticky="w", padx=5)
+        ttk.Label(log_level_frame, text="/netlog=").pack(side="left")
+        ttk.Entry(log_level_frame, textvariable=self.val_netlog, width=3).pack(side="left")
+        ttk.Label(log_level_frame, text="/bzrnetlog=").pack(side="left", padx=(5, 0))
+        ttk.Entry(log_level_frame, textvariable=self.val_bzrnetlog, width=3).pack(side="left")
         ttk.Checkbutton(flags_frame, text="/console (Enable Console)", variable=self.flag_console).grid(row=1, column=0, sticky="w", padx=5)
         ttk.Checkbutton(flags_frame, text="/nointro (Skip Intro)", variable=self.flag_nointro).grid(row=1, column=1, sticky="w", padx=5)
         ttk.Checkbutton(flags_frame, text="/ipdirect (Direct IP)", variable=self.flag_ipdirect).grid(row=2, column=0, sticky="w", padx=5)
@@ -187,7 +196,12 @@ class BZRNetProbe:
             
         cmd = [exe]
         if self.flag_netpktlog.get(): cmd.append("/netpktlog")
-        if self.flag_bzrnetlog.get(): cmd.append("/bzrnetlog")
+        netlog = self.val_netlog.get().strip()
+        if netlog:
+            cmd.append(f"/netlog={netlog}")
+        bzrnetlog = self.val_bzrnetlog.get().strip()
+        if bzrnetlog:
+            cmd.append(f"/bzrnetlog={bzrnetlog}")
         if self.flag_console.get(): cmd.append("/console")
         if self.flag_nointro.get(): cmd.append("/nointro")
         if self.flag_ipdirect.get(): cmd.append("/ipdirect")
@@ -307,19 +321,19 @@ class BZRNetProbe:
             self.log_status_lbl.config(text="Stopped watching")
             return
 
-        log_path = "battlezone.log"
+        log_path = "bzlogger.txt"
         exe_path = self.game_exe_var.get()
         if exe_path:
-            candidate = os.path.join(os.path.dirname(exe_path), "battlezone.log")
+            candidate = os.path.join(os.path.dirname(exe_path), "bzlogger.txt")
             if os.path.exists(candidate): log_path = candidate
         
         if not os.path.exists(log_path):
              docs = os.path.expanduser("~/Documents/My Games/Battlezone 98 Redux")
-             candidate = os.path.join(docs, "battlezone.log")
+             candidate = os.path.join(docs, "bzlogger.txt")
              if os.path.exists(candidate): log_path = candidate
         
         if not os.path.exists(log_path):
-            log_path = filedialog.askopenfilename(title="Select battlezone.log", filetypes=[("Log Files", "*.log"), ("All Files", "*.*")])
+            log_path = filedialog.askopenfilename(title="Select bzlogger.txt", filetypes=[("Log Files", "*.txt"), ("Log Files", "*.log"), ("All Files", "*.*")])
             
         if not log_path: return
         
