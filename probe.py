@@ -8,6 +8,7 @@ import struct
 import json
 import subprocess
 import os
+import time
 
 # Configuration derived from your logs
 DEFAULT_HOST = "68.183.35.188" # Rebellion BZRNet Server
@@ -22,6 +23,9 @@ class BZRNetProbe:
         self.server_socket = None
         self.server_thread = None
         self.is_server_running = False
+        self.last_client_addr = None
+        self.watching_log = False
+        self.log_file_path = None
         
         self.setup_ui()
         
@@ -97,6 +101,17 @@ class BZRNetProbe:
         self.server_log = scrolledtext.ScrolledText(log_frame, height=10, bg="black", fg="#00ffff", font=("Consolas", 10))
         self.server_log.pack(fill="both", expand=True)
         
+        # Reply Section
+        reply_frame = ttk.LabelFrame(self.server_tab, text="Reply to Client", padding=10)
+        reply_frame.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(reply_frame, text="Payload (Hex):").pack(side="left")
+        self.server_payload = ttk.Entry(reply_frame, width=50)
+        self.server_payload.pack(side="left", padx=5, fill="x", expand=True)
+        ttk.Button(reply_frame, text="Send Reply", command=self.send_server_reply).pack(side="left")
+        self.last_client_lbl = ttk.Label(reply_frame, text="No client yet")
+        self.last_client_lbl.pack(side="left", padx=10)
+
     def setup_parser_tab(self):
         frame = ttk.Frame(self.parser_tab, padding=10)
         frame.pack(fill="both", expand=True)
@@ -105,7 +120,12 @@ class BZRNetProbe:
         self.parser_input = scrolledtext.ScrolledText(frame, height=10)
         self.parser_input.pack(fill="x", pady=5)
         
-        ttk.Button(frame, text="Extract & Analyze Hex", command=self.parse_logs).pack(anchor="w")
+        ctrl_frame = ttk.Frame(frame)
+        ctrl_frame.pack(fill="x", pady=5)
+        ttk.Button(ctrl_frame, text="Extract & Analyze Hex", command=self.parse_logs).pack(side="left")
+        ttk.Button(ctrl_frame, text="Watch battlezone.log", command=self.toggle_log_watch).pack(side="left", padx=10)
+        self.log_status_lbl = ttk.Label(ctrl_frame, text="Not watching")
+        self.log_status_lbl.pack(side="left")
         
         ttk.Label(frame, text="Analysis Output:").pack(anchor="w", pady=(10,0))
         self.parser_output = scrolledtext.ScrolledText(frame, height=15, bg="#f0f0f0", font=("Consolas", 9))
@@ -239,10 +259,24 @@ class BZRNetProbe:
             except Exception as e:
                 self.log(self.server_log, f"Failed to start server: {e}")
 
+    def send_server_reply(self):
+        if not self.server_socket or not self.last_client_addr:
+            messagebox.showerror("Error", "No client connected or server not running.")
+            return
+        try:
+            hex_data = self.server_payload.get().replace(" ", "")
+            data = binascii.unhexlify(hex_data)
+            self.server_socket.sendto(data, self.last_client_addr)
+            self.log(self.server_log, f"TX -> {self.last_client_addr[0]}:{self.last_client_addr[1]} | {hex_data}")
+        except Exception as e:
+            self.log(self.server_log, f"Send Error: {e}")
+
     def server_loop(self):
         while self.is_server_running:
             try:
                 data, addr = self.server_socket.recvfrom(4096)
+                self.last_client_addr = addr
+                self.root.after(0, lambda: self.last_client_lbl.config(text=f"Client: {addr[0]}:{addr[1]}"))
                 hex_data = binascii.hexlify(data).decode()
                 self.log(self.server_log, f"RX <- {addr[0]}:{addr[1]} | {hex_data}")
                 
@@ -266,6 +300,56 @@ class BZRNetProbe:
                 if len(parts) >= 4: # Timestamp:Msg:IP:Port: Hex
                     hex_part = parts[-1].strip()
                     self.analyze_packet(hex_part, "Sent" if "Sent" in line else "Recv")
+
+    def toggle_log_watch(self):
+        if self.watching_log:
+            self.watching_log = False
+            self.log_status_lbl.config(text="Stopped watching")
+            return
+
+        log_path = "battlezone.log"
+        exe_path = self.game_exe_var.get()
+        if exe_path:
+            candidate = os.path.join(os.path.dirname(exe_path), "battlezone.log")
+            if os.path.exists(candidate): log_path = candidate
+        
+        if not os.path.exists(log_path):
+             docs = os.path.expanduser("~/Documents/My Games/Battlezone 98 Redux")
+             candidate = os.path.join(docs, "battlezone.log")
+             if os.path.exists(candidate): log_path = candidate
+        
+        if not os.path.exists(log_path):
+            log_path = filedialog.askopenfilename(title="Select battlezone.log", filetypes=[("Log Files", "*.log"), ("All Files", "*.*")])
+            
+        if not log_path: return
+        
+        self.log_file_path = log_path
+        self.watching_log = True
+        self.log_status_lbl.config(text=f"Watching: {os.path.basename(log_path)}")
+        threading.Thread(target=self.watch_log_loop, daemon=True).start()
+
+    def watch_log_loop(self):
+        try:
+            with open(self.log_file_path, "r") as f:
+                f.seek(0, 2)
+                while self.watching_log:
+                    line = f.readline()
+                    if not line:
+                        time.sleep(0.1); continue
+                    if "BZRNet" in line:
+                        self.root.after(0, lambda l=line: self.handle_live_log(l))
+        except Exception as e:
+            self.watching_log = False
+            self.root.after(0, lambda: self.log_status_lbl.config(text=f"Error: {e}"))
+
+    def handle_live_log(self, line):
+        self.parser_input.insert(tk.END, line)
+        self.parser_input.see(tk.END)
+        if "BZRNet P2P" in line:
+            parts = line.split(":")
+            if len(parts) >= 4:
+                hex_part = parts[-1].strip()
+                self.analyze_packet(hex_part, "Sent" if "Sent" in line else "Recv")
 
     def analyze_packet(self, hex_data, direction):
         try:
@@ -297,7 +381,12 @@ class BZRNetProbe:
                             analysis += f"  -> Field 3 (u32): {u3} (0x{u3:08x})\n"
                         except: pass
             
+            # ASCII Dump
+            ascii_dump = "".join([chr(b) if 32 <= b <= 126 else "." for b in data])
+            analysis += f"  ASCII: {ascii_dump}\n"
+            
             self.parser_output.insert(tk.END, analysis + "-"*40 + "\n")
+            self.parser_output.see(tk.END)
         except Exception as e:
             self.parser_output.insert(tk.END, f"Failed to parse {hex_data}: {e}\n")
 
