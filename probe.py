@@ -1,11 +1,13 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import socket
 import threading
 import datetime
 import binascii
 import struct
 import json
+import subprocess
+import os
 
 # Configuration derived from your logs
 DEFAULT_HOST = "68.183.35.188" # Rebellion BZRNet Server
@@ -30,14 +32,17 @@ class BZRNetProbe:
         self.client_tab = ttk.Frame(notebook)
         self.server_tab = ttk.Frame(notebook)
         self.parser_tab = ttk.Frame(notebook)
+        self.launcher_tab = ttk.Frame(notebook)
         
         notebook.add(self.client_tab, text="UDP Client (Probe)")
         notebook.add(self.server_tab, text="UDP Server (Listen)")
         notebook.add(self.parser_tab, text="Log Parser")
+        notebook.add(self.launcher_tab, text="Game Launcher")
         
         self.setup_client_tab()
         self.setup_server_tab()
         self.setup_parser_tab()
+        self.setup_launcher_tab()
         
     def setup_client_tab(self):
         frame = ttk.LabelFrame(self.client_tab, text="Send Packet", padding=10)
@@ -105,6 +110,79 @@ class BZRNetProbe:
         ttk.Label(frame, text="Analysis Output:").pack(anchor="w", pady=(10,0))
         self.parser_output = scrolledtext.ScrolledText(frame, height=15, bg="#f0f0f0", font=("Consolas", 9))
         self.parser_output.pack(fill="both", expand=True, pady=5)
+
+    def setup_launcher_tab(self):
+        frame = ttk.LabelFrame(self.launcher_tab, text="Launch Configuration", padding=10)
+        frame.pack(fill="x", padx=10, pady=5)
+        
+        # Executable
+        ttk.Label(frame, text="Game Executable:").grid(row=0, column=0, sticky="w")
+        self.game_exe_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.game_exe_var, width=50).grid(row=0, column=1, padx=5)
+        ttk.Button(frame, text="Browse", command=self.browse_exe).grid(row=0, column=2)
+        
+        # Flags
+        flags_frame = ttk.LabelFrame(self.launcher_tab, text="Startup Flags", padding=10)
+        flags_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.flag_netpktlog = tk.BooleanVar()
+        self.flag_bzrnetlog = tk.BooleanVar()
+        self.flag_console = tk.BooleanVar()
+        self.flag_nointro = tk.BooleanVar()
+        self.flag_ipdirect = tk.BooleanVar()
+        
+        ttk.Checkbutton(flags_frame, text="/netpktlog (Packet Log)", variable=self.flag_netpktlog).grid(row=0, column=0, sticky="w", padx=5)
+        ttk.Checkbutton(flags_frame, text="/bzrnetlog (BZRNet Log)", variable=self.flag_bzrnetlog).grid(row=0, column=1, sticky="w", padx=5)
+        ttk.Checkbutton(flags_frame, text="/console (Enable Console)", variable=self.flag_console).grid(row=1, column=0, sticky="w", padx=5)
+        ttk.Checkbutton(flags_frame, text="/nointro (Skip Intro)", variable=self.flag_nointro).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Checkbutton(flags_frame, text="/ipdirect (Direct IP)", variable=self.flag_ipdirect).grid(row=2, column=0, sticky="w", padx=5)
+        
+        # Server Redirection
+        net_frame = ttk.LabelFrame(self.launcher_tab, text="Network Redirection", padding=10)
+        net_frame.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(net_frame, text="/bzrserver=").grid(row=0, column=0, sticky="w")
+        self.launch_server_ip = ttk.Entry(net_frame, width=20)
+        self.launch_server_ip.grid(row=0, column=1, padx=5)
+        ttk.Label(net_frame, text="(Leave empty for default)").grid(row=0, column=2, sticky="w")
+        
+        ttk.Label(net_frame, text="/bzrnetport=").grid(row=1, column=0, sticky="w")
+        self.launch_server_port = ttk.Entry(net_frame, width=10)
+        self.launch_server_port.grid(row=1, column=1, padx=5)
+        
+        # Launch Button
+        btn_frame = ttk.Frame(self.launcher_tab, padding=10)
+        btn_frame.pack(fill="x")
+        ttk.Button(btn_frame, text="LAUNCH BATTLEZONE", command=self.launch_game).pack(fill="x", ipady=5)
+        
+    def browse_exe(self):
+        f = filedialog.askopenfilename(filetypes=[("Executables", "*.exe"), ("All Files", "*.*")])
+        if f: self.game_exe_var.set(f)
+        
+    def launch_game(self):
+        exe = self.game_exe_var.get()
+        if not exe or not os.path.exists(exe):
+            messagebox.showerror("Error", "Invalid Game Executable")
+            return
+            
+        cmd = [exe]
+        if self.flag_netpktlog.get(): cmd.append("/netpktlog")
+        if self.flag_bzrnetlog.get(): cmd.append("/bzrnetlog")
+        if self.flag_console.get(): cmd.append("/console")
+        if self.flag_nointro.get(): cmd.append("/nointro")
+        if self.flag_ipdirect.get(): cmd.append("/ipdirect")
+        
+        srv = self.launch_server_ip.get().strip()
+        if srv: cmd.append(f"/bzrserver={srv}")
+        
+        port = self.launch_server_port.get().strip()
+        if port: cmd.append(f"/bzrnetport={port}")
+        
+        try:
+            subprocess.Popen(cmd, cwd=os.path.dirname(exe))
+            # messagebox.showinfo("Success", f"Launched: {' '.join(cmd)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch: {e}")
 
     def log(self, widget, msg):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
