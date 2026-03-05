@@ -2,6 +2,138 @@
 
 This repository contains tools and documentation for reverse engineering the Battlezone 98 Redux server protocols (BZRNet). The goal is to develop a custom dedicated server to ensure multiplayer longevity.
 
+For operations and cutover notes, see `NOTES.md`.
+
+## New: MVP Dedicated Server (`server.py`)
+
+This repo now includes a runnable compatibility shim that emulates key BZRNet behavior:
+
+*   **WebSocket Lobby Service** on `:1337`
+*   **UDP P2P Handshake Shim** on `:1338`
+*   **Health/Status HTTP Endpoint** on `:8080` (`/health`, `/status`)
+*   **Persistent state snapshots** (lobby metadata) to JSON
+*   **Admin controls** (`--admin-key`, `--admin-ids`)
+
+### Implemented WebSocket Message Support
+
+The server currently handles:
+
+*   `Authorization` -> `OnAuthorization`
+*   `DoEnterLounge` -> `OnDoEnterLounge`
+*   `GetLobbyList` -> `OnGetLobbyList`
+*   `CreateLobby` -> `OnLobbyCreated`
+*   `DoJoinLobby` -> `OnLobbyJoined`
+*   `DoExitLobby` / `DoExitLounge` -> `OnDoExitLobby`
+*   `DoSendChat` -> `OnChatMessage`
+*   `SetPlayerData` -> `OnUserDataChanged`
+*   `SetLobbyData` / `DeleteLobbyData` -> `OnLobbyDataChanged`
+*   `LockLobby`, `SetLobbyMemberLimit`, `DoSetLobbyOwner`, `DoKickUser`
+*   `Ping` / `DoPing` -> `OnHeartbeat`
+*   `GetUserList` / `GetStatLog` / `GetFullLog`
+
+### Quick Start
+
+1.  Install dependencies:
+    ```bash
+    pip install -r requirements.txt
+    ```
+2.  Run the server:
+    ```bash
+    python server.py
+    ```
+3.  Optional verbose mode:
+    ```bash
+    python server.py --log-level DEBUG
+    ```
+4.  Optional smoke test (in another terminal while server is running):
+    ```bash
+    python smoke_test.py
+    ```
+
+Useful runtime options:
+
+```bash
+python server.py ^
+  --state-file data/server_state.json ^
+  --autosave-seconds 15 ^
+  --motd "Welcome to failover BZR server" ^
+  --admin-key "your-secret" ^
+  --admin-ids "S7656119...,U1234" ^
+  --retain-empty-lobbies
+```
+
+Default bind addresses:
+
+*   WebSocket: `ws://0.0.0.0:1337`
+*   UDP: `0.0.0.0:1338`
+*   Health: `http://127.0.0.1:8080/health`
+
+### Docker / Compose Deployment
+
+1.  Copy env template:
+    ```bash
+    copy .env.example .env
+    ```
+2.  Edit `.env` values.
+3.  Build and run:
+    ```bash
+    docker compose up -d --build
+    ```
+4.  Check health:
+    ```bash
+    python smoke_test.py --host 127.0.0.1
+    ```
+
+The compose stack mounts `./data` into the container so state survives restarts.
+
+### Persistence Behavior
+
+*   State file default: `data/server_state.json`
+*   Persisted: lobby metadata/settings, next lobby ID
+*   Not persisted: active websocket sessions
+*   On restart, restored lobbies are empty (`users={}`) and can be re-joined
+*   `--retain-empty-lobbies` keeps empty rooms so they can survive restart
+
+### Validate with Battlezone Lobby Monitor
+
+In your `Battlezone_LobbyMonitor` tool:
+
+1.  Game: **Battlezone 98 Redux**
+2.  Host: `127.0.0.1:1337`
+3.  Key: leave blank (for local test)
+4.  Click **Connect**
+
+Then test:
+
+*   Create lobby
+*   Join selected lobby from another monitor instance
+*   Send chat
+*   Leave lobby
+
+### Validate with Game Client
+
+Use these launch flags:
+
+```bash
+battlezone98redux.exe /netpktlog /netlog=3 /bzrnetlog=3 /bzrserver=127.0.0.1 /bzrnetport=1338
+```
+
+Notes:
+
+*   The game binary also contains a hardcoded WebSocket URL for BZRNet (`...:1337`), so DNS/hosts override may be needed for full end-to-end local redirection.
+*   The UDP shim currently focuses on handshake compatibility and iterative packet probing.
+
+### Preemptive Ops Checklist
+
+*   Open/forward ports:
+    *   TCP `1337` (WebSocket lobby)
+    *   UDP `1338` (P2P handshake/probe)
+    *   TCP `8080` (health endpoint; can be LAN-only)
+*   Set DNS/hosts failover for `battlezone98mp.webdev.rebellion.co.uk` to your server IP if official host is unavailable.
+*   Run periodic health checks against `http://<server>:8080/health`.
+*   Keep backups of `data/server_state.json`.
+*   Use `--admin-key` and keep it private.
+
 ## BZRNet Protocol Probe (`probe.py`)
 
 A Python/Tkinter utility included in this repo to assist with packet analysis and emulation.

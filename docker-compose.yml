@@ -1,0 +1,47 @@
+services:
+  bzr-dedicated:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bzr-dedicated
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${BZR_WS_PORT:-1337}:1337/tcp"
+      - "${BZR_UDP_PORT:-1338}:1338/udp"
+      - "${BZR_HEALTH_PORT:-8080}:8080/tcp"
+    volumes:
+      - ./data:/app/data
+    command:
+      - python
+      - server.py
+      - --ws-host
+      - 0.0.0.0
+      - --udp-host
+      - 0.0.0.0
+      - --health-host
+      - 0.0.0.0
+      - --health-port
+      - "8080"
+      - --state-file
+      - /app/data/server_state.json
+      - --autosave-seconds
+      - "${BZR_AUTOSAVE_SECONDS:-15}"
+      - --motd
+      - "${BZR_MOTD:-}"
+      - --admin-key
+      - "${BZR_ADMIN_KEY:-}"
+      - --admin-ids
+      - "${BZR_ADMIN_IDS:-}"
+      - --max-lobbies
+      - "${BZR_MAX_LOBBIES:-500}"
+      - --retain-empty-lobbies
+      - --log-level
+      - "${BZR_LOG_LEVEL:-INFO}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
