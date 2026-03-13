@@ -3,6 +3,7 @@
 This repository contains tools and documentation for reverse engineering the Battlezone 98 Redux server protocols (BZRNet). The goal is to develop a custom dedicated server to ensure multiplayer longevity.
 
 For operations and cutover notes, see `NOTES.md`.
+For the ANet-to-BZR comparison and the recommended community failover architecture, see `COMMUNITY_FAILOVER_PLAN.md`.
 
 ## New: MVP Dedicated Server (`server.py`)
 
@@ -13,6 +14,14 @@ This repo now includes a runnable compatibility shim that emulates key BZRNet be
 *   **Health/Status HTTP Endpoint** on `:8080` (`/health`, `/status`)
 *   **Persistent state snapshots** (lobby metadata) to JSON
 *   **Admin controls** (`--admin-key`, `--admin-ids`)
+
+Observed against the official service on March 13, 2026:
+
+*   The public host is `battlezone98mp.webdev.rebellion.co.uk`
+*   Clients establish a WebSocket session on TCP `1337`
+*   Clients perform a UDP probe / handshake on `68.183.35.188:1338`
+*   WebSocket `Authorization` includes `steamAppTicket`, `wanAddress`, and `lanAddresses`
+*   Lobby data returned by the service includes peer address metadata, which strongly suggests the actual match remains peer-to-peer once players connect
 
 ### Implemented WebSocket Message Support
 
@@ -122,6 +131,7 @@ Notes:
 
 *   The game binary also contains a hardcoded WebSocket URL for BZRNet (`...:1337`), so DNS/hosts override may be needed for full end-to-end local redirection.
 *   The UDP shim currently focuses on handshake compatibility and iterative packet probing.
+*   A community-hosted matchmaking replacement appears feasible for most cases, but relay-assisted NAT traversal is still an open gap for strict-NAT users.
 
 ### Preemptive Ops Checklist
 

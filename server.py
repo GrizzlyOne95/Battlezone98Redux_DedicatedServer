@@ -38,6 +38,7 @@ DEFAULT_HEALTH_HOST = "127.0.0.1"
 DEFAULT_HEALTH_PORT = 8080
 DEFAULT_STATE_FILE = "data/server_state.json"
 STATE_FORMAT_VERSION = 1
+MAX_STDOUT_HISTORY = 200
 
 DEFAULT_WHITELIST = {
     "list": [
@@ -110,6 +111,7 @@ class ServerState:
         self.state_file = Path(state_file).expanduser() if state_file else None
         self.admin_key = admin_key
         self.admin_ids = admin_ids or set()
+        self.stdout_history: list[str] = []
         self._dirty = False
 
     def allocate_lobby_id(self) -> int:
@@ -161,8 +163,16 @@ class ServerState:
             "activeUsers": len(self.sessions_by_user_id),
             "lobbyCount": len(self.lobbies),
             "nextLobbyId": self.next_lobby_id,
+            "stdoutHistoryCount": len(self.stdout_history),
             "stateDirty": self._dirty,
         }
+
+    def record_stdout_entry(self, level: str, message: str) -> str:
+        entry = f"[{utc_now_str()}] {str(level).upper()}: {message}"
+        self.stdout_history.append(entry)
+        if len(self.stdout_history) > MAX_STDOUT_HISTORY:
+            self.stdout_history = self.stdout_history[-MAX_STDOUT_HISTORY:]
+        return entry
 
     def mark_dirty(self) -> None:
         self._dirty = True
@@ -329,16 +339,61 @@ class BZRWebSocketServer:
             "kicksTotal": self.kicks_total,
         }
 
+    def build_stat_log(self) -> str:
+        lines = [
+            "BZR Community Failover Server",
+            f"time={utc_now_str()}",
+        ]
+        for key, value in self.state.metrics().items():
+            lines.append(f"state.{key}={value}")
+        for key, value in self.metrics().items():
+            lines.append(f"ws.{key}={value}")
+        lines.extend(
+            [
+                "compatibility.websocketLobby=true",
+                "compatibility.udpHandshakeShim=true",
+                "compatibility.directPeerSessionsExpected=true",
+                "compatibility.relayTransportImplemented=false",
+                "compatibility.steamTicketValidation=false",
+            ]
+        )
+        for lid, lobby in sorted(self.state.lobbies.items()):
+            lines.append(
+                "lobby."
+                + json.dumps(
+                    {
+                        "id": lid,
+                        "name": str(lobby.metadata.get("name", "")),
+                        "owner": lobby.owner,
+                        "users": len(lobby.users),
+                        "memberLimit": lobby.member_limit,
+                        "isLocked": lobby.is_locked,
+                        "isPrivate": lobby.is_private,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        return "\n".join(lines)
+
+    async def send_stdout(self, ws: Any, level: str, message: str) -> None:
+        entry = self.state.record_stdout_entry(level, message)
+        await self.send(
+            ws,
+            "OnStdoutLogEntry",
+            {
+                "time": utc_now_str(),
+                "level": level,
+                "message": message,
+                "txt": entry,
+            },
+        )
+
     async def send(self, ws: Any, msg_type: str, data: Any) -> None:
         payload = {"type": msg_type, "data": data}
         await ws.send(json.dumps(payload, separators=(",", ":")))
 
     async def send_error(self, ws: Any, message: str) -> None:
-        await self.send(
-            ws,
-            "OnStdoutLogEntry",
-            {"time": utc_now_str(), "level": "error", "message": message},
-        )
+        await self.send_stdout(ws, "error", message)
 
     async def broadcast_all(self, msg_type: str, data: Any) -> None:
         if not self.state.sessions_by_ws:
@@ -413,6 +468,7 @@ class BZRWebSocketServer:
         if session.user_id in lobby.users:
             del lobby.users[session.user_id]
             self.state.mark_dirty()
+            self.state.record_stdout_entry("info", f"{session.name} left lobby {lid}")
             await self.broadcast_all(
                 "OnLobbyMemberListChanged",
                 {
@@ -472,6 +528,10 @@ class BZRWebSocketServer:
         self.state.sessions_by_ws[ws] = session
         self.state.sessions_by_user_id[user_id] = session
         self.auth_total += 1
+        self.state.record_stdout_entry(
+            "info",
+            f"Authorized {session.user_id} ({session.name}) via {session.authtype}",
+        )
 
         await self.send(
             ws,
@@ -563,6 +623,7 @@ class BZRWebSocketServer:
         session.in_lounge = False
         self.lobbies_created_total += 1
         self.state.mark_dirty()
+        self.state.record_stdout_entry("info", f"Created lobby {lid} owner={session.user_id} name={name}")
 
         await self.send(session.ws, "OnLobbyCreated", {"success": True, "id": lid, "time": utc_now_str()})
         await self.push_lobby_changed(lobby)
@@ -607,6 +668,7 @@ class BZRWebSocketServer:
             session.in_lounge = False
             self.lobbies_joined_total += 1
             self.state.mark_dirty()
+            self.state.record_stdout_entry("info", f"{session.user_id} joined lobby {lid}")
 
             await self.broadcast_all(
                 "OnLobbyMemberListChanged",
@@ -636,6 +698,7 @@ class BZRWebSocketServer:
             "lobbyId": lid,
             "time": utc_now_str(),
         }
+        self.state.record_stdout_entry("info", f"Chat from {session.user_id} in lobby {lid}: {text}")
 
         # Support simple /t targetName message style whisper.
         if text.lower().startswith("/t "):
@@ -725,11 +788,8 @@ class BZRWebSocketServer:
             return
         self.kicks_total += 1
         await self.remove_from_lobby(target_session, send_exit_ack=True)
-        await self.send(
-            target_session.ws,
-            "OnStdoutLogEntry",
-            {"time": utc_now_str(), "level": "warn", "message": "You were kicked from the lobby"},
-        )
+        self.state.record_stdout_entry("warn", f"{target_id} was kicked from lobby {lid} by {session.user_id}")
+        await self.send_stdout(target_session.ws, "warn", "You were kicked from the lobby")
 
     async def route_message(self, ws: Any, raw_message: str) -> None:
         try:
@@ -864,23 +924,55 @@ class BZRWebSocketServer:
             return
 
         if msg_type == "GetStatLog":
-            await self.send(ws, "OnGetStatLog", {"entries": [], "generatedAt": utc_now_str()})
+            await self.send(
+                ws,
+                "OnGetStatLog",
+                {
+                    "entries": [],
+                    "generatedAt": utc_now_str(),
+                    "stats": self.build_stat_log(),
+                },
+            )
             return
 
         if msg_type == "GetFullLog":
-            await self.send(ws, "OnGetFullLog", {"entries": [], "generatedAt": utc_now_str()})
+            await self.send(
+                ws,
+                "OnGetFullLog",
+                {
+                    "entries": list(self.state.stdout_history),
+                    "generatedAt": utc_now_str(),
+                    "stdout": {"history": list(self.state.stdout_history)},
+                },
+            )
+            return
+
+        if msg_type == "SetRelay":
+            requested = bool(content.get("toggle")) if isinstance(content, dict) else bool(content)
+            if requested:
+                self.state.record_stdout_entry(
+                    "warn",
+                    "Relay enable requested, but packet relay is not implemented in community failover mode",
+                )
+            await self.send(
+                ws,
+                "OnEnableRelayChanged",
+                {"enabled": False, "requested": requested, "success": False},
+            )
+            await self.send(
+                ws,
+                "OnRelayUpdated",
+                {"enabled": False, "requested": requested, "success": False},
+            )
+            return
+
+        if msg_type == "SetTest":
+            enabled = bool(content.get("toggle")) if isinstance(content, dict) else bool(content)
+            await self.send_stdout(ws, "info", f"Test mode request ignored; requested={enabled}")
             return
 
         # Keep unknown messages non-fatal for compatibility.
-        await self.send(
-            ws,
-            "OnStdoutLogEntry",
-            {
-                "time": utc_now_str(),
-                "level": "info",
-                "message": f"Unhandled message type: {msg_type}",
-            },
-        )
+        await self.send_stdout(ws, "info", f"Unhandled message type: {msg_type}")
 
     async def unregister(self, ws: Any) -> None:
         session = self.state.sessions_by_ws.pop(ws, None)
@@ -891,6 +983,7 @@ class BZRWebSocketServer:
             await self.remove_from_lobby(session, send_exit_ack=False)
         finally:
             self.state.sessions_by_user_id.pop(session.user_id, None)
+            self.state.record_stdout_entry("info", f"Disconnected {session.user_id} ({session.name})")
             self.log.info("Disconnected user_id=%s name=%s", session.user_id, session.name)
 
     async def handler(self, ws: Any) -> None:
@@ -921,6 +1014,36 @@ def _http_json(status_code: int, payload: dict[str, Any]) -> bytes:
         "",
     ]
     return "\r\n".join(headers).encode("utf-8") + body
+
+
+def build_status_payload(
+    *,
+    state: ServerState,
+    ws_server: BZRWebSocketServer,
+    udp_protocol: BZRUDPProtocol,
+    started_monotonic: float,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "time": utc_now_str(),
+        "uptimeSeconds": int(time.monotonic() - started_monotonic),
+        "state": state.metrics(),
+        "websocket": ws_server.metrics(),
+        "udp": {
+            "packetsRxTotal": udp_protocol.rx_count,
+            "packetsTxTotal": udp_protocol.tx_count,
+        },
+        "compatibility": {
+            "observedOfficialHost": "battlezone98mp.webdev.rebellion.co.uk",
+            "websocketLobby": True,
+            "udpHandshakeShim": True,
+            "directPeerSessionsExpected": True,
+            "relayControlMessages": True,
+            "relayTransportImplemented": False,
+            "steamTicketValidation": False,
+            "adminLogPayloadCompatibility": True,
+        },
+    }
 
 
 async def serve_health_http(
@@ -958,17 +1081,12 @@ async def serve_health_http(
             await writer.drain()
             return
 
-        payload = {
-            "ok": True,
-            "time": utc_now_str(),
-            "uptimeSeconds": int(time.monotonic() - started_monotonic),
-            "state": state.metrics(),
-            "websocket": ws_server.metrics(),
-            "udp": {
-                "packetsRxTotal": udp_protocol.rx_count,
-                "packetsTxTotal": udp_protocol.tx_count,
-            },
-        }
+        payload = build_status_payload(
+            state=state,
+            ws_server=ws_server,
+            udp_protocol=udp_protocol,
+            started_monotonic=started_monotonic,
+        )
         writer.write(_http_json(200, payload))
         await writer.drain()
     except Exception:

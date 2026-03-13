@@ -64,6 +64,27 @@ async def ws_smoke(host: str, port: int, timeout: float) -> tuple[bool, str]:
         if "OnAuthorization" not in first:
             return False, f"Expected OnAuthorization, got {first}"
 
+        await ws.send(json.dumps({"type": "GetStatLog", "content": True}))
+        stat_seen = False
+        for _ in range(4):
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+            if msg.get("type") == "OnGetStatLog":
+                stat_seen = isinstance(msg.get("data", {}).get("stats"), str)
+                break
+        if not stat_seen:
+            return False, "Did not receive compatible OnGetStatLog payload"
+
+        await ws.send(json.dumps({"type": "GetFullLog", "content": True}))
+        log_seen = False
+        for _ in range(4):
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+            if msg.get("type") == "OnGetFullLog":
+                stdout = msg.get("data", {}).get("stdout", {})
+                log_seen = isinstance(stdout.get("history"), list)
+                break
+        if not log_seen:
+            return False, "Did not receive compatible OnGetFullLog payload"
+
         await ws.send(json.dumps({"type": "DoEnterLounge", "content": True}))
         lounge = await recv_types(ws, 2, timeout)
         if "OnDoEnterLounge" not in lounge:
