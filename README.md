@@ -12,6 +12,7 @@ This repo now includes a runnable compatibility shim that emulates key BZRNet be
 *   **WebSocket Lobby Service** on `:1337`
 *   **UDP P2P Handshake Shim** on `:1338`
 *   **Health/Status HTTP Endpoint** on `:8080` (`/health`, `/status`)
+*   **Protocol/Capture Endpoints** on `:8080` (`/protocol`, `/captures`)
 *   **Persistent state snapshots** (lobby metadata) to JSON
 *   **Admin controls** (`--admin-key`, `--admin-ids`)
 
@@ -29,16 +30,21 @@ The server currently handles:
 
 *   `Authorization` -> `OnAuthorization`
 *   `DoEnterLounge` -> `OnDoEnterLounge`
+*   `DoExitLounge` -> `OnDoExitLounge`
 *   `GetLobbyList` -> `OnGetLobbyList`
 *   `CreateLobby` -> `OnLobbyCreated`
+*   `CreateGame` -> `OnLobbyCreated`
 *   `DoJoinLobby` -> `OnLobbyJoined`
 *   `DoExitLobby` / `DoExitLounge` -> `OnDoExitLobby`
 *   `DoSendChat` -> `OnChatMessage`
 *   `SetPlayerData` -> `OnUserDataChanged`
 *   `SetLobbyData` / `DeleteLobbyData` -> `OnLobbyDataChanged`
+*   `DoUpdateWAN` / `DoUpdateLAN` -> `OnWANUpdated` / `OnLANUpdated`
+*   `DoP2PConnect` / `DoP2PRoute` -> `OnLobbyMemberP2PConnect`
 *   `LockLobby`, `SetLobbyMemberLimit`, `DoSetLobbyOwner`, `DoKickUser`
 *   `Ping` / `DoPing` -> `OnHeartbeat`
-*   `GetUserList` / `GetStatLog` / `GetFullLog`
+*   `GetUserList` / `GetStatLog` / `GetFullLog` / `GetLogLevel`
+*   admin-side `SetLogLevel`, `SetRelay`, `SetTest`, `AddRegex`, `RemoveRegex`, `TraceData`
 
 ### Quick Start
 
@@ -76,6 +82,8 @@ Default bind addresses:
 *   WebSocket: `ws://0.0.0.0:1337`
 *   UDP: `0.0.0.0:1338`
 *   Health: `http://127.0.0.1:8080/health`
+*   Protocol: `http://127.0.0.1:8080/protocol`
+*   Captures: `http://127.0.0.1:8080/captures`
 
 ### Docker / Compose Deployment
 
@@ -119,6 +127,35 @@ Then test:
 *   Send chat
 *   Leave lobby
 
+### Validate with Official Admin Page Compatibility
+
+The official service exposes an admin UI at `http://battlezone98mp.webdev.rebellion.co.uk:1337/`
+that loads `scripts/bzadmin.js` and related assets. That JS expects:
+
+*   `Authorization`
+*   `DoEnterLounge`
+*   `GetStatLog`
+*   `OnAuthorization`
+*   `OnLobbyListChanged`
+*   `OnLobbyChanged`
+*   `OnLobbyRemoved`
+*   `OnGetLogLevel`
+*   `OnGetUserList`
+*   `OnWhitelistUpdated`
+*   `OnRelayUpdated`
+*   `OnEnableRelayChanged`
+*   `OnGetFullLog`
+*   `OnStdoutLogEntry`
+*   `OnGetStatLog`
+*   `SetLogLevel`
+*   `SetRelay`
+*   `SetTest`
+*   `AddRegex`
+*   `RemoveRegex`
+
+The current server now implements compatibility stubs or responses for that
+admin surface as well.
+
 ### Validate with Game Client
 
 Use these launch flags:
@@ -141,6 +178,8 @@ Notes:
     *   TCP `8080` (health endpoint; can be LAN-only)
 *   Set DNS/hosts failover for `battlezone98mp.webdev.rebellion.co.uk` to your server IP if official host is unavailable.
 *   Run periodic health checks against `http://<server>:8080/health`.
+*   Use `http://<server>:8080/protocol` to inspect supported message surface.
+*   Use `http://<server>:8080/captures` to inspect recent WS/UDP traffic summaries.
 *   Keep backups of `data/server_state.json`.
 *   Use `--admin-key` and keep it private.
 

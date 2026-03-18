@@ -39,6 +39,7 @@ DEFAULT_HEALTH_PORT = 8080
 DEFAULT_STATE_FILE = "data/server_state.json"
 STATE_FORMAT_VERSION = 1
 MAX_STDOUT_HISTORY = 200
+MAX_PROTOCOL_HISTORY = 400
 
 DEFAULT_WHITELIST = {
     "list": [
@@ -59,9 +60,81 @@ DEFAULT_WHITELIST = {
     "minor": 0,
 }
 
+SUPPORTED_CLIENT_MESSAGES = [
+    "Authorization",
+    "CreateGame",
+    "CreateLobby",
+    "DeleteLobbyData",
+    "DoEnterLounge",
+    "DoExitLobby",
+    "DoExitLounge",
+    "DoJoinLobby",
+    "DoKickUser",
+    "DoPing",
+    "DoP2PConnect",
+    "DoP2PRoute",
+    "DoSendChat",
+    "DoSetLobbyOwner",
+    "DoUpdateLAN",
+    "DoUpdateWAN",
+    "GetFullLog",
+    "GetLobbyList",
+    "GetStatLog",
+    "GetUserList",
+    "LockLobby",
+    "Ping",
+    "SetLobbyData",
+    "SetLobbyMemberLimit",
+    "SetPlayerData",
+    "SetRelay",
+    "SetTest",
+]
+
+SUPPORTED_SERVER_MESSAGES = [
+    "OnAuthorization",
+    "OnChatMessage",
+    "OnDoEnterLounge",
+    "OnDoExitLobby",
+    "OnDoExitLounge",
+    "OnEnableRelayChanged",
+    "OnGetFullLog",
+    "OnGetLobbyList",
+    "OnGetStatLog",
+    "OnGetUserList",
+    "OnHeartbeat",
+    "OnLANUpdated",
+    "OnLobbyChanged",
+    "OnLobbyCreated",
+    "OnLobbyDataChanged",
+    "OnLobbyJoined",
+    "OnLobbyList",
+    "OnLobbyListChanged",
+    "OnLobbyMemberListChanged",
+    "OnLobbyMemberP2PConnect",
+    "OnLobbyRemoved",
+    "OnRelayUpdated",
+    "OnStdoutLogEntry",
+    "OnUserDataChanged",
+    "OnWANUpdated",
+    "OnWhitelistUpdated",
+]
+
 
 def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def compact_preview(value: Any, *, limit: int = 240) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        text = bytes(value).hex()
+    else:
+        try:
+            text = json.dumps(value, separators=(",", ":"), sort_keys=True)
+        except Exception:
+            text = str(value)
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
 
 
 @dataclass
@@ -111,7 +184,12 @@ class ServerState:
         self.state_file = Path(state_file).expanduser() if state_file else None
         self.admin_key = admin_key
         self.admin_ids = admin_ids or set()
+        self.whitelist = json.loads(json.dumps(DEFAULT_WHITELIST))
+        self.log_level_setting = 1
+        self.relay_requested = False
+        self.test_mode = False
         self.stdout_history: list[str] = []
+        self.protocol_history: list[dict[str, Any]] = []
         self._dirty = False
 
     def allocate_lobby_id(self) -> int:
@@ -123,16 +201,24 @@ class ServerState:
     def build_user_snapshot(self, s: UserSession) -> dict[str, Any]:
         snapshot = {
             "id": s.user_id,
+            "userId": s.user_id,
             "name": s.name,
+            "realname": s.name,
             "playerName": s.player_name,
             "authType": s.authtype,
             "clientVersion": s.client_version,
+            "inLounge": s.in_lounge,
+            "isInLounge": s.in_lounge,
+            "isAdmin": s.is_admin,
+            "lobby": -1 if s.current_lobby_id is None else s.current_lobby_id,
         }
         if s.wan_address:
+            snapshot["wanAddress"] = s.wan_address
             snapshot["ipAddress"] = s.wan_address.split(":")[0]
         if s.lan_addresses:
-            snapshot["lanAddresses"] = s.lan_addresses
+            snapshot["lanAddresses"] = list(s.lan_addresses)
         if s.extra_data:
+            snapshot["metadata"] = dict(s.extra_data)
             snapshot.update(s.extra_data)
         return snapshot
 
@@ -164,6 +250,11 @@ class ServerState:
             "lobbyCount": len(self.lobbies),
             "nextLobbyId": self.next_lobby_id,
             "stdoutHistoryCount": len(self.stdout_history),
+            "protocolHistoryCount": len(self.protocol_history),
+            "whitelistEntries": len(self.whitelist.get("list", [])),
+            "relayRequested": self.relay_requested,
+            "testMode": self.test_mode,
+            "logLevelSetting": self.log_level_setting,
             "stateDirty": self._dirty,
         }
 
@@ -172,6 +263,28 @@ class ServerState:
         self.stdout_history.append(entry)
         if len(self.stdout_history) > MAX_STDOUT_HISTORY:
             self.stdout_history = self.stdout_history[-MAX_STDOUT_HISTORY:]
+        return entry
+
+    def record_protocol_event(
+        self,
+        *,
+        channel: str,
+        direction: str,
+        peer: str,
+        msg_type: str,
+        payload: Any,
+    ) -> dict[str, Any]:
+        entry = {
+            "time": utc_now_str(),
+            "channel": channel,
+            "direction": direction,
+            "peer": peer,
+            "type": msg_type,
+            "preview": compact_preview(payload),
+        }
+        self.protocol_history.append(entry)
+        if len(self.protocol_history) > MAX_PROTOCOL_HISTORY:
+            self.protocol_history = self.protocol_history[-MAX_PROTOCOL_HISTORY:]
         return entry
 
     def mark_dirty(self) -> None:
@@ -196,6 +309,16 @@ class ServerState:
                 return
 
             self.next_lobby_id = int(payload.get("nextLobbyId", self.next_lobby_id))
+            whitelist = payload.get("whitelist")
+            if isinstance(whitelist, dict) and isinstance(whitelist.get("list"), list):
+                self.whitelist = {
+                    "list": [str(x) for x in whitelist.get("list", []) if isinstance(x, str)],
+                    "major": int(whitelist.get("major", DEFAULT_WHITELIST["major"])),
+                    "minor": int(whitelist.get("minor", DEFAULT_WHITELIST["minor"])),
+                }
+            self.log_level_setting = int(payload.get("logLevelSetting", self.log_level_setting))
+            self.relay_requested = bool(payload.get("relayRequested", self.relay_requested))
+            self.test_mode = bool(payload.get("testMode", self.test_mode))
             self.lobbies = {}
             for raw_lobby in payload.get("lobbies", []):
                 try:
@@ -246,6 +369,10 @@ class ServerState:
             "version": STATE_FORMAT_VERSION,
             "savedAt": utc_now_str(),
             "nextLobbyId": self.next_lobby_id,
+            "whitelist": self.whitelist,
+            "logLevelSetting": self.log_level_setting,
+            "relayRequested": self.relay_requested,
+            "testMode": self.test_mode,
             "lobbies": persisted_lobbies,
         }
 
@@ -281,12 +408,26 @@ class BZRUDPProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         self.rx_count += 1
         hex_data = data.hex()
+        self.state.record_protocol_event(
+            channel="udp",
+            direction="rx",
+            peer=f"{addr[0]}:{addr[1]}",
+            msg_type="udp_datagram",
+            payload=hex_data,
+        )
         self.logger.debug("UDP RX <- %s:%d | %s", addr[0], addr[1], hex_data)
 
         reply = self._build_reply(data)
         if reply and self.transport:
             self.transport.sendto(reply, addr)
             self.tx_count += 1
+            self.state.record_protocol_event(
+                channel="udp",
+                direction="tx",
+                peer=f"{addr[0]}:{addr[1]}",
+                msg_type="udp_datagram",
+                payload=reply.hex(),
+            )
             self.logger.debug("UDP TX -> %s:%d | %s", addr[0], addr[1], reply.hex())
 
     @staticmethod
@@ -375,6 +516,140 @@ class BZRWebSocketServer:
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _ws_peer(ws: Any) -> str:
+        peer = getattr(ws, "remote_address", None)
+        if isinstance(peer, tuple) and len(peer) >= 2:
+            return f"{peer[0]}:{peer[1]}"
+        return "unknown"
+
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @staticmethod
+    def _dedupe_strings(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for raw in values:
+            text = str(raw).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            ordered.append(text)
+        return ordered
+
+    def _extract_wan_address(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, dict):
+            for key in ("wanAddress", "address", "value", "ipAddress"):
+                value = content.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    def _extract_lan_addresses(self, content: Any) -> list[str]:
+        if isinstance(content, str):
+            return self._dedupe_strings([content])
+        if isinstance(content, list):
+            return self._dedupe_strings([str(x) for x in content if isinstance(x, str)])
+        if isinstance(content, dict):
+            if isinstance(content.get("lanAddresses"), list):
+                return self._dedupe_strings([str(x) for x in content.get("lanAddresses", []) if isinstance(x, str)])
+            for key in ("lanAddress", "address", "value"):
+                value = content.get(key)
+                if isinstance(value, str):
+                    return self._dedupe_strings([value])
+        return []
+
+    def _extract_target_user_id(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, dict):
+            for key in ("id", "userId", "targetId", "member", "peerId", "friendID"):
+                value = content.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+        return ""
+
+    def _build_user_change_payload(self, session: UserSession, key: str, value: Any) -> dict[str, Any]:
+        snapshot = self.state.build_user_snapshot(session)
+        return {
+            "type": "OnUserDataChanged",
+            "time": utc_now_str(),
+            "success": True,
+            "id": session.user_id,
+            "userId": session.user_id,
+            "member": session.name,
+            "memberName": session.name,
+            "key": key,
+            "value": value,
+            "changedLobby": session.current_lobby_id,
+            "user": snapshot,
+            "users": {session.user_id: snapshot},
+        }
+
+    def _build_lobby_data_payload(
+        self,
+        lobby: LobbyState,
+        *,
+        key: str,
+        value: Any = None,
+        deleted: bool = False,
+    ) -> dict[str, Any]:
+        lobby_blob = self.state.serialize_lobby(lobby)
+        payload = {
+            "type": "OnLobbyDataChanged",
+            "time": utc_now_str(),
+            "success": True,
+            "id": lobby.lobby_id,
+            "lobbyId": lobby.lobby_id,
+            "changedLobby": lobby.lobby_id,
+            "key": key,
+            "lobby": lobby_blob,
+            "lobbies": {str(lobby.lobby_id): lobby_blob},
+        }
+        if deleted:
+            payload["deleted"] = True
+        else:
+            payload["value"] = value
+        return payload
+
+    def _build_address_payload(self, session: UserSession, *, message_type: str) -> dict[str, Any]:
+        snapshot = self.state.build_user_snapshot(session)
+        payload = {
+            "type": message_type,
+            "time": utc_now_str(),
+            "success": True,
+            "id": session.user_id,
+            "userId": session.user_id,
+            "member": session.name,
+            "memberName": session.name,
+            "changedLobby": session.current_lobby_id,
+            "user": snapshot,
+            "users": {session.user_id: snapshot},
+        }
+        if message_type == "OnWANUpdated":
+            payload["wanAddress"] = session.wan_address
+        else:
+            payload["lanAddresses"] = list(session.lan_addresses)
+        return payload
+
+    async def _broadcast_session_addresses(self, session: UserSession) -> None:
+        if session.wan_address:
+            await self.broadcast_all("OnWANUpdated", self._build_address_payload(session, message_type="OnWANUpdated"))
+        if session.lan_addresses:
+            await self.broadcast_all("OnLANUpdated", self._build_address_payload(session, message_type="OnLANUpdated"))
+
     async def send_stdout(self, ws: Any, level: str, message: str) -> None:
         entry = self.state.record_stdout_entry(level, message)
         await self.send(
@@ -390,6 +665,13 @@ class BZRWebSocketServer:
 
     async def send(self, ws: Any, msg_type: str, data: Any) -> None:
         payload = {"type": msg_type, "data": data}
+        self.state.record_protocol_event(
+            channel="ws",
+            direction="tx",
+            peer=self._ws_peer(ws),
+            msg_type=msg_type,
+            payload=data,
+        )
         await ws.send(json.dumps(payload, separators=(",", ":")))
 
     async def send_error(self, ws: Any, message: str) -> None:
@@ -399,7 +681,16 @@ class BZRWebSocketServer:
         if not self.state.sessions_by_ws:
             return
         payload = json.dumps({"type": msg_type, "data": data}, separators=(",", ":"))
-        coros = [session.ws.send(payload) for session in self.state.sessions_by_ws.values()]
+        coros = []
+        for session in self.state.sessions_by_ws.values():
+            self.state.record_protocol_event(
+                channel="ws",
+                direction="tx",
+                peer=self._ws_peer(session.ws),
+                msg_type=msg_type,
+                payload=data,
+            )
+            coros.append(session.ws.send(payload))
         await asyncio.gather(*coros, return_exceptions=True)
 
     async def broadcast_lobby(self, lobby: LobbyState, msg_type: str, data: Any) -> None:
@@ -408,6 +699,13 @@ class BZRWebSocketServer:
         for uid in lobby.users:
             session = self.state.sessions_by_user_id.get(uid)
             if session and session.ws:
+                self.state.record_protocol_event(
+                    channel="ws",
+                    direction="tx",
+                    peer=self._ws_peer(session.ws),
+                    msg_type=msg_type,
+                    payload=data,
+                )
                 targets.append(session.ws.send(payload))
         if targets:
             await asyncio.gather(*targets, return_exceptions=True)
@@ -445,16 +743,22 @@ class BZRWebSocketServer:
             return "~chat~pub~~MyLobby"
         return raw_name if raw_name.startswith("~chat~pub~~") else f"~chat~pub~~{raw_name}"
 
+    def _normalize_game_name(self, raw_name: str) -> str:
+        if not raw_name:
+            return "~game~pub~~MyGame"
+        return raw_name if raw_name.startswith("~game~pub~~") else f"~game~pub~~{raw_name}"
+
     async def remove_from_lobby(
         self,
         session: UserSession,
         *,
         send_exit_ack: bool = False,
+        ack_type: str = "OnDoExitLobby",
     ) -> None:
         lid = session.current_lobby_id
         if lid is None:
             if send_exit_ack:
-                await self.send(session.ws, "OnDoExitLobby", {"success": False, "reason": "Not in lobby"})
+                await self.send(session.ws, ack_type, {"success": False, "reason": "Not in lobby"})
             return
 
         lobby = self.state.lobbies.get(lid)
@@ -462,7 +766,7 @@ class BZRWebSocketServer:
         session.in_lounge = True
         if not lobby:
             if send_exit_ack:
-                await self.send(session.ws, "OnDoExitLobby", {"success": True, "id": lid})
+                await self.send(session.ws, ack_type, {"success": True, "id": lid})
             return
 
         if session.user_id in lobby.users:
@@ -475,7 +779,10 @@ class BZRWebSocketServer:
                     "lobbyId": lid,
                     "id": session.user_id,
                     "member": session.name,
+                    "memberId": session.user_id,
                     "removed": True,
+                    "user": self.state.build_user_snapshot(session),
+                    "users": {session.user_id: self.state.build_user_snapshot(session)},
                 },
             )
 
@@ -495,7 +802,7 @@ class BZRWebSocketServer:
             await self.push_lobby_changed(lobby)
 
         if send_exit_ack:
-            await self.send(session.ws, "OnDoExitLobby", {"success": True, "id": lid})
+            await self.send(session.ws, ack_type, {"success": True, "id": lid})
         await self.push_full_lobby_list()
 
     async def handle_authorization(self, ws: Any, content: dict[str, Any]) -> None:
@@ -541,13 +848,20 @@ class BZRWebSocketServer:
                 "time": utc_now_str(),
                 "success": True,
                 "id": session.user_id,
+                "userId": session.user_id,
+                "member": session.name,
                 "name": session.name,
+                "playerName": session.player_name,
+                "realname": session.name,
+                "authType": session.authtype,
                 "isAdmin": session.is_admin,
+                "isBB": False,
                 "isAuth": True,
                 "isInLounge": session.in_lounge,
                 "wanAddress": session.wan_address,
                 "clientVersion": session.client_version,
-                "lanAddresses": session.lan_addresses,
+                "lanAddresses": list(session.lan_addresses),
+                "user": self.state.build_user_snapshot(session),
             },
         )
         await self.send(
@@ -557,7 +871,7 @@ class BZRWebSocketServer:
                 "type": "OnWhitelistUpdated",
                 "time": utc_now_str(),
                 "success": True,
-                "whitelist": DEFAULT_WHITELIST,
+                "whitelist": self.state.whitelist,
             },
         )
         await self.send(
@@ -567,8 +881,31 @@ class BZRWebSocketServer:
                 "type": "OnRelayUpdated",
                 "time": utc_now_str(),
                 "enabled": False,
+                "requested": self.state.relay_requested,
             },
         )
+        if session.is_admin:
+            await self.send(
+                ws,
+                "OnGetLogLevel",
+                {
+                    "type": "OnGetLogLevel",
+                    "time": utc_now_str(),
+                    "success": True,
+                    "level": [self.state.log_level_setting, self.state.log_level_setting],
+                },
+            )
+            await self.send(ws, "OnGetUserList", {"users": self.state.serialize_users()})
+            await self.send(
+                ws,
+                "OnGetFullLog",
+                {
+                    "entries": list(self.state.stdout_history),
+                    "generatedAt": utc_now_str(),
+                    "stdout": {"history": list(self.state.stdout_history)},
+                    "protocol": {"history": list(self.state.protocol_history)},
+                },
+            )
 
         if self.motd:
             await self.send(
@@ -584,6 +921,7 @@ class BZRWebSocketServer:
                 },
             )
 
+        await self._broadcast_session_addresses(session)
         self.log.info("Authorized user_id=%s name=%s", session.user_id, session.name)
 
     async def handle_create_lobby(self, session: UserSession, content: dict[str, Any]) -> None:
@@ -628,6 +966,22 @@ class BZRWebSocketServer:
         await self.send(session.ws, "OnLobbyCreated", {"success": True, "id": lid, "time": utc_now_str()})
         await self.push_lobby_changed(lobby)
         await self.push_full_lobby_list()
+
+    async def handle_create_game(self, session: UserSession, content: dict[str, Any]) -> None:
+        payload = dict(content)
+        payload["name"] = self._normalize_game_name(str(content.get("name", "MyGame")))
+        await self.handle_create_lobby(session, payload)
+        lid = session.current_lobby_id
+        if lid is None:
+            return
+        lobby = self.state.lobbies.get(lid)
+        if not lobby:
+            return
+        lobby.metadata.setdefault("nextmid", str(content.get("nextmid", "1")))
+        lobby.metadata.setdefault("gameType", str(content.get("gameType", "1")))
+        lobby.metadata.setdefault("gameSettings", content.get("gameSettings", "*"))
+        self.state.mark_dirty()
+        await self.push_lobby_changed(lobby)
 
     async def handle_join_lobby(self, session: UserSession, content: dict[str, Any]) -> None:
         requested_lid = content.get("id")
@@ -676,13 +1030,80 @@ class BZRWebSocketServer:
                     "lobbyId": lid,
                     "id": session.user_id,
                     "member": session.name,
+                    "memberId": session.user_id,
                     "removed": False,
+                    "user": self.state.build_user_snapshot(session),
+                    "users": {session.user_id: self.state.build_user_snapshot(session)},
                 },
             )
 
         await self.send(session.ws, "OnLobbyJoined", {"success": True, "id": lid, "time": utc_now_str()})
         await self.push_lobby_changed(lobby)
         await self.push_full_lobby_list()
+
+    async def handle_update_wan(self, session: UserSession, content: Any) -> None:
+        wan = self._extract_wan_address(content)
+        if not wan:
+            await self.send_error(session.ws, "DoUpdateWAN ignored: missing address")
+            return
+        session.wan_address = wan
+        if session.current_lobby_id is not None:
+            lobby = self.state.lobbies.get(session.current_lobby_id)
+            if lobby and session.user_id in lobby.users:
+                lobby.users[session.user_id] = self.state.build_user_snapshot(session)
+        self.state.record_stdout_entry("info", f"{session.user_id} updated WAN address to {wan}")
+        await self.broadcast_all("OnWANUpdated", self._build_address_payload(session, message_type="OnWANUpdated"))
+        if session.current_lobby_id and session.current_lobby_id in self.state.lobbies:
+            await self.push_lobby_changed(self.state.lobbies[session.current_lobby_id])
+
+    async def handle_update_lan(self, session: UserSession, content: Any) -> None:
+        lan_addresses = self._extract_lan_addresses(content)
+        if not lan_addresses:
+            await self.send_error(session.ws, "DoUpdateLAN ignored: missing address")
+            return
+        session.lan_addresses = lan_addresses
+        if session.current_lobby_id is not None:
+            lobby = self.state.lobbies.get(session.current_lobby_id)
+            if lobby and session.user_id in lobby.users:
+                lobby.users[session.user_id] = self.state.build_user_snapshot(session)
+        self.state.record_stdout_entry(
+            "info",
+            f"{session.user_id} updated LAN addresses to {','.join(session.lan_addresses)}",
+        )
+        await self.broadcast_all("OnLANUpdated", self._build_address_payload(session, message_type="OnLANUpdated"))
+        if session.current_lobby_id and session.current_lobby_id in self.state.lobbies:
+            await self.push_lobby_changed(self.state.lobbies[session.current_lobby_id])
+
+    async def handle_p2p_signal(self, session: UserSession, content: Any, *, route: bool) -> None:
+        target_id = self._extract_target_user_id(content)
+        target_session = self.state.sessions_by_user_id.get(target_id) if target_id else None
+        event_name = "DoP2PRoute" if route else "DoP2PConnect"
+        self.state.record_stdout_entry(
+            "info",
+            f"{event_name} from {session.user_id} target={target_id or '?'} route={compact_preview(content)}",
+        )
+        payload = {
+            "type": "OnLobbyMemberP2PConnect",
+            "time": utc_now_str(),
+            "success": target_session is not None,
+            "lobbyId": session.current_lobby_id,
+            "changedLobby": session.current_lobby_id,
+            "sourceUserId": session.user_id,
+            "sourceName": session.name,
+            "targetId": target_id,
+            "requested": content,
+            "routeRequested": route,
+            "relayEnabled": False,
+            "sourceWanAddress": session.wan_address,
+            "sourceLanAddresses": list(session.lan_addresses),
+            "user": self.state.build_user_snapshot(session),
+            "users": {session.user_id: self.state.build_user_snapshot(session)},
+        }
+        if target_session:
+            payload["target"] = self.state.build_user_snapshot(target_session)
+            payload["users"][target_session.user_id] = self.state.build_user_snapshot(target_session)
+            await self.send(target_session.ws, "OnLobbyMemberP2PConnect", payload)
+        await self.send(session.ws, "OnLobbyMemberP2PConnect", payload)
 
     async def handle_chat(self, session: UserSession, text: str) -> None:
         text = text.strip()
@@ -745,7 +1166,10 @@ class BZRWebSocketServer:
         value = content.get("value")
         lobby.metadata[key] = value
         self.state.mark_dirty()
-        await self.broadcast_all("OnLobbyDataChanged", {"id": lid, "key": key, "value": value})
+        await self.broadcast_all(
+            "OnLobbyDataChanged",
+            self._build_lobby_data_payload(lobby, key=key, value=value),
+        )
         await self.push_lobby_changed(lobby)
 
     async def handle_set_lobby_owner(self, session: UserSession, target_id: str) -> None:
@@ -813,6 +1237,13 @@ class BZRWebSocketServer:
             content = envelope.get("data", {})
         if content is None:
             content = {}
+        self.state.record_protocol_event(
+            channel="ws",
+            direction="rx",
+            peer=self._ws_peer(ws),
+            msg_type=str(msg_type),
+            payload=content,
+        )
 
         if msg_type == "Authorization":
             await self.handle_authorization(ws, content if isinstance(content, dict) else {})
@@ -824,7 +1255,7 @@ class BZRWebSocketServer:
             return
 
         if msg_type == "DoEnterLounge":
-            session.in_lounge = bool(content)
+            session.in_lounge = self._coerce_bool(content)
             await self.send(ws, "OnDoEnterLounge", {"success": True, "time": utc_now_str()})
             await self.push_lobby_list(ws, msg_type="OnLobbyListChanged")
             return
@@ -838,13 +1269,22 @@ class BZRWebSocketServer:
             await self.handle_create_lobby(session, content if isinstance(content, dict) else {})
             return
 
+        if msg_type == "CreateGame":
+            await self.handle_create_game(session, content if isinstance(content, dict) else {})
+            return
+
         if msg_type == "DoJoinLobby":
             await self.handle_join_lobby(session, content if isinstance(content, dict) else {})
             return
 
-        if msg_type in {"DoExitLobby", "DoExitLounge"}:
-            await self.remove_from_lobby(session, send_exit_ack=True)
+        if msg_type == "DoExitLobby":
+            await self.remove_from_lobby(session, send_exit_ack=True, ack_type="OnDoExitLobby")
             await self.push_lobby_list(ws, msg_type="OnLobbyListChanged")
+            return
+
+        if msg_type == "DoExitLounge":
+            session.in_lounge = False
+            await self.send(ws, "OnDoExitLounge", {"success": True, "time": utc_now_str()})
             return
 
         if msg_type == "DoSendChat":
@@ -859,7 +1299,7 @@ class BZRWebSocketServer:
                     self.state.mark_dirty()
                     await self.broadcast_all(
                         "OnUserDataChanged",
-                        {"id": session.user_id, "key": key, "value": content.get("value")},
+                        self._build_user_change_payload(session, key, content.get("value")),
                     )
                     if session.current_lobby_id and session.current_lobby_id in self.state.lobbies:
                         await self.push_lobby_changed(self.state.lobbies[session.current_lobby_id])
@@ -874,10 +1314,14 @@ class BZRWebSocketServer:
             if lid is not None and lid in self.state.lobbies and isinstance(content, dict):
                 key = str(content.get("key", "")).strip()
                 if key:
-                    self.state.lobbies[lid].metadata.pop(key, None)
+                    lobby = self.state.lobbies[lid]
+                    lobby.metadata.pop(key, None)
                     self.state.mark_dirty()
-                    await self.broadcast_all("OnLobbyDataChanged", {"id": lid, "key": key, "deleted": True})
-                    await self.push_lobby_changed(self.state.lobbies[lid])
+                    await self.broadcast_all(
+                        "OnLobbyDataChanged",
+                        self._build_lobby_data_payload(lobby, key=key, deleted=True),
+                    )
+                    await self.push_lobby_changed(lobby)
             return
 
         if msg_type == "LockLobby":
@@ -911,6 +1355,22 @@ class BZRWebSocketServer:
             await self.handle_kick_user(session, str(content))
             return
 
+        if msg_type == "DoUpdateWAN":
+            await self.handle_update_wan(session, content)
+            return
+
+        if msg_type == "DoUpdateLAN":
+            await self.handle_update_lan(session, content)
+            return
+
+        if msg_type == "DoP2PConnect":
+            await self.handle_p2p_signal(session, content, route=False)
+            return
+
+        if msg_type == "DoP2PRoute":
+            await self.handle_p2p_signal(session, content, route=True)
+            return
+
         if msg_type in {"Ping", "DoPing"}:
             await self.send(
                 ws,
@@ -921,6 +1381,19 @@ class BZRWebSocketServer:
 
         if msg_type == "GetUserList":
             await self.send(ws, "OnGetUserList", {"users": self.state.serialize_users()})
+            return
+
+        if msg_type == "GetLogLevel":
+            await self.send(
+                ws,
+                "OnGetLogLevel",
+                {
+                    "type": "OnGetLogLevel",
+                    "time": utc_now_str(),
+                    "success": True,
+                    "level": [self.state.log_level_setting, self.state.log_level_setting],
+                },
+            )
             return
 
         if msg_type == "GetStatLog":
@@ -943,12 +1416,86 @@ class BZRWebSocketServer:
                     "entries": list(self.state.stdout_history),
                     "generatedAt": utc_now_str(),
                     "stdout": {"history": list(self.state.stdout_history)},
+                    "protocol": {"history": list(self.state.protocol_history)},
+                },
+            )
+            return
+
+        if msg_type == "SetLogLevel":
+            if not session.is_admin:
+                await self.send_error(ws, "SetLogLevel denied: admin only")
+                return
+            level = 0
+            if isinstance(content, dict):
+                try:
+                    level = max(0, min(2, int(content.get("level", 0))))
+                except Exception:
+                    level = 0
+            self.state.log_level_setting = level
+            self.state.mark_dirty()
+            await self.send(
+                ws,
+                "OnGetLogLevel",
+                {
+                    "type": "OnGetLogLevel",
+                    "time": utc_now_str(),
+                    "success": True,
+                    "level": [level, level],
+                },
+            )
+            return
+
+        if msg_type == "AddRegex":
+            if not session.is_admin:
+                await self.send_error(ws, "AddRegex denied: admin only")
+                return
+            regex = ""
+            if isinstance(content, dict):
+                regex = str(content.get("regex", "")).strip()
+            if not regex:
+                await self.send_error(ws, "AddRegex ignored: missing regex")
+                return
+            entries = self.state.whitelist.setdefault("list", [])
+            if regex not in entries:
+                entries.append(regex)
+                entries.sort()
+                self.state.mark_dirty()
+            await self.broadcast_all(
+                "OnWhitelistUpdated",
+                {
+                    "type": "OnWhitelistUpdated",
+                    "time": utc_now_str(),
+                    "success": True,
+                    "whitelist": self.state.whitelist,
+                },
+            )
+            return
+
+        if msg_type == "RemoveRegex":
+            if not session.is_admin:
+                await self.send_error(ws, "RemoveRegex denied: admin only")
+                return
+            regex = ""
+            if isinstance(content, dict):
+                regex = str(content.get("regex", "")).strip()
+            if regex in self.state.whitelist.get("list", []):
+                self.state.whitelist["list"] = [x for x in self.state.whitelist["list"] if x != regex]
+                self.state.mark_dirty()
+            await self.broadcast_all(
+                "OnWhitelistUpdated",
+                {
+                    "type": "OnWhitelistUpdated",
+                    "time": utc_now_str(),
+                    "success": True,
+                    "whitelist": self.state.whitelist,
                 },
             )
             return
 
         if msg_type == "SetRelay":
-            requested = bool(content.get("toggle")) if isinstance(content, dict) else bool(content)
+            requested = self._coerce_bool(content.get("toggle")) if isinstance(content, dict) else self._coerce_bool(content)
+            self.state.relay_requested = requested
+            self.state.mark_dirty()
             if requested:
                 self.state.record_stdout_entry(
                     "warn",
@@ -957,18 +1504,33 @@ class BZRWebSocketServer:
             await self.send(
                 ws,
                 "OnEnableRelayChanged",
-                {"enabled": False, "requested": requested, "success": False},
+                {"enabled": False, "requested": requested, "success": False, "time": utc_now_str()},
             )
             await self.send(
                 ws,
                 "OnRelayUpdated",
-                {"enabled": False, "requested": requested, "success": False},
+                {"enabled": False, "requested": requested, "success": False, "time": utc_now_str()},
             )
             return
 
         if msg_type == "SetTest":
-            enabled = bool(content.get("toggle")) if isinstance(content, dict) else bool(content)
-            await self.send_stdout(ws, "info", f"Test mode request ignored; requested={enabled}")
+            enabled = self._coerce_bool(content.get("toggle")) if isinstance(content, dict) else self._coerce_bool(content)
+            self.state.test_mode = enabled
+            self.state.mark_dirty()
+            await self.send_stdout(ws, "info", f"Test mode set to {enabled}")
+            return
+
+        if msg_type == "TraceData":
+            await self.send(
+                ws,
+                "OnGetFullLog",
+                {
+                    "entries": list(self.state.stdout_history),
+                    "generatedAt": utc_now_str(),
+                    "stdout": {"history": list(self.state.stdout_history)},
+                    "protocol": {"history": list(self.state.protocol_history)},
+                },
+            )
             return
 
         # Keep unknown messages non-fatal for compatibility.
@@ -991,6 +1553,13 @@ class BZRWebSocketServer:
         try:
             async for message in ws:
                 if isinstance(message, bytes):
+                    self.state.record_protocol_event(
+                        channel="ws",
+                        direction="rx",
+                        peer=self._ws_peer(ws),
+                        msg_type="binary",
+                        payload=message,
+                    )
                     await self.send_error(ws, "Binary messages are not supported")
                     continue
                 await self.route_message(ws, message)
@@ -1043,6 +1612,11 @@ def build_status_payload(
             "steamTicketValidation": False,
             "adminLogPayloadCompatibility": True,
         },
+        "supportedMessages": {
+            "client": SUPPORTED_CLIENT_MESSAGES,
+            "server": SUPPORTED_SERVER_MESSAGES,
+        },
+        "recentProtocolEvents": state.protocol_history[-20:],
     }
 
 
@@ -1076,17 +1650,42 @@ async def serve_health_http(
             await writer.drain()
             return
 
-        if path not in ("/health", "/status"):
+        if path not in ("/health", "/status", "/captures", "/protocol"):
             writer.write(_http_json(404, {"ok": False, "error": "Unknown path"}))
             await writer.drain()
             return
 
-        payload = build_status_payload(
-            state=state,
-            ws_server=ws_server,
-            udp_protocol=udp_protocol,
-            started_monotonic=started_monotonic,
-        )
+        if path in ("/health", "/status"):
+            payload = build_status_payload(
+                state=state,
+                ws_server=ws_server,
+                udp_protocol=udp_protocol,
+                started_monotonic=started_monotonic,
+            )
+        elif path == "/captures":
+            payload = {
+                "ok": True,
+                "time": utc_now_str(),
+                "protocol": {"history": list(state.protocol_history)},
+                "stdout": {"history": list(state.stdout_history)},
+            }
+        else:
+            payload = {
+                "ok": True,
+                "time": utc_now_str(),
+                "observedOfficialHost": "battlezone98mp.webdev.rebellion.co.uk",
+                "cutover": {
+                    "dnsOrHostsOverrideRequired": True,
+                    "hostname": "battlezone98mp.webdev.rebellion.co.uk",
+                    "websocketPort": DEFAULT_WS_PORT,
+                    "udpProbePort": DEFAULT_UDP_PORT,
+                    "relayPortObserved": 1339,
+                },
+                "supportedMessages": {
+                    "client": SUPPORTED_CLIENT_MESSAGES,
+                    "server": SUPPORTED_SERVER_MESSAGES,
+                },
+            }
         writer.write(_http_json(200, payload))
         await writer.drain()
     except Exception:
