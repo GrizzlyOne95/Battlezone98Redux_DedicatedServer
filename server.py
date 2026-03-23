@@ -19,7 +19,10 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import signal
+import socket
+import struct
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,6 +43,44 @@ DEFAULT_STATE_FILE = "data/server_state.json"
 STATE_FORMAT_VERSION = 1
 MAX_STDOUT_HISTORY = 200
 MAX_PROTOCOL_HISTORY = 400
+BZR_CONTROL_MARKERS = {"SS", "KA", "PP", "PR", "PB", "PO", "PZ"}
+BZR_CONTROL_MARKER_INFO = {
+    "KA": {
+        "controlEvent": "peer_keepalive",
+        "likelyMeaning": "short keepalive or keepalive-ack marker",
+        "meaningConfidence": "medium",
+    },
+    "PB": {
+        "controlEvent": "peer_timing_sideband",
+        "likelyMeaning": "short timing-sideband marker seen near PP and PR exchanges",
+        "meaningConfidence": "low",
+    },
+    "PO": {
+        "controlEvent": "peer_control_unknown_po",
+        "likelyMeaning": "short object-side control marker with a float-like time field and small control words",
+        "meaningConfidence": "low",
+    },
+    "PP": {
+        "controlEvent": "peer_ping_request",
+        "likelyMeaning": "ping or timing request frame; aligns with BZLogger PING SENT lines",
+        "meaningConfidence": "high",
+    },
+    "PR": {
+        "controlEvent": "peer_ping_response",
+        "likelyMeaning": "ping or timing response paired against PP",
+        "meaningConfidence": "high",
+    },
+    "PZ": {
+        "controlEvent": "peer_control_unknown_pz",
+        "likelyMeaning": "unresolved PZ control marker",
+        "meaningConfidence": "low",
+    },
+    "SS": {
+        "controlEvent": "peer_session_sync",
+        "likelyMeaning": "repeated session-sync or step-sync marker during bootstrap ramp",
+        "meaningConfidence": "medium",
+    },
+}
 
 DEFAULT_WHITELIST = {
     "list": [
@@ -135,6 +176,2758 @@ def compact_preview(value: Any, *, limit: int = 240) -> str:
     if len(text) > limit:
         return text[: limit - 3] + "..."
     return text
+
+
+def _ascii_runs(data: bytes, *, min_len: int = 2) -> list[str]:
+    runs: list[str] = []
+    current = bytearray()
+    for b in data:
+        if 32 <= b <= 126:
+            current.append(b)
+            continue
+        if len(current) >= min_len:
+            runs.append(current.decode("ascii", errors="ignore"))
+        current.clear()
+    if len(current) >= min_len:
+        runs.append(current.decode("ascii", errors="ignore"))
+    return runs
+
+
+def _dedupe_preserve(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _looks_like_steam_id(text: str) -> bool:
+    return len(text) >= 8 and text.startswith("S") and text[1:].isdigit()
+
+
+def _looks_like_unit_code(text: str) -> bool:
+    lowered = text.lower()
+    return 5 <= len(lowered) <= 8 and lowered.startswith(("bv", "cv", "sv", "iv", "av"))
+
+
+def _looks_like_compact_object_code(text: str) -> bool:
+    lowered = text.lower()
+    if _looks_like_unit_code(lowered):
+        return True
+    if not (5 <= len(lowered) <= 8):
+        return False
+    if "_" in lowered or not lowered[0].isalpha() or not lowered.isalnum():
+        return False
+    if lowered in BZR_CONTROL_MARKERS or _looks_like_steam_id(text):
+        return False
+    return any(ch.isalpha() for ch in lowered) and any(ch.isdigit() for ch in lowered) or lowered.isalpha()
+
+
+def _looks_like_object_name(text: str) -> bool:
+    lowered = text.lower()
+    return "_" in lowered and len(lowered) >= 8 and lowered.replace("_", "").isalnum()
+
+
+OBJECT_NAME_PATTERN = re.compile(r"([a-z][a-z0-9]{4,}_[a-z][a-z0-9_]{3,})")
+
+
+def _normalize_object_token(text: str) -> str:
+    lowered = text.lower()
+    start = 0
+    end = len(lowered)
+    while start < end and not (lowered[start].isalnum() or lowered[start] == "_"):
+        start += 1
+    while end > start and not (lowered[end - 1].isalnum() or lowered[end - 1] == "_"):
+        end -= 1
+    return lowered[start:end]
+
+
+def _split_object_name(text: str) -> tuple[str, str, int | None]:
+    lowered = text.lower()
+    stem, _, object_kind = lowered.partition("_")
+    base = stem
+    ordinal: int | None = None
+    while base and base[-1].isdigit():
+        base = base[:-1]
+    if len(base) < len(stem):
+        ordinal = int(stem[len(base) :])
+    return base, object_kind, ordinal
+
+
+def _extract_object_names_from_runs(ascii_runs: list[str]) -> list[str]:
+    found: list[str] = []
+    for run in ascii_runs:
+        lowered = run.lower()
+        for match in OBJECT_NAME_PATTERN.finditer(lowered):
+            token = _normalize_object_token(match.group(1))
+            if _looks_like_object_name(token):
+                found.append(token)
+    return _dedupe_preserve(found)
+
+
+def _side_label_from_code_prefix(prefix: str) -> str:
+    return {
+        "b": "b_side",
+        "c": "c_side",
+        "n": "neutral",
+    }.get(prefix, f"{prefix}_side")
+
+
+def _build_descriptor_field_hints(descriptor_sketch: dict[str, Any], owner_word: int) -> dict[str, Any]:
+    owner_lane = {
+        0x0100: "owner_index_1",
+        0x0200: "owner_index_2",
+    }.get(owner_word, f"owner_word_{owner_word:04x}")
+    return {
+        "identityWords": {
+            "classWord": descriptor_sketch["classWord"],
+            "subtypeWord": descriptor_sketch["subtypeWord"],
+            "ownerWord": descriptor_sketch["ownerWord"],
+        },
+        "payloadWords": {
+            "controlWord": descriptor_sketch["controlWord"],
+            "paramWord": descriptor_sketch["paramWord"],
+            "vectorWordA": descriptor_sketch["vectorWordA"],
+            "vectorWordB": descriptor_sketch["vectorWordB"],
+        },
+        "ownerLane": owner_lane,
+        "stabilityAssessment": "class/subtype/owner words look family-stable in March 21 captures; later words vary more like descriptor payload",
+    }
+
+
+def _build_descriptor_archetype_hint(object_kind: str, person_role: str | None) -> str:
+    if object_kind == "person" and person_role:
+        return f"person_{person_role}"
+    return object_kind
+
+
+def _build_descriptor_payload_family_hint(
+    side_label: str | None,
+    object_kind: str | None,
+    descriptor_sketch: dict[str, Any] | None,
+) -> str | None:
+    if not side_label or not object_kind or not descriptor_sketch:
+        return None
+
+    control_word = descriptor_sketch.get("controlWord")
+    if object_kind in {"turrettank", "recycler"} and control_word == "0x00000000":
+        return f"{side_label}_structure_payload"
+    if object_kind in {"scavenger", "wingman"} and control_word in {"0xda000000", "0xbd000000"}:
+        return f"{side_label}_mobile_unit_payload"
+    if object_kind == "person":
+        return f"{side_label}_person_payload"
+    if object_kind == "scrap":
+        return f"{side_label}_scrap_payload"
+    return f"{side_label}_{object_kind}_payload"
+
+
+def _build_descriptor_payload_hints(
+    descriptor_sketch: dict[str, Any],
+    payload_family_hint: str | None,
+) -> dict[str, Any]:
+    control_word = descriptor_sketch["controlWord"]
+    param_word = descriptor_sketch["paramWord"]
+    vector_word_a = descriptor_sketch["vectorWordA"]
+    vector_word_b = descriptor_sketch["vectorWordB"]
+    payload_hints = {
+        "controlLaneWords": {
+            "controlWord": control_word,
+            "paramWord": param_word,
+        },
+        "vectorLaneWords": {
+            "vectorWordA": vector_word_a,
+            "vectorWordB": vector_word_b,
+        },
+        "payloadLaneAssessment": "controlWord/paramWord look more family-side dependent; vectorWordA/vectorWordB vary more like per-descriptor payload",
+    }
+    if payload_family_hint:
+        payload_hints["controlSignature"] = f"{payload_family_hint}:{control_word}/{param_word}"
+    return payload_hints
+
+
+def _read_u16_le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 2], "little")
+
+
+def _read_u32_le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little")
+
+
+def _read_i8(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 1], "little", signed=True)
+
+
+def _hex_u16(data: bytes, offset: int) -> str:
+    return f"0x{_read_u16_le(data, offset):04x}"
+
+
+def _hex_u32(data: bytes, offset: int) -> str:
+    return f"0x{_read_u32_le(data, offset):08x}"
+
+
+def _decode_pp_marker_payload(payload: bytes) -> dict[str, Any]:
+    body = payload[2:]
+    if len(body) < 20:
+        return {}
+    return {
+        "timingFields": {
+            "localMsTick": _read_u32_le(body, 0),
+            "clockOffset": _read_u32_le(body, 4),
+            "hostMsTick": _read_u32_le(body, 8),
+            "delayUnits": _read_u32_le(body, 12),
+            "flags": _read_u32_le(body, 16),
+        },
+        "fieldConfidence": "high",
+        "fieldCorrelation": "matches BZLogger PING SENT fields mst/off/hst/dl",
+    }
+
+
+def _decode_pr_marker_payload(payload: bytes) -> dict[str, Any]:
+    body = payload[2:]
+    if len(body) < 12:
+        return {}
+    return {
+        "timingFields": {
+            "echoedPingMsTick": _read_u32_le(body, 0),
+            "responderMsTick": _read_u32_le(body, 4),
+            "responseWord": f"0x{_read_u32_le(body, 8):08x}",
+        },
+        "fieldConfidence": "medium",
+        "fieldCorrelation": "first field matches the paired PP localMsTick in March 21 captures",
+    }
+
+
+def _decode_pb_marker_payload(payload: bytes) -> dict[str, Any]:
+    body = payload[2:]
+    if len(body) < 8:
+        return {}
+    return {
+        "timingFields": {
+            "bandwidthTarget": _read_u32_le(body, 0),
+            "opaqueWord": f"0x{_read_u32_le(body, 4):08x}",
+            "opaqueLow16": _read_u16_le(body, 4),
+            "opaqueHigh16": _read_u16_le(body, 6),
+        },
+        "fieldConfidence": "medium",
+        "fieldCorrelation": "first field aligns with TempStateSendAll target BW values in March 21 logs",
+    }
+
+
+def _decode_po_marker_payload(payload: bytes) -> dict[str, Any]:
+    body = payload[2:]
+    if len(body) < 10:
+        return {}
+    clock_seconds = struct.unpack_from("<f", body, 0)[0]
+    timing_fields: dict[str, Any] = {
+        "modeWord": f"0x{_read_u16_le(body, 4):04x}",
+        "sequenceValue": _read_u16_le(body, 6),
+        "laneValue": _read_u16_le(body, 8),
+    }
+    if 0.0 <= clock_seconds < 86400.0:
+        timing_fields["clockSeconds"] = round(clock_seconds, 3)
+    return {
+        "timingFields": timing_fields,
+        "fieldConfidence": "medium",
+        "fieldCorrelation": "first float-like word tracks elapsed match time in March 21 captures; 0x0306/lane0 is common and a smaller 0x0206/lane2 burst appears later",
+    }
+
+
+def _decode_state_block(data: bytes, ascii_runs: list[str]) -> dict[str, Any]:
+    body = data[18:]
+    decoded: dict[str, Any] = {
+        "family": "peer_state_block",
+        "stateOpcode": f"0x{data[19]:02x}",
+    }
+    if len(body) >= 16:
+        state_seconds = struct.unpack_from("<f", body, 2)[0]
+        if 0.0 <= state_seconds < 86400.0:
+            decoded["stateHeader"] = {
+                "stateTimeSeconds": round(state_seconds, 3),
+                "stateStreamWord": _read_u32_le(body, 6),
+                "statePlayerIndex": _read_u16_le(body, 10),
+                "stateHeaderWord": f"0x{_read_u32_le(body, 12):08x}",
+            }
+            decoded["fieldConfidence"] = "medium"
+            decoded["fieldCorrelation"] = "float clock plus stable stream/player header words across March 21 state samples"
+
+    unit_codes = _dedupe_preserve([text.lower() for text in ascii_runs if _looks_like_unit_code(text)])
+    if unit_codes:
+        decoded["unitCodes"] = unit_codes[:8]
+        decoded["stateObjectCount"] = len(unit_codes)
+    return decoded
+
+
+def _decode_object_packet(data: bytes, ascii_runs: list[str]) -> dict[str, Any]:
+    body = data[18:]
+    decoded: dict[str, Any] = {
+        "transportReliability": "reliable" if data[0] == 0xC0 else "unreliable",
+        "objectPacketSignature": body[:2].hex(),
+    }
+    if len(body) >= 16:
+        decoded["objectHeader"] = {
+            "objectVariant": body[2],
+            "objectIndex": _read_i8(body, 4),
+            "descriptorFlags": body[5],
+            "objectHeaderWord": f"0x{_read_u32_le(body, 10):08x}",
+            "objectOwnerFlags": body[14],
+            "objectOwnerIndex": body[15],
+        }
+    if len(body) >= 30:
+        class_word = _read_u16_le(body, 10)
+        subtype_word = _read_u16_le(body, 12)
+        owner_word = _read_u16_le(body, 14)
+        decoded["descriptorSketch"] = {
+            "classWord": f"0x{class_word:04x}",
+            "subtypeWord": f"0x{subtype_word:04x}",
+            "ownerWord": f"0x{owner_word:04x}",
+            "controlWord": _hex_u32(body, 16),
+            "paramWord": _hex_u32(body, 20),
+            "vectorWordA": _hex_u32(body, 24),
+            "vectorWordB": _hex_u32(body, 28),
+        }
+        decoded["descriptorPattern"] = f"0x{class_word:04x}/0x{subtype_word:04x}/0x{owner_word:04x}"
+        decoded["descriptorWordProfile"] = {
+            "classLowByte": body[10],
+            "classHighByte": body[11],
+            "subtypeLowByte": body[12],
+            "subtypeHighByte": body[13],
+            "ownerLowByte": body[14],
+            "ownerHighByte": body[15],
+        }
+        decoded["descriptorFieldHints"] = _build_descriptor_field_hints(decoded["descriptorSketch"], owner_word)
+
+    normalized_runs = _dedupe_preserve(
+        [token for token in (_normalize_object_token(text) for text in ascii_runs) if token]
+    )
+    object_names = _dedupe_preserve(
+        [text for text in normalized_runs if _looks_like_object_name(text)] + _extract_object_names_from_runs(ascii_runs)
+    )
+    derived_codes = []
+    for object_name in object_names:
+        stem, _, _ = _split_object_name(object_name)
+        if stem:
+            derived_codes.append(stem)
+    object_codes = _dedupe_preserve(
+        [text for text in normalized_runs if _looks_like_compact_object_code(text)] + derived_codes
+    )
+    if object_codes:
+        decoded["objectCodes"] = object_codes[:8]
+    if object_names:
+        decoded["objectNames"] = object_names[:8]
+
+    if object_codes or object_names:
+        if object_names:
+            primary_name = object_names[0]
+            name_base, object_kind, object_ordinal = _split_object_name(primary_name)
+            decoded["primaryObjectName"] = primary_name
+            decoded["objectNameStem"] = name_base
+            decoded["objectKind"] = object_kind
+            if object_ordinal is not None:
+                decoded["objectOrdinal"] = object_ordinal
+        if object_codes:
+            primary_code = object_codes[0]
+            decoded["primaryObjectCode"] = primary_code
+            decoded["sideCodePrefix"] = primary_code[0]
+            decoded["sideLabel"] = _side_label_from_code_prefix(primary_code[0])
+            if decoded.get("objectKind") == "person":
+                if primary_code.endswith("pilo"):
+                    decoded["personRole"] = "pilot"
+                elif primary_code.endswith("user"):
+                    decoded["personRole"] = "user"
+        object_kind = decoded.get("objectKind")
+        side_label = decoded.get("sideLabel")
+        if isinstance(object_kind, str) and isinstance(side_label, str):
+            person_role = decoded.get("personRole")
+            family_parts = [side_label, object_kind]
+            if isinstance(person_role, str) and person_role:
+                family_parts.append(person_role)
+            decoded["descriptorFamilyHint"] = "_".join(family_parts) + "_descriptor"
+            decoded["descriptorArchetypeHint"] = _build_descriptor_archetype_hint(object_kind, person_role if isinstance(person_role, str) else None)
+            payload_family_hint = _build_descriptor_payload_family_hint(
+                side_label,
+                object_kind,
+                decoded.get("descriptorSketch") if isinstance(decoded.get("descriptorSketch"), dict) else None,
+            )
+            if payload_family_hint:
+                decoded["descriptorPayloadFamilyHint"] = payload_family_hint
+                descriptor_sketch = decoded.get("descriptorSketch")
+                if isinstance(descriptor_sketch, dict):
+                    decoded["descriptorPayloadHints"] = _build_descriptor_payload_hints(
+                        descriptor_sketch,
+                        payload_family_hint,
+                    )
+
+        decoded["family"] = "peer_object_descriptor"
+        decoded["fieldConfidence"] = "medium"
+        decoded["fieldCorrelation"] = "7a75 packets carry unit codes and stable object names ahead of the first 0x5f state stream"
+        return decoded
+
+    if len(body) >= 17 and body[10:13] == bytes.fromhex("060601"):
+        control_value = _read_u16_le(body, 4)
+        if 0x2100 <= control_value <= 0x21FF:
+            decoded["family"] = "peer_object_presence"
+            decoded["objectSetupEvent"] = "object_presence"
+            decoded["presenceKeyWord"] = f"0x{control_value:04x}"
+            decoded["presenceFlags"] = body[13]
+            decoded["presenceOwnerIndex"] = body[15] if len(body) >= 16 else None
+            decoded["fieldConfidence"] = "medium"
+            decoded["fieldCorrelation"] = "short 7a75 060601 packets appear during object presence/setup exchange"
+            return decoded
+
+        decoded["family"] = "peer_object_counter"
+        decoded["objectSetupEvent"] = "object_counter"
+        decoded["counterValue"] = control_value
+        decoded["counterFlags"] = body[13]
+        decoded["fieldConfidence"] = "medium"
+        decoded["fieldCorrelation"] = "short 7a75 060601 packets repeat as synchronized object/setup counters"
+        return decoded
+
+    if len(body) >= 31 and body[10:14] == (20).to_bytes(4, "little"):
+        decoded["family"] = "peer_object_batch"
+        decoded["objectSetupEvent"] = "object_roster_batch"
+        decoded["batchDescriptorCount"] = _read_u32_le(body, 23) if len(body) >= 27 else None
+        decoded["batchOwnerIndex"] = _read_u16_le(body, 28) if len(body) >= 30 else None
+        decoded["fieldConfidence"] = "medium"
+        decoded["fieldCorrelation"] = "31-byte 7a75 header packets precede object descriptor bursts in March 21 captures"
+        return decoded
+
+    if len(body) == 15 and body[10:12] in {bytes.fromhex("0401"), bytes.fromhex("0402")}:
+        decoded["family"] = "peer_object_setup_marker"
+        decoded["objectSetupEvent"] = "object_setup_marker"
+        decoded["setupMarkerWord"] = f"0x{_read_u16_le(body, 10):04x}"
+        decoded["fieldConfidence"] = "low"
+        decoded["fieldCorrelation"] = "short 7a75 setup markers appear around roster refresh points"
+        return decoded
+
+    decoded["family"] = "peer_object_control"
+    decoded["controlBodyBytes"] = len(body)
+    decoded["controlBodySignature"] = body[2:].hex() if len(body) >= 2 else body.hex()
+    if len(body) >= 12:
+        decoded["controlModeWord"] = f"0x{_read_u16_le(body, 10):04x}"
+    if len(body) >= 14:
+        decoded["controlTailWord"] = f"0x{_read_u32_le(body, 10):08x}"
+    decoded["fieldConfidence"] = "low"
+    decoded["fieldCorrelation"] = "7a75 short packets appear during roster/setup exchange but remain only partially decoded"
+    return decoded
+
+
+def _describe_bzr_control_marker(marker: str, payload: bytes) -> dict[str, Any]:
+    info = BZR_CONTROL_MARKER_INFO.get(marker)
+    if not info:
+        return {}
+
+    description = dict(info)
+    description["controlPayloadBytes"] = len(payload)
+    if marker == "SS" and len(payload) >= 3:
+        description["syncVariant"] = payload[2]
+    elif marker == "PP":
+        description.update(_decode_pp_marker_payload(payload))
+    elif marker == "PR":
+        description.update(_decode_pr_marker_payload(payload))
+    elif marker == "PB":
+        description.update(_decode_pb_marker_payload(payload))
+    elif marker == "PO":
+        description.update(_decode_po_marker_payload(payload))
+    return description
+
+
+def decode_bzr_udp_datagram(data: bytes) -> dict[str, Any]:
+    decoded: dict[str, Any] = {
+        "payloadBytes": len(data),
+        "lead": data[:2].hex() if len(data) >= 2 else data.hex(),
+    }
+    if not data:
+        decoded["family"] = "empty"
+        return decoded
+
+    if len(data) >= 18 and data[0] == 0x40 and data[1] == 0x02:
+        if len(data) == 18:
+            decoded["family"] = "bootstrap_probe"
+            return decoded
+        if len(data) == 25 and data[18] == 0x04:
+            decoded["family"] = "bootstrap_reply"
+            decoded["publicEndpoint"] = f"{socket.inet_ntoa(data[19:23])}:{int.from_bytes(data[23:25], 'big')}"
+            return decoded
+        decoded["family"] = "bootstrap_variant"
+        return decoded
+
+    ascii_runs = _ascii_runs(data, min_len=2)
+    steam_ids = [text for text in ascii_runs if _looks_like_steam_id(text)]
+    if steam_ids and len(data) >= 2 and data[1] in {0x03, 0x04, 0x05}:
+        decoded["family"] = "peer_identity"
+        decoded["variant"] = f"0x{data[1]:02x}"
+        decoded["steamIds"] = steam_ids[:2]
+        return decoded
+
+    if len(data) >= 20 and data[18:20] == bytes.fromhex("7a75"):
+        decoded.update(_decode_object_packet(data, ascii_runs))
+        return decoded
+
+    marker = ""
+    marker_offset = -1
+    if len(data) >= 20 and all(65 <= b <= 90 for b in data[18:20]):
+        marker = data[18:20].decode("ascii", errors="ignore")
+        marker_offset = 18
+    elif len(data) >= 2 and all(65 <= b <= 90 for b in data[-2:]):
+        marker = data[-2:].decode("ascii", errors="ignore")
+        marker_offset = len(data) - 2
+    if marker in BZR_CONTROL_MARKERS:
+        decoded["marker"] = marker
+        marker_payload = data[marker_offset:] if marker_offset >= 0 else b""
+        decoded["markerOffset"] = marker_offset
+        decoded.update(_describe_bzr_control_marker(marker, marker_payload))
+
+    interesting_strings = _dedupe_preserve(
+        [
+            text
+            for text in ascii_runs
+            if _looks_like_steam_id(text)
+            or _looks_like_unit_code(text)
+            or text in BZR_CONTROL_MARKERS
+        ]
+    )
+    if interesting_strings:
+        decoded["asciiStrings"] = interesting_strings[:6]
+
+    if len(data) >= 20 and data[18] == 0x5F:
+        decoded.update(_decode_state_block(data, ascii_runs))
+        return decoded
+
+    if marker:
+        decoded["family"] = "peer_control_marker"
+        return decoded
+
+    if steam_ids:
+        decoded["family"] = "peer_identity_variant"
+        decoded["steamIds"] = steam_ids[:2]
+        return decoded
+
+    if len(data) >= 20 and data[0] in {0x40, 0xC0}:
+        decoded["family"] = "peer_unknown"
+        return decoded
+
+    decoded["family"] = "unknown"
+    return decoded
+
+
+def summarize_protocol_history(history: list[dict[str, Any]]) -> dict[str, Any]:
+    channels: dict[str, int] = {}
+    udp_families: dict[str, int] = {}
+    udp_control_events: dict[str, int] = {}
+    udp_object_events: dict[str, int] = {}
+    ws_types: dict[str, int] = {}
+    for entry in history:
+        channel = str(entry.get("channel", "unknown"))
+        channels[channel] = channels.get(channel, 0) + 1
+        if channel == "udp":
+            decoder = entry.get("decoder", {})
+            family = str(decoder.get("family", "unclassified"))
+            udp_families[family] = udp_families.get(family, 0) + 1
+            control_event = decoder.get("controlEvent")
+            if isinstance(control_event, str) and control_event:
+                udp_control_events[control_event] = udp_control_events.get(control_event, 0) + 1
+            object_event = decoder.get("objectSetupEvent")
+            if isinstance(object_event, str) and object_event:
+                udp_object_events[object_event] = udp_object_events.get(object_event, 0) + 1
+        elif channel == "ws":
+            msg_type = str(entry.get("type", "unknown"))
+            ws_types[msg_type] = ws_types.get(msg_type, 0) + 1
+    return {
+        "channels": channels,
+        "udpFamilies": udp_families,
+        "udpControlEvents": udp_control_events,
+        "udpObjectEvents": udp_object_events,
+        "wsTypes": ws_types,
+        "descriptorPayloadComparisons": summarize_descriptor_payload_families(history),
+        "descriptorStateCorrelations": summarize_descriptor_state_correlations(history),
+        "descriptorFollowups": summarize_descriptor_followups(history),
+        "unresolvedControlComparisons": summarize_unresolved_control_traffic(history),
+        "peerSessions": summarize_peer_udp_sessions(history),
+    }
+
+
+def _phase_for_udp_family(family: str) -> str:
+    if family in {"peer_identity", "peer_identity_variant"}:
+        return "identity"
+    if family in {
+        "peer_object_descriptor",
+        "peer_object_control",
+        "peer_object_presence",
+        "peer_object_counter",
+        "peer_object_batch",
+        "peer_object_setup_marker",
+    }:
+        return "objects"
+    if family == "peer_control_marker":
+        return "control"
+    if family == "peer_state_block":
+        return "state"
+    if family.startswith("peer_"):
+        return "peer_other"
+    return "other"
+
+
+def _sorted_count_map(values: dict[str, int]) -> dict[str, int]:
+    return dict(sorted(values.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _top_count_key(values: dict[str, int]) -> str | None:
+    if not values:
+        return None
+    return sorted(values.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _parse_hex_word(value: str) -> int | None:
+    if not isinstance(value, str) or not value.startswith("0x"):
+        return None
+    try:
+        return int(value, 16)
+    except ValueError:
+        return None
+
+
+HEX_BYTE_LANES = ("hexByte0", "hexByte1", "hexByte2", "hexByte3")
+HEX_HALF_LANES = ("hexHalf0", "hexHalf1")
+
+
+def _hex_word_bytes(value: int) -> tuple[int, int, int, int]:
+    return (
+        (value >> 24) & 0xFF,
+        (value >> 16) & 0xFF,
+        (value >> 8) & 0xFF,
+        value & 0xFF,
+    )
+
+
+def _summarize_word_byte_profiles(counts: dict[str, int]) -> dict[str, Any] | None:
+    if not counts:
+        return None
+    lane_counts: dict[str, dict[str, int]] = {lane: {} for lane in HEX_BYTE_LANES}
+    for value, value_count in counts.items():
+        parsed_value = _parse_hex_word(value)
+        if parsed_value is None:
+            continue
+        for lane_name, byte_value in zip(HEX_BYTE_LANES, _hex_word_bytes(parsed_value)):
+            bucket = lane_counts[lane_name]
+            byte_hex = f"0x{byte_value:02x}"
+            bucket[byte_hex] = bucket.get(byte_hex, 0) + value_count
+
+    stable_lanes: list[str] = []
+    varying_lanes: list[str] = []
+    always_zero_lanes: list[str] = []
+    common_lane_values: dict[str, str] = {}
+    for lane_name, bucket in lane_counts.items():
+        if not bucket:
+            continue
+        if len(bucket) == 1:
+            stable_lanes.append(lane_name)
+            only_value = next(iter(bucket))
+            common_lane_values[lane_name] = only_value
+            if only_value == "0x00":
+                always_zero_lanes.append(lane_name)
+        else:
+            varying_lanes.append(lane_name)
+
+    return {
+        "lanes": {lane_name: _sorted_count_map(bucket) for lane_name, bucket in lane_counts.items()},
+        "stableLanes": stable_lanes,
+        "varyingLanes": varying_lanes,
+        "alwaysZeroLanes": always_zero_lanes,
+        "commonLaneValues": common_lane_values,
+    }
+
+
+def _summarize_word_half_profiles(counts: dict[str, int]) -> dict[str, Any] | None:
+    if not counts:
+        return None
+    lane_counts: dict[str, dict[str, int]] = {lane: {} for lane in HEX_HALF_LANES}
+    for value, value_count in counts.items():
+        parsed_value = _parse_hex_word(value)
+        if parsed_value is None:
+            continue
+        upper_half = f"0x{(parsed_value >> 16) & 0xFFFF:04x}"
+        lower_half = f"0x{parsed_value & 0xFFFF:04x}"
+        for lane_name, half_value in zip(HEX_HALF_LANES, (upper_half, lower_half)):
+            bucket = lane_counts[lane_name]
+            bucket[half_value] = bucket.get(half_value, 0) + value_count
+
+    stable_lanes: list[str] = []
+    varying_lanes: list[str] = []
+    always_zero_lanes: list[str] = []
+    common_lane_values: dict[str, str] = {}
+    for lane_name, bucket in lane_counts.items():
+        if not bucket:
+            continue
+        if len(bucket) == 1:
+            stable_lanes.append(lane_name)
+            only_value = next(iter(bucket))
+            common_lane_values[lane_name] = only_value
+            if only_value == "0x0000":
+                always_zero_lanes.append(lane_name)
+        else:
+            varying_lanes.append(lane_name)
+
+    return {
+        "lanes": {lane_name: _sorted_count_map(bucket) for lane_name, bucket in lane_counts.items()},
+        "stableLanes": stable_lanes,
+        "varyingLanes": varying_lanes,
+        "alwaysZeroLanes": always_zero_lanes,
+        "commonLaneValues": common_lane_values,
+    }
+
+
+def _summarize_mutating_word(counts: dict[str, int]) -> dict[str, Any] | None:
+    if len(counts) <= 1:
+        return None
+    ordered_values = list(sorted(counts))
+    parsed_values = [_parse_hex_word(value) for value in ordered_values]
+    if any(value is None for value in parsed_values):
+        return {
+            "values": ordered_values,
+            "valueCounts": _sorted_count_map(counts),
+        }
+    base_value = parsed_values[0]
+    assert base_value is not None
+    xor_values = sorted({base_value ^ value for value in parsed_values[1:] if value is not None})
+    mutation_bits = sorted(
+        {
+            bit_index
+            for xor_value in xor_values
+            for bit_index in range(32)
+            if xor_value & (1 << bit_index)
+        }
+    )
+    changed_byte_lanes = sorted(
+        {
+            HEX_BYTE_LANES[lane_index]
+            for xor_value in xor_values
+            for lane_index, lane_byte in enumerate(_hex_word_bytes(xor_value))
+            if lane_byte
+        }
+    )
+    changed_half_lanes = sorted(
+        {
+            HEX_HALF_LANES[0] if xor_value & 0xFFFF0000 else HEX_HALF_LANES[1]
+            for xor_value in xor_values
+            if xor_value
+        }
+    )
+    return {
+        "values": ordered_values,
+        "valueCounts": _sorted_count_map(counts),
+        "xorFromFirstValue": [f"0x{xor_value:08x}" for xor_value in xor_values],
+        "bitPositions": mutation_bits,
+        "changedByteLanes": changed_byte_lanes,
+        "changedHalfLanes": changed_half_lanes,
+    }
+
+
+def _update_halfword_cluster(
+    clusters: dict[str, dict[str, Any]],
+    cluster_key: str,
+    *,
+    object_name: str | None,
+    object_ordinal: int | None,
+    paired_half0: str | None = None,
+    paired_half1: str | None = None,
+) -> None:
+    cluster = clusters.setdefault(
+        cluster_key,
+        {
+            "count": 0,
+            "objectNames": set(),
+            "ordinals": set(),
+            "pairedHalf0": {},
+            "pairedHalf1": {},
+        },
+    )
+    cluster["count"] += 1
+    if isinstance(object_name, str) and object_name:
+        cluster["objectNames"].add(object_name)
+    if isinstance(object_ordinal, int):
+        cluster["ordinals"].add(object_ordinal)
+    if isinstance(paired_half0, str) and paired_half0:
+        cluster["pairedHalf0"][paired_half0] = cluster["pairedHalf0"].get(paired_half0, 0) + 1
+    if isinstance(paired_half1, str) and paired_half1:
+        cluster["pairedHalf1"][paired_half1] = cluster["pairedHalf1"].get(paired_half1, 0) + 1
+
+
+def _build_halfword_cluster_hints(clusters: dict[str, dict[str, Any]], total_object_names: int) -> dict[str, dict[str, Any]]:
+    hints: dict[str, dict[str, Any]] = {}
+    for key, value in clusters.items():
+        object_name_count = len(value["objectNames"])
+        paired_half0_count = len(value["pairedHalf0"])
+        paired_half1_count = len(value["pairedHalf1"])
+        scope_hint = "single_object_specific"
+        if object_name_count > 1 and object_name_count == total_object_names:
+            scope_hint = "family_shared"
+        elif object_name_count > 1:
+            scope_hint = "multi_object_category"
+
+        lane_hint = "mixed_cluster"
+        if paired_half0_count == 1 and paired_half1_count == 1:
+            lane_hint = "paired_halves_stable"
+        elif paired_half0_count > 1 and paired_half1_count == 1:
+            lane_hint = "paired_half0_varies"
+        elif paired_half0_count == 1 and paired_half1_count > 1:
+            lane_hint = "paired_half1_varies"
+        elif paired_half0_count > 1 and paired_half1_count > 1:
+            lane_hint = "paired_halves_both_vary"
+
+        hints[key] = {
+            "scopeHint": scope_hint,
+            "laneHint": lane_hint,
+            "objectNameCount": object_name_count,
+            "ordinalCount": len(value["ordinals"]),
+            "pairedHalf0Count": paired_half0_count,
+            "pairedHalf1Count": paired_half1_count,
+        }
+    return hints
+
+
+def _update_vector_alignment_cluster(
+    clusters: dict[str, dict[str, Any]],
+    cluster_key: str,
+    *,
+    object_name: str | None,
+    object_ordinal: int | None,
+    paired_vector_a_half1: str | None = None,
+    paired_vector_b_half0: str | None = None,
+) -> None:
+    cluster = clusters.setdefault(
+        cluster_key,
+        {
+            "count": 0,
+            "objectNames": set(),
+            "ordinals": set(),
+            "pairedVectorAHalf1": {},
+            "pairedVectorBHalf0": {},
+        },
+    )
+    cluster["count"] += 1
+    if isinstance(object_name, str) and object_name:
+        cluster["objectNames"].add(object_name)
+    if isinstance(object_ordinal, int):
+        cluster["ordinals"].add(object_ordinal)
+    if isinstance(paired_vector_a_half1, str) and paired_vector_a_half1:
+        bucket = cluster["pairedVectorAHalf1"]
+        bucket[paired_vector_a_half1] = bucket.get(paired_vector_a_half1, 0) + 1
+    if isinstance(paired_vector_b_half0, str) and paired_vector_b_half0:
+        bucket = cluster["pairedVectorBHalf0"]
+        bucket[paired_vector_b_half0] = bucket.get(paired_vector_b_half0, 0) + 1
+
+
+def _build_vector_alignment_hints(clusters: dict[str, dict[str, Any]], total_object_names: int) -> dict[str, dict[str, Any]]:
+    hints: dict[str, dict[str, Any]] = {}
+    for key, value in clusters.items():
+        object_name_count = len(value["objectNames"])
+        paired_vector_a_count = len(value["pairedVectorAHalf1"])
+        paired_vector_b_count = len(value["pairedVectorBHalf0"])
+        scope_hint = "single_object_specific"
+        if object_name_count > 1 and object_name_count == total_object_names:
+            scope_hint = "family_shared"
+        elif object_name_count > 1:
+            scope_hint = "multi_object_category"
+
+        vector_lane_hint = "mixed_vector_cluster"
+        if paired_vector_a_count == 1 and paired_vector_b_count == 1:
+            vector_lane_hint = "vector_pair_stable"
+        elif paired_vector_a_count > 1 and paired_vector_b_count == 1:
+            vector_lane_hint = "vector_a_half1_varies"
+        elif paired_vector_a_count == 1 and paired_vector_b_count > 1:
+            vector_lane_hint = "vector_b_half0_varies"
+        elif paired_vector_a_count > 1 and paired_vector_b_count > 1:
+            vector_lane_hint = "vector_pair_both_vary"
+
+        hints[key] = {
+            "scopeHint": scope_hint,
+            "vectorLaneHint": vector_lane_hint,
+            "objectNameCount": object_name_count,
+            "ordinalCount": len(value["ordinals"]),
+            "pairedVectorAHalf1Count": paired_vector_a_count,
+            "pairedVectorBHalf0Count": paired_vector_b_count,
+        }
+    return hints
+
+
+def _assess_vector_cluster_alignment(cluster_hints: dict[str, dict[str, Any]], cluster_label: str) -> str:
+    multi_object_keys = [
+        key
+        for key, value in cluster_hints.items()
+        if value.get("scopeHint") == "multi_object_category"
+    ]
+    if not multi_object_keys:
+        return f"no multi-object {cluster_label} vector clusters observed"
+    if any(
+        cluster_hints[key].get("vectorLaneHint") != "vector_pair_stable"
+        for key in multi_object_keys
+    ):
+        return f"multi-object {cluster_label} clusters span multiple vector signatures; not a simple vector bucket"
+    return f"multi-object {cluster_label} clusters currently map to stable vector signatures"
+
+
+def summarize_descriptor_state_correlations(history: list[dict[str, Any]]) -> dict[str, Any]:
+    descriptor_unit_codes: dict[str, int] = {}
+    descriptor_kinds: dict[str, int] = {}
+    descriptor_code_kinds: dict[str, dict[str, int]] = {}
+    state_unit_codes: dict[str, int] = {}
+
+    for entry in history:
+        if entry.get("channel") != "udp":
+            continue
+        decoder = entry.get("decoder") or {}
+        family = decoder.get("family")
+        if family == "peer_object_descriptor":
+            object_kind = decoder.get("objectKind")
+            if isinstance(object_kind, str) and object_kind:
+                descriptor_kinds[object_kind] = descriptor_kinds.get(object_kind, 0) + 1
+            object_codes = decoder.get("objectCodes")
+            if isinstance(object_codes, list):
+                for code in object_codes:
+                    if not isinstance(code, str) or not code:
+                        continue
+                    descriptor_unit_codes[code] = descriptor_unit_codes.get(code, 0) + 1
+                    if isinstance(object_kind, str) and object_kind:
+                        bucket = descriptor_code_kinds.setdefault(code, {})
+                        bucket[object_kind] = bucket.get(object_kind, 0) + 1
+        elif family == "peer_state_block":
+            unit_codes = decoder.get("unitCodes")
+            if isinstance(unit_codes, list):
+                for code in unit_codes:
+                    if not isinstance(code, str) or not code:
+                        continue
+                    state_unit_codes[code] = state_unit_codes.get(code, 0) + 1
+
+    descriptor_code_set = set(descriptor_unit_codes)
+    state_code_set = set(state_unit_codes)
+    shared_unit_codes = sorted(descriptor_code_set & state_code_set)
+    descriptor_only_unit_codes = sorted(descriptor_code_set - state_code_set)
+    state_only_unit_codes = sorted(state_code_set - descriptor_code_set)
+
+    state_unit_code_kinds: dict[str, str] = {}
+    state_kind_counts: dict[str, int] = {}
+    for code in shared_unit_codes:
+        kind = _top_count_key(descriptor_code_kinds.get(code, {}))
+        if kind:
+            state_unit_code_kinds[code] = kind
+            state_kind_counts[kind] = state_kind_counts.get(kind, 0) + state_unit_codes.get(code, 0)
+
+    state_visible_object_kinds = sorted(state_kind_counts)
+    descriptor_only_object_kinds = sorted(set(descriptor_kinds) - set(state_kind_counts))
+
+    assessment = "insufficient descriptor/state overlap for correlation"
+    if descriptor_unit_codes and state_unit_codes:
+        assessment_parts = ["state blocks reuse a subset of descriptor unit codes in this sample"]
+        highlighted_kinds = [kind for kind in ("person", "scrap") if kind in descriptor_only_object_kinds]
+        if highlighted_kinds:
+            if len(descriptor_only_object_kinds) > len(highlighted_kinds):
+                assessment_parts.append(
+                    f"{', '.join(highlighted_kinds)} and some other roster entries remain descriptor-only"
+                )
+            else:
+                assessment_parts.append(f"{' and '.join(highlighted_kinds)} remain descriptor-only")
+        elif descriptor_only_unit_codes:
+            assessment_parts.append("some descriptor roster codes remain outside the observed state stream")
+        elif state_only_unit_codes:
+            assessment_parts.append("some state codes have not yet been seen in descriptor packets")
+        assessment = "; ".join(assessment_parts)
+
+    return {
+        "descriptorUnitCodes": _sorted_count_map(descriptor_unit_codes),
+        "stateUnitCodes": _sorted_count_map(state_unit_codes),
+        "sharedUnitCodes": shared_unit_codes,
+        "descriptorOnlyUnitCodes": descriptor_only_unit_codes,
+        "stateOnlyUnitCodes": state_only_unit_codes,
+        "descriptorKinds": _sorted_count_map(descriptor_kinds),
+        "stateKindCounts": _sorted_count_map(state_kind_counts),
+        "stateUnitCodeKinds": state_unit_code_kinds,
+        "stateVisibleObjectKinds": state_visible_object_kinds,
+        "descriptorOnlyObjectKinds": descriptor_only_object_kinds,
+        "assessment": assessment,
+    }
+
+
+def summarize_descriptor_followups(history: list[dict[str, Any]], lookahead_packets: int = 12) -> dict[str, Any]:
+    descriptor_entries: list[tuple[int, dict[str, Any]]] = []
+    for idx, entry in enumerate(history):
+        if entry.get("channel") != "udp":
+            continue
+        decoder = entry.get("decoder") or {}
+        if decoder.get("family") != "peer_object_descriptor":
+            continue
+        object_kind = decoder.get("objectKind")
+        if not isinstance(object_kind, str) or not object_kind:
+            continue
+        descriptor_entries.append((idx, decoder))
+
+    per_kind: dict[str, dict[str, Any]] = {}
+    for idx, decoder in descriptor_entries:
+        object_kind = str(decoder.get("objectKind"))
+        summary = per_kind.setdefault(
+            object_kind,
+            {
+                "descriptorCount": 0,
+                "firstNonDescriptorEvents": {},
+                "firstShortObjectEvents": {},
+                "descriptorsWithoutShortObjectFollowup": 0,
+            },
+        )
+        summary["descriptorCount"] += 1
+
+        first_non_descriptor: str | None = None
+        first_short_object: str | None = None
+        for next_idx in range(idx + 1, min(len(history), idx + 1 + lookahead_packets)):
+            next_entry = history[next_idx]
+            if next_entry.get("channel") != "udp":
+                continue
+            next_decoder = next_entry.get("decoder") or {}
+            next_family = next_decoder.get("family")
+            if next_family == "peer_object_descriptor":
+                continue
+            if not isinstance(next_family, str) or not next_family.startswith("peer_"):
+                continue
+
+            if first_non_descriptor is None:
+                first_non_descriptor = (
+                    next_decoder.get("objectSetupEvent")
+                    or next_decoder.get("controlEvent")
+                    or next_family
+                )
+                if isinstance(first_non_descriptor, str) and first_non_descriptor:
+                    bucket = summary["firstNonDescriptorEvents"]
+                    bucket[first_non_descriptor] = bucket.get(first_non_descriptor, 0) + 1
+
+            if next_family in {
+                "peer_object_presence",
+                "peer_object_counter",
+                "peer_object_control",
+                "peer_object_setup_marker",
+                "peer_object_batch",
+            }:
+                first_short_object = next_decoder.get("objectSetupEvent") or next_family
+                if isinstance(first_short_object, str) and first_short_object:
+                    bucket = summary["firstShortObjectEvents"]
+                    bucket[first_short_object] = bucket.get(first_short_object, 0) + 1
+                break
+
+        if first_short_object is None:
+            summary["descriptorsWithoutShortObjectFollowup"] += 1
+
+    ordered: dict[str, Any] = {}
+    for object_kind, summary in sorted(per_kind.items()):
+        descriptor_count = summary["descriptorCount"]
+        first_non_descriptor_events = _sorted_count_map(summary["firstNonDescriptorEvents"])
+        first_short_object_events = _sorted_count_map(summary["firstShortObjectEvents"])
+        descriptors_without_short = summary["descriptorsWithoutShortObjectFollowup"]
+        descriptors_with_short = descriptor_count - descriptors_without_short
+
+        assessment = "insufficient descriptor follow-up data"
+        top_non_descriptor = _top_count_key(first_non_descriptor_events)
+        if descriptors_with_short and descriptors_without_short:
+            assessment = "some descriptors reach short object/setup followups while others hand off directly into broader peer traffic"
+        elif descriptors_with_short:
+            assessment = "descriptors often transition into short object/setup followup packets"
+        elif top_non_descriptor == "peer_state_block":
+            assessment = "descriptors usually hand off directly into state traffic without a decoded short object/setup followup"
+        elif top_non_descriptor:
+            assessment = f"descriptors usually hand off into {top_non_descriptor} without a decoded short object/setup followup"
+
+        ordered[object_kind] = {
+            "descriptorCount": descriptor_count,
+            "firstNonDescriptorEvents": first_non_descriptor_events,
+            "firstShortObjectEvents": first_short_object_events,
+            "descriptorsWithShortObjectFollowup": descriptors_with_short,
+            "descriptorsWithoutShortObjectFollowup": descriptors_without_short,
+            "assessment": assessment,
+        }
+
+    return {
+        "lookaheadPackets": lookahead_packets,
+        "objectKinds": ordered,
+    }
+
+
+def summarize_unresolved_control_traffic(history: list[dict[str, Any]]) -> dict[str, Any]:
+    po_signatures: dict[str, dict[str, Any]] = {}
+    object_control_signatures: dict[str, dict[str, Any]] = {}
+    context_window = 4
+    scrap_control_words_by_name: dict[str, set[str]] = {}
+
+    for entry in history:
+        if entry.get("channel") != "udp":
+            continue
+        decoder = entry.get("decoder") or {}
+        if decoder.get("family") != "peer_object_descriptor" or decoder.get("objectKind") != "scrap":
+            continue
+        object_name = decoder.get("primaryObjectName")
+        descriptor_sketch = decoder.get("descriptorSketch")
+        if not isinstance(object_name, str) or not object_name or not isinstance(descriptor_sketch, dict):
+            continue
+        control_word = descriptor_sketch.get("controlWord")
+        if isinstance(control_word, str) and control_word:
+            scrap_control_words_by_name.setdefault(object_name, set()).add(control_word)
+
+    mutable_scrap_names = {
+        name for name, values in scrap_control_words_by_name.items() if len(values) > 1
+    }
+
+    def _next_scrap_descriptor(index: int) -> tuple[str | None, str | None, str | None, int | None, str | None]:
+        source_log = history[index].get("sourceLog")
+        for neighbor_index in range(index + 1, min(len(history), index + context_window + 3)):
+            if source_log and history[neighbor_index].get("sourceLog") != source_log:
+                continue
+            neighbor_decoder = history[neighbor_index].get("decoder") or {}
+            if neighbor_decoder.get("family") != "peer_object_descriptor" or neighbor_decoder.get("objectKind") != "scrap":
+                continue
+            object_name = neighbor_decoder.get("primaryObjectName") if isinstance(neighbor_decoder.get("primaryObjectName"), str) else None
+            object_ordinal = neighbor_decoder.get("objectOrdinal") if isinstance(neighbor_decoder.get("objectOrdinal"), int) else None
+            descriptor_sketch = neighbor_decoder.get("descriptorSketch")
+            control_half0 = None
+            param_half1 = None
+            subtype_word = None
+            if isinstance(descriptor_sketch, dict):
+                control_word = descriptor_sketch.get("controlWord")
+                param_word = descriptor_sketch.get("paramWord")
+                subtype_value = descriptor_sketch.get("subtypeWord")
+                control_value = _parse_hex_word(control_word) if isinstance(control_word, str) else None
+                param_value = _parse_hex_word(param_word) if isinstance(param_word, str) else None
+                if control_value is not None:
+                    control_half0 = f"0x{(control_value >> 16) & 0xFFFF:04x}"
+                if param_value is not None:
+                    param_half1 = f"0x{param_value & 0xFFFF:04x}"
+                if isinstance(subtype_value, str) and subtype_value:
+                    subtype_word = subtype_value
+            return object_name, control_half0, param_half1, object_ordinal, subtype_word
+        return None, None, None, None, None
+
+    def _collect_local_context(index: int) -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int], dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+        descriptor_kinds: dict[str, int] = {}
+        object_events: dict[str, int] = {}
+        object_names: dict[str, int] = {}
+        payload_families: dict[str, int] = {}
+        scrap_control_half0: dict[str, int] = {}
+        scrap_param_half1: dict[str, int] = {}
+        mutable_scrap_names_nearby: dict[str, int] = {}
+        mutable_scrap_control_half0: dict[str, int] = {}
+        source_log = history[index].get("sourceLog")
+        for neighbor_index in range(max(0, index - context_window), min(len(history), index + context_window + 1)):
+            if neighbor_index == index:
+                continue
+            if source_log and history[neighbor_index].get("sourceLog") != source_log:
+                continue
+            neighbor_decoder = history[neighbor_index].get("decoder") or {}
+            if neighbor_decoder.get("family") == "peer_object_descriptor":
+                object_kind = neighbor_decoder.get("objectKind")
+                if isinstance(object_kind, str) and object_kind:
+                    descriptor_kinds[object_kind] = descriptor_kinds.get(object_kind, 0) + 1
+                object_name = neighbor_decoder.get("primaryObjectName")
+                if isinstance(object_name, str) and object_name:
+                    object_names[object_name] = object_names.get(object_name, 0) + 1
+                payload_family = neighbor_decoder.get("descriptorPayloadFamilyHint")
+                if isinstance(payload_family, str) and payload_family:
+                    payload_families[payload_family] = payload_families.get(payload_family, 0) + 1
+                if object_kind == "scrap":
+                    descriptor_sketch = neighbor_decoder.get("descriptorSketch")
+                    if isinstance(descriptor_sketch, dict):
+                        control_word = descriptor_sketch.get("controlWord")
+                        param_word = descriptor_sketch.get("paramWord")
+                        control_value = _parse_hex_word(control_word) if isinstance(control_word, str) else None
+                        param_value = _parse_hex_word(param_word) if isinstance(param_word, str) else None
+                        if control_value is not None:
+                            key = f"0x{(control_value >> 16) & 0xFFFF:04x}"
+                            scrap_control_half0[key] = scrap_control_half0.get(key, 0) + 1
+                            if object_name in mutable_scrap_names:
+                                mutable_scrap_control_half0[key] = mutable_scrap_control_half0.get(key, 0) + 1
+                        if param_value is not None:
+                            key = f"0x{param_value & 0xFFFF:04x}"
+                            scrap_param_half1[key] = scrap_param_half1.get(key, 0) + 1
+                    if isinstance(object_name, str) and object_name in mutable_scrap_names:
+                        mutable_scrap_names_nearby[object_name] = mutable_scrap_names_nearby.get(object_name, 0) + 1
+            object_event = neighbor_decoder.get("objectSetupEvent")
+            if isinstance(object_event, str) and object_event:
+                object_events[object_event] = object_events.get(object_event, 0) + 1
+        return (
+            descriptor_kinds,
+            object_events,
+            object_names,
+            payload_families,
+            scrap_control_half0,
+            scrap_param_half1,
+            mutable_scrap_names_nearby,
+            mutable_scrap_control_half0,
+        )
+
+    for idx, entry in enumerate(history):
+        if entry.get("channel") != "udp":
+            continue
+        decoder = entry.get("decoder") or {}
+        family = decoder.get("family")
+        if family == "peer_control_marker" and decoder.get("controlEvent") == "peer_control_unknown_po":
+            timing_fields = decoder.get("timingFields")
+            if not isinstance(timing_fields, dict):
+                continue
+            mode_word = timing_fields.get("modeWord")
+            lane_value = timing_fields.get("laneValue")
+            signature_key = f"{mode_word}/lane{lane_value}" if mode_word is not None and lane_value is not None else "unknown"
+            summary = po_signatures.setdefault(
+                signature_key,
+                {
+                    "count": 0,
+                    "modeWord": mode_word,
+                    "laneValue": lane_value,
+                    "sequenceValues": set(),
+                    "_clockValues": [],
+                    "_nearbyDescriptorKinds": {},
+                    "_nearbyObjectEvents": {},
+                    "_nearbyObjectNames": {},
+                    "_nearbyPayloadFamilies": {},
+                    "_nearbyScrapControlHalf0": {},
+                    "_nearbyScrapParamHalf1": {},
+                    "_nearbyMutableScrapNames": {},
+                    "_nearbyMutableScrapControlHalf0": {},
+                    "_sequenceNextDescriptorNames": {},
+                    "_sequenceNextScrapControlHalf0": {},
+                    "_sequenceNextScrapParamHalf1": {},
+                    "_sequenceNextScrapOrdinals": {},
+                    "_sequenceNextScrapSubtypeWords": {},
+                },
+            )
+            summary["count"] += 1
+            sequence_value = timing_fields.get("sequenceValue")
+            if isinstance(sequence_value, int):
+                summary["sequenceValues"].add(sequence_value)
+            clock_seconds = timing_fields.get("clockSeconds")
+            if isinstance(clock_seconds, (int, float)):
+                summary["_clockValues"].append(float(clock_seconds))
+            (
+                nearby_descriptor_kinds,
+                nearby_object_events,
+                nearby_object_names,
+                nearby_payload_families,
+                nearby_scrap_control_half0,
+                nearby_scrap_param_half1,
+                nearby_mutable_scrap_names,
+                nearby_mutable_scrap_control_half0,
+            ) = _collect_local_context(idx)
+            for key, value in nearby_descriptor_kinds.items():
+                bucket = summary["_nearbyDescriptorKinds"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_object_events.items():
+                bucket = summary["_nearbyObjectEvents"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_object_names.items():
+                bucket = summary["_nearbyObjectNames"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_payload_families.items():
+                bucket = summary["_nearbyPayloadFamilies"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_scrap_control_half0.items():
+                bucket = summary["_nearbyScrapControlHalf0"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_scrap_param_half1.items():
+                bucket = summary["_nearbyScrapParamHalf1"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_mutable_scrap_names.items():
+                bucket = summary["_nearbyMutableScrapNames"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_mutable_scrap_control_half0.items():
+                bucket = summary["_nearbyMutableScrapControlHalf0"]
+                bucket[key] = bucket.get(key, 0) + value
+            if isinstance(sequence_value, int):
+                next_object_name, next_control_half0, next_param_half1, next_ordinal, next_subtype_word = _next_scrap_descriptor(idx)
+                if isinstance(next_object_name, str) and next_object_name:
+                    bucket = summary["_sequenceNextDescriptorNames"].setdefault(sequence_value, {})
+                    bucket[next_object_name] = bucket.get(next_object_name, 0) + 1
+                if isinstance(next_control_half0, str) and next_control_half0:
+                    bucket = summary["_sequenceNextScrapControlHalf0"].setdefault(sequence_value, {})
+                    bucket[next_control_half0] = bucket.get(next_control_half0, 0) + 1
+                if isinstance(next_param_half1, str) and next_param_half1:
+                    bucket = summary["_sequenceNextScrapParamHalf1"].setdefault(sequence_value, {})
+                    bucket[next_param_half1] = bucket.get(next_param_half1, 0) + 1
+                if isinstance(next_ordinal, int):
+                    bucket = summary["_sequenceNextScrapOrdinals"].setdefault(sequence_value, set())
+                    bucket.add(next_ordinal)
+                if isinstance(next_subtype_word, str) and next_subtype_word:
+                    bucket = summary["_sequenceNextScrapSubtypeWords"].setdefault(sequence_value, {})
+                    bucket[next_subtype_word] = bucket.get(next_subtype_word, 0) + 1
+        elif family == "peer_object_control":
+            signature = decoder.get("controlBodySignature")
+            if not isinstance(signature, str) or not signature:
+                signature = "unknown"
+            summary = object_control_signatures.setdefault(
+                signature,
+                {
+                    "count": 0,
+                    "controlBodyBytes": decoder.get("controlBodyBytes"),
+                    "controlModeWord": decoder.get("controlModeWord"),
+                    "controlTailWord": decoder.get("controlTailWord"),
+                    "_nearbyDescriptorKinds": {},
+                    "_nearbyObjectEvents": {},
+                    "_nearbyObjectNames": {},
+                    "_nearbyPayloadFamilies": {},
+                    "_nearbyScrapControlHalf0": {},
+                    "_nearbyScrapParamHalf1": {},
+                    "_nearbyMutableScrapNames": {},
+                    "_nearbyMutableScrapControlHalf0": {},
+                },
+            )
+            summary["count"] += 1
+            (
+                nearby_descriptor_kinds,
+                nearby_object_events,
+                nearby_object_names,
+                nearby_payload_families,
+                nearby_scrap_control_half0,
+                nearby_scrap_param_half1,
+                nearby_mutable_scrap_names,
+                nearby_mutable_scrap_control_half0,
+            ) = _collect_local_context(idx)
+            for key, value in nearby_descriptor_kinds.items():
+                bucket = summary["_nearbyDescriptorKinds"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_object_events.items():
+                bucket = summary["_nearbyObjectEvents"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_object_names.items():
+                bucket = summary["_nearbyObjectNames"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_payload_families.items():
+                bucket = summary["_nearbyPayloadFamilies"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_scrap_control_half0.items():
+                bucket = summary["_nearbyScrapControlHalf0"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_scrap_param_half1.items():
+                bucket = summary["_nearbyScrapParamHalf1"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_mutable_scrap_names.items():
+                bucket = summary["_nearbyMutableScrapNames"]
+                bucket[key] = bucket.get(key, 0) + value
+            for key, value in nearby_mutable_scrap_control_half0.items():
+                bucket = summary["_nearbyMutableScrapControlHalf0"]
+                bucket[key] = bucket.get(key, 0) + value
+
+    ordered_po_signatures: dict[str, Any] = {}
+    for key, value in sorted(po_signatures.items(), key=lambda item: (-item[1]["count"], item[0])):
+        clock_values = value.pop("_clockValues")
+        nearby_descriptor_kinds = value.pop("_nearbyDescriptorKinds")
+        nearby_object_events = value.pop("_nearbyObjectEvents")
+        nearby_object_names = value.pop("_nearbyObjectNames")
+        nearby_payload_families = value.pop("_nearbyPayloadFamilies")
+        nearby_scrap_control_half0 = value.pop("_nearbyScrapControlHalf0")
+        nearby_scrap_param_half1 = value.pop("_nearbyScrapParamHalf1")
+        nearby_mutable_scrap_names = value.pop("_nearbyMutableScrapNames")
+        nearby_mutable_scrap_control_half0 = value.pop("_nearbyMutableScrapControlHalf0")
+        sequence_next_descriptor_names = value.pop("_sequenceNextDescriptorNames")
+        sequence_next_scrap_control_half0 = value.pop("_sequenceNextScrapControlHalf0")
+        sequence_next_scrap_param_half1 = value.pop("_sequenceNextScrapParamHalf1")
+        sequence_next_scrap_ordinals = value.pop("_sequenceNextScrapOrdinals")
+        sequence_next_scrap_subtype_words = value.pop("_sequenceNextScrapSubtypeWords")
+        subtype_to_control_half0: dict[str, dict[str, int]] = {}
+        subtype_to_param_half1: dict[str, dict[str, int]] = {}
+        for sequence_value in sorted(
+            set(sequence_next_scrap_subtype_words) | set(sequence_next_scrap_control_half0) | set(sequence_next_scrap_param_half1)
+        ):
+            subtype_counts = sequence_next_scrap_subtype_words.get(sequence_value, {})
+            control_counts = sequence_next_scrap_control_half0.get(sequence_value, {})
+            param_counts = sequence_next_scrap_param_half1.get(sequence_value, {})
+            if len(subtype_counts) != 1:
+                continue
+            subtype_word = next(iter(subtype_counts))
+            if len(control_counts) == 1:
+                control_half0 = next(iter(control_counts))
+                bucket = subtype_to_control_half0.setdefault(subtype_word, {})
+                bucket[control_half0] = bucket.get(control_half0, 0) + 1
+            if len(param_counts) == 1:
+                param_half1 = next(iter(param_counts))
+                bucket = subtype_to_param_half1.setdefault(subtype_word, {})
+                bucket[param_half1] = bucket.get(param_half1, 0) + 1
+        mutable_scrap_assessment = "no mutable scrap overlap observed"
+        if nearby_mutable_scrap_names:
+            highlighted_mutable = ", ".join(list(_sorted_count_map(nearby_mutable_scrap_names).keys())[:3])
+            if len(nearby_mutable_scrap_control_half0) == 1:
+                highlighted_half0 = next(iter(_sorted_count_map(nearby_mutable_scrap_control_half0)))
+                mutable_scrap_assessment = f"overlaps mutable scrap via {highlighted_mutable}; observed mutable scrap controlHalf0 is {highlighted_half0}"
+            else:
+                mutable_scrap_assessment = f"overlaps mutable scrap via {highlighted_mutable}"
+        sequence_pattern_assessment = "no next-scrap sequence pattern observed"
+        sequence_halfword_assessment = "no subtype-linked halfword pattern observed"
+        ordered_sequence_ordinals: list[int] = []
+        ordered_sequence_subtype_values: list[int] = []
+        for sequence_value in sorted(sequence_next_scrap_ordinals):
+            ordinals_for_sequence = sequence_next_scrap_ordinals.get(sequence_value, set())
+            if len(ordinals_for_sequence) == 1:
+                ordered_sequence_ordinals.append(next(iter(ordinals_for_sequence)))
+        for sequence_value in sorted(sequence_next_scrap_subtype_words):
+            subtype_counts = sequence_next_scrap_subtype_words.get(sequence_value, {})
+            if len(subtype_counts) == 1:
+                subtype_word = next(iter(subtype_counts))
+                subtype_value = _parse_hex_word(subtype_word)
+                if subtype_value is not None:
+                    ordered_sequence_subtype_values.append(subtype_value)
+        subtype_stride = None
+        if len(ordered_sequence_subtype_values) >= 2:
+            subtype_deltas = [
+                right - left for left, right in zip(ordered_sequence_subtype_values, ordered_sequence_subtype_values[1:])
+            ]
+            if len(set(subtype_deltas)) == 1:
+                subtype_stride = subtype_deltas[0]
+        if ordered_sequence_ordinals or ordered_sequence_subtype_values:
+            sequence_pattern_assessment = "next-scrap sequence pattern is partially decoded"
+            if (
+                len(ordered_sequence_subtype_values) >= 2
+                and subtype_stride == 0x0100
+            ):
+                sequence_pattern_assessment = "next-scrap subtypeWord steps contiguously while objectOrdinal does not"
+            elif len(ordered_sequence_ordinals) >= 2 and ordered_sequence_ordinals == sorted(ordered_sequence_ordinals):
+                sequence_pattern_assessment = "next-scrap objectOrdinal steps monotonically"
+        if subtype_to_control_half0 or subtype_to_param_half1:
+            control_one_to_one = bool(subtype_to_control_half0) and all(len(counts) == 1 for counts in subtype_to_control_half0.values()) and len({
+                next(iter(counts)) for counts in subtype_to_control_half0.values()
+            }) == len(subtype_to_control_half0)
+            param_one_to_one = bool(subtype_to_param_half1) and all(len(counts) == 1 for counts in subtype_to_param_half1.values()) and len({
+                next(iter(counts)) for counts in subtype_to_param_half1.values()
+            }) == len(subtype_to_param_half1)
+            if control_one_to_one and not param_one_to_one:
+                sequence_halfword_assessment = "subtypeWord maps one-to-one onto controlHalf0, while paramHalf1 repeats across subtype steps"
+            elif control_one_to_one and param_one_to_one:
+                sequence_halfword_assessment = "subtypeWord currently maps one-to-one onto both controlHalf0 and paramHalf1"
+            else:
+                sequence_halfword_assessment = "subtypeWord-to-halfword mapping is partially decoded"
+        ordered_po_signatures[key] = {
+            "count": value["count"],
+            "modeWord": value["modeWord"],
+            "laneValue": value["laneValue"],
+            "sequenceValues": sorted(value["sequenceValues"]),
+            "clockSecondsRange": [
+                round(min(clock_values), 3),
+                round(max(clock_values), 3),
+            ] if clock_values else [],
+            "nearbyDescriptorKinds": _sorted_count_map(nearby_descriptor_kinds),
+            "nearbyObjectEvents": _sorted_count_map(nearby_object_events),
+            "nearbyObjectNames": _sorted_count_map(nearby_object_names),
+            "nearbyPayloadFamilies": _sorted_count_map(nearby_payload_families),
+            "nearbyScrapControlHalf0": _sorted_count_map(nearby_scrap_control_half0),
+            "nearbyScrapParamHalf1": _sorted_count_map(nearby_scrap_param_half1),
+            "nearbyMutableScrapNames": _sorted_count_map(nearby_mutable_scrap_names),
+            "nearbyMutableScrapControlHalf0": _sorted_count_map(nearby_mutable_scrap_control_half0),
+            "mutableScrapAssessment": mutable_scrap_assessment,
+            "sequenceNextDescriptorNames": {
+                str(sequence_value): _sorted_count_map(counts)
+                for sequence_value, counts in sorted(sequence_next_descriptor_names.items())
+            },
+            "sequenceNextScrapControlHalf0": {
+                str(sequence_value): _sorted_count_map(counts)
+                for sequence_value, counts in sorted(sequence_next_scrap_control_half0.items())
+            },
+            "sequenceNextScrapParamHalf1": {
+                str(sequence_value): _sorted_count_map(counts)
+                for sequence_value, counts in sorted(sequence_next_scrap_param_half1.items())
+            },
+            "sequenceNextScrapOrdinals": {
+                str(sequence_value): sorted(ordinals)
+                for sequence_value, ordinals in sorted(sequence_next_scrap_ordinals.items())
+            },
+            "sequenceNextScrapSubtypeWords": {
+                str(sequence_value): _sorted_count_map(counts)
+                for sequence_value, counts in sorted(sequence_next_scrap_subtype_words.items())
+            },
+            "sequencePatternAssessment": sequence_pattern_assessment,
+            "subtypeToScrapControlHalf0": {
+                subtype_word: _sorted_count_map(counts)
+                for subtype_word, counts in sorted(subtype_to_control_half0.items())
+            },
+            "subtypeToScrapParamHalf1": {
+                subtype_word: _sorted_count_map(counts)
+                for subtype_word, counts in sorted(subtype_to_param_half1.items())
+            },
+            "sequenceHalfwordAssessment": sequence_halfword_assessment,
+        }
+
+    ordered_object_control_signatures: dict[str, Any] = {}
+    for key, value in sorted(object_control_signatures.items(), key=lambda item: (-item[1]["count"], item[0])):
+        nearby_descriptor_kinds = value.pop("_nearbyDescriptorKinds")
+        nearby_object_events = value.pop("_nearbyObjectEvents")
+        nearby_object_names = value.pop("_nearbyObjectNames")
+        nearby_payload_families = value.pop("_nearbyPayloadFamilies")
+        nearby_scrap_control_half0 = value.pop("_nearbyScrapControlHalf0")
+        nearby_scrap_param_half1 = value.pop("_nearbyScrapParamHalf1")
+        nearby_mutable_scrap_names = value.pop("_nearbyMutableScrapNames")
+        nearby_mutable_scrap_control_half0 = value.pop("_nearbyMutableScrapControlHalf0")
+        ordered_object_control_signatures[key] = {
+            **value,
+            "nearbyDescriptorKinds": _sorted_count_map(nearby_descriptor_kinds),
+            "nearbyObjectEvents": _sorted_count_map(nearby_object_events),
+            "nearbyObjectNames": _sorted_count_map(nearby_object_names),
+            "nearbyPayloadFamilies": _sorted_count_map(nearby_payload_families),
+            "nearbyScrapControlHalf0": _sorted_count_map(nearby_scrap_control_half0),
+            "nearbyScrapParamHalf1": _sorted_count_map(nearby_scrap_param_half1),
+            "nearbyMutableScrapNames": _sorted_count_map(nearby_mutable_scrap_names),
+            "nearbyMutableScrapControlHalf0": _sorted_count_map(nearby_mutable_scrap_control_half0),
+        }
+
+    po_assessment = "no PO control markers observed"
+    if "0x0306/lane0" in ordered_po_signatures and "0x0206/lane2" in ordered_po_signatures:
+        po_assessment = "PO mostly runs in a 0x0306/lane0 cadence, with a smaller 0x0206/lane2 burst in the March 21 captures"
+        lane2_descriptor_kinds = ordered_po_signatures["0x0206/lane2"].get("nearbyDescriptorKinds", {})
+        if set(lane2_descriptor_kinds) == {"scrap"}:
+            po_assessment += "; the late 0x0206/lane2 burst is only seen near scrap descriptors in the current windowed context"
+        lane2_scrap_names = ordered_po_signatures["0x0206/lane2"].get("nearbyObjectNames", {})
+        if lane2_scrap_names:
+            highlighted_names = ", ".join(list(lane2_scrap_names.keys())[:5])
+            po_assessment += f"; its local scrap neighborhood is led by {highlighted_names}"
+        lane2_mutable_scrap_names = ordered_po_signatures["0x0206/lane2"].get("nearbyMutableScrapNames", {})
+        if lane2_mutable_scrap_names:
+            highlighted_mutable = ", ".join(list(lane2_mutable_scrap_names.keys())[:3])
+            po_assessment += f"; it overlaps the currently mutable scrap object set via {highlighted_mutable}"
+            lane2_mutable_scrap_control_half0 = ordered_po_signatures["0x0206/lane2"].get("nearbyMutableScrapControlHalf0", {})
+            if set(lane2_mutable_scrap_control_half0) == {"0xa980"}:
+                po_assessment += "; that mutable overlap is only seen with the mutated 0xa980 halfword, not the earlier 0xaa00 variant"
+        lane2_sequence_next_descriptor_names = ordered_po_signatures["0x0206/lane2"].get("sequenceNextDescriptorNames", {})
+        if lane2_sequence_next_descriptor_names:
+            ordered_pairs = [
+                f"{sequence}->{next(iter(names))}"
+                for sequence, names in lane2_sequence_next_descriptor_names.items()
+                if len(names) == 1
+            ]
+            if ordered_pairs:
+                po_assessment += f"; observed late-burst ordering is {'; '.join(ordered_pairs)}"
+        lane2_sequence_next_scrap_subtype_words = ordered_po_signatures["0x0206/lane2"].get("sequenceNextScrapSubtypeWords", {})
+        lane2_sequence_next_scrap_ordinals = ordered_po_signatures["0x0206/lane2"].get("sequenceNextScrapOrdinals", {})
+        ordered_lane2_subtypes: list[int] = []
+        ordered_lane2_ordinals: list[int] = []
+        for sequence_value, subtype_counts in lane2_sequence_next_scrap_subtype_words.items():
+            if len(subtype_counts) == 1:
+                subtype_value = _parse_hex_word(next(iter(subtype_counts)))
+                if subtype_value is not None:
+                    ordered_lane2_subtypes.append(subtype_value)
+        for sequence_value, ordinals in lane2_sequence_next_scrap_ordinals.items():
+            if len(ordinals) == 1:
+                ordered_lane2_ordinals.append(ordinals[0])
+        lane2_subtype_stride = None
+        if len(ordered_lane2_subtypes) >= 2:
+            subtype_deltas = [right - left for left, right in zip(ordered_lane2_subtypes, ordered_lane2_subtypes[1:])]
+            if len(set(subtype_deltas)) == 1:
+                lane2_subtype_stride = subtype_deltas[0]
+        if len(ordered_lane2_subtypes) >= 2 and lane2_subtype_stride == 0x0100:
+            subtype_start = f"0x{ordered_lane2_subtypes[0]:04x}"
+            subtype_end = f"0x{ordered_lane2_subtypes[-1]:04x}"
+            po_assessment += f"; the paired scrap subtypeWord values step contiguously from {subtype_start} through {subtype_end}"
+            if len(ordered_lane2_ordinals) >= 2 and ordered_lane2_ordinals != sorted(ordered_lane2_ordinals):
+                ordinal_text = ", ".join(str(ordinal) for ordinal in ordered_lane2_ordinals)
+                po_assessment += f", while the linked scrap ordinals jump {ordinal_text}"
+        lane2_halfword_assessment = ordered_po_signatures["0x0206/lane2"].get("sequenceHalfwordAssessment")
+        if lane2_halfword_assessment == "subtypeWord maps one-to-one onto controlHalf0, while paramHalf1 repeats across subtype steps":
+            po_assessment += "; across that subtype ladder, controlHalf0 stays subtype-specific while paramHalf1 repeats across more than one subtype step"
+    elif ordered_po_signatures:
+        po_assessment = "PO exposes a stable float-like clock plus small mode/lane words, but only one observed signature family"
+
+    object_control_assessment = "no generic peer_object_control packets observed"
+    if len(ordered_object_control_signatures) > 1:
+        object_control_assessment = "peer_object_control currently splits across a small set of repeated short-packet signatures"
+        if any(
+            signature_info.get("nearbyObjectEvents", {}).get("object_setup_marker")
+            for signature_info in ordered_object_control_signatures.values()
+        ):
+            object_control_assessment += "; the 0x0606 signatures appear adjacent to object_setup_marker packets"
+    elif ordered_object_control_signatures:
+        object_control_assessment = "peer_object_control currently resolves to a single repeated short-packet signature"
+
+    return {
+        "poControlSignatures": ordered_po_signatures,
+        "poAssessment": po_assessment,
+        "objectControlSignatures": ordered_object_control_signatures,
+        "objectControlAssessment": object_control_assessment,
+    }
+
+
+def summarize_descriptor_payload_families(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    families: dict[str, dict[str, Any]] = {}
+    for idx, entry in enumerate(history):
+        if entry.get("channel") != "udp":
+            continue
+        decoder = entry.get("decoder") or {}
+        if decoder.get("family") != "peer_object_descriptor":
+            continue
+
+        payload_family = decoder.get("descriptorPayloadFamilyHint")
+        if not isinstance(payload_family, str) or not payload_family:
+            continue
+
+        summary = families.setdefault(
+            payload_family,
+            {
+                "payloadFamily": payload_family,
+                "packetCount": 0,
+                "descriptorFamilies": {},
+                "descriptorArchetypes": {},
+                "objectKinds": {},
+                "objectNames": set(),
+                "controlSignatures": {},
+                "objectProfiles": {},
+                "payloadWords": {
+                    "controlWord": {},
+                    "paramWord": {},
+                    "vectorWordA": {},
+                    "vectorWordB": {},
+                },
+                "subtypeWordClusters": {},
+                "controlWordHalf0Clusters": {},
+                "paramWordHalf1Clusters": {},
+                "controlWordHalf0VectorClusters": {},
+                "paramWordHalf1VectorClusters": {},
+                "sampleDescriptors": [],
+                "_sampleKeys": set(),
+                "_firstIndex": idx,
+            },
+        )
+        summary["packetCount"] += 1
+
+        descriptor_family = decoder.get("descriptorFamilyHint")
+        if isinstance(descriptor_family, str) and descriptor_family:
+            summary["descriptorFamilies"][descriptor_family] = summary["descriptorFamilies"].get(descriptor_family, 0) + 1
+        descriptor_archetype = decoder.get("descriptorArchetypeHint")
+        if isinstance(descriptor_archetype, str) and descriptor_archetype:
+            summary["descriptorArchetypes"][descriptor_archetype] = summary["descriptorArchetypes"].get(descriptor_archetype, 0) + 1
+        object_kind = decoder.get("objectKind")
+        if isinstance(object_kind, str) and object_kind:
+            summary["objectKinds"][object_kind] = summary["objectKinds"].get(object_kind, 0) + 1
+        object_name = decoder.get("primaryObjectName")
+        if isinstance(object_name, str) and object_name:
+            summary["objectNames"].add(object_name)
+
+        payload_hints = decoder.get("descriptorPayloadHints")
+        if isinstance(payload_hints, dict):
+            control_signature = payload_hints.get("controlSignature")
+            if isinstance(control_signature, str) and control_signature:
+                summary["controlSignatures"][control_signature] = summary["controlSignatures"].get(control_signature, 0) + 1
+
+        descriptor_sketch = decoder.get("descriptorSketch")
+        if isinstance(descriptor_sketch, dict):
+            object_profile: dict[str, Any] | None = None
+            object_ordinal = decoder.get("objectOrdinal") if isinstance(decoder.get("objectOrdinal"), int) else None
+            if isinstance(object_name, str) and object_name:
+                object_profile = summary["objectProfiles"].setdefault(
+                    object_name,
+                    {
+                        "name": object_name,
+                        "observationCount": 0,
+                        "descriptorFamilies": {},
+                        "subtypeWords": {},
+                        "indices": [],
+                        "observations": [],
+                        "payloadWords": {
+                            "controlWord": {},
+                            "paramWord": {},
+                            "vectorWordA": {},
+                            "vectorWordB": {},
+                        },
+                    },
+                )
+                object_profile["observationCount"] += 1
+                object_profile["indices"].append(idx)
+                if isinstance(descriptor_family, str) and descriptor_family:
+                    object_profile["descriptorFamilies"][descriptor_family] = object_profile["descriptorFamilies"].get(descriptor_family, 0) + 1
+            control_word_raw = descriptor_sketch.get("controlWord")
+            param_word_raw = descriptor_sketch.get("paramWord")
+            control_word_value = _parse_hex_word(control_word_raw) if isinstance(control_word_raw, str) else None
+            param_word_value = _parse_hex_word(param_word_raw) if isinstance(param_word_raw, str) else None
+            vector_word_a_raw = descriptor_sketch.get("vectorWordA")
+            vector_word_b_raw = descriptor_sketch.get("vectorWordB")
+            vector_word_a_value = _parse_hex_word(vector_word_a_raw) if isinstance(vector_word_a_raw, str) else None
+            vector_word_b_value = _parse_hex_word(vector_word_b_raw) if isinstance(vector_word_b_raw, str) else None
+            subtype_word = descriptor_sketch.get("subtypeWord") if isinstance(descriptor_sketch.get("subtypeWord"), str) else None
+            control_half0 = f"0x{(control_word_value >> 16) & 0xFFFF:04x}" if control_word_value is not None else None
+            param_half0 = f"0x{(param_word_value >> 16) & 0xFFFF:04x}" if param_word_value is not None else None
+            param_half1 = f"0x{param_word_value & 0xFFFF:04x}" if param_word_value is not None else None
+            vector_a_half1 = f"0x{vector_word_a_value & 0xFFFF:04x}" if vector_word_a_value is not None else None
+            vector_b_half0 = f"0x{(vector_word_b_value >> 16) & 0xFFFF:04x}" if vector_word_b_value is not None else None
+            if isinstance(subtype_word, str) and subtype_word:
+                subtype_summary = summary["subtypeWordClusters"].setdefault(
+                    subtype_word,
+                    {
+                        "count": 0,
+                        "objectNames": set(),
+                        "ordinals": set(),
+                        "controlHalf0": {},
+                        "paramHalf1": {},
+                    },
+                )
+                subtype_summary["count"] += 1
+                if isinstance(object_name, str) and object_name:
+                    subtype_summary["objectNames"].add(object_name)
+                if isinstance(object_ordinal, int):
+                    subtype_summary["ordinals"].add(object_ordinal)
+                if isinstance(control_half0, str) and control_half0:
+                    bucket = subtype_summary["controlHalf0"]
+                    bucket[control_half0] = bucket.get(control_half0, 0) + 1
+                if isinstance(param_half1, str) and param_half1:
+                    bucket = subtype_summary["paramHalf1"]
+                    bucket[param_half1] = bucket.get(param_half1, 0) + 1
+                if isinstance(object_profile, dict):
+                    bucket = object_profile["subtypeWords"]
+                    bucket[subtype_word] = bucket.get(subtype_word, 0) + 1
+            if isinstance(object_profile, dict):
+                object_profile["observations"].append(
+                    {
+                        "index": idx,
+                        "time": entry.get("time"),
+                        "sourceLog": entry.get("sourceLog"),
+                        "lineNumber": entry.get("lineNumber"),
+                        "controlWord": control_word_raw,
+                        "paramWord": param_word_raw,
+                        "subtypeWord": subtype_word,
+                        "controlHalf0": control_half0,
+                        "paramHalf1": param_half1,
+                    }
+                )
+            if isinstance(control_half0, str):
+                _update_halfword_cluster(
+                    summary["controlWordHalf0Clusters"],
+                    control_half0,
+                    object_name=object_name if isinstance(object_name, str) else None,
+                    object_ordinal=object_ordinal,
+                    paired_half0=param_half0,
+                    paired_half1=param_half1,
+                )
+            if isinstance(param_half1, str):
+                _update_halfword_cluster(
+                    summary["paramWordHalf1Clusters"],
+                    param_half1,
+                    object_name=object_name if isinstance(object_name, str) else None,
+                    object_ordinal=object_ordinal,
+                    paired_half0=control_half0,
+                    paired_half1=param_half0,
+                )
+                _update_vector_alignment_cluster(
+                    summary["paramWordHalf1VectorClusters"],
+                    param_half1,
+                    object_name=object_name if isinstance(object_name, str) else None,
+                    object_ordinal=object_ordinal,
+                    paired_vector_a_half1=vector_a_half1,
+                    paired_vector_b_half0=vector_b_half0,
+                )
+            if isinstance(control_half0, str):
+                _update_vector_alignment_cluster(
+                    summary["controlWordHalf0VectorClusters"],
+                    control_half0,
+                    object_name=object_name if isinstance(object_name, str) else None,
+                    object_ordinal=object_ordinal,
+                    paired_vector_a_half1=vector_a_half1,
+                    paired_vector_b_half0=vector_b_half0,
+                )
+            for key in ("controlWord", "paramWord", "vectorWordA", "vectorWordB"):
+                value = descriptor_sketch.get(key)
+                if isinstance(value, str) and value:
+                    bucket = summary["payloadWords"][key]
+                    bucket[value] = bucket.get(value, 0) + 1
+                    if isinstance(object_profile, dict):
+                        object_bucket = object_profile["payloadWords"][key]
+                        object_bucket[value] = object_bucket.get(value, 0) + 1
+
+            sample_key = (
+                decoder.get("primaryObjectName"),
+                descriptor_sketch.get("controlWord"),
+                descriptor_sketch.get("paramWord"),
+                descriptor_sketch.get("vectorWordA"),
+                descriptor_sketch.get("vectorWordB"),
+            )
+            if len(summary["sampleDescriptors"]) < 6 and sample_key not in summary["_sampleKeys"]:
+                summary["_sampleKeys"].add(sample_key)
+                sample_descriptor = {
+                    "name": decoder.get("primaryObjectName"),
+                    "descriptorFamilyHint": decoder.get("descriptorFamilyHint"),
+                    "objectKind": decoder.get("objectKind"),
+                    "controlWord": descriptor_sketch.get("controlWord"),
+                    "paramWord": descriptor_sketch.get("paramWord"),
+                    "vectorWordA": descriptor_sketch.get("vectorWordA"),
+                    "vectorWordB": descriptor_sketch.get("vectorWordB"),
+                }
+                summary["sampleDescriptors"].append(sample_descriptor)
+
+    ordered: list[dict[str, Any]] = []
+    for summary in sorted(families.values(), key=lambda item: item["_firstIndex"]):
+        payload_words = {
+            "controlWord": _sorted_count_map(summary["payloadWords"]["controlWord"]),
+            "paramWord": _sorted_count_map(summary["payloadWords"]["paramWord"]),
+            "vectorWordA": _sorted_count_map(summary["payloadWords"]["vectorWordA"]),
+            "vectorWordB": _sorted_count_map(summary["payloadWords"]["vectorWordB"]),
+        }
+        payload_word_byte_profiles = {
+            field_name: _summarize_word_byte_profiles(counts)
+            for field_name, counts in payload_words.items()
+        }
+        payload_word_half_profiles = {
+            field_name: _summarize_word_half_profiles(counts)
+            for field_name, counts in payload_words.items()
+        }
+        control_word_half0_vector_cluster_hints = _build_vector_alignment_hints(
+            summary["controlWordHalf0VectorClusters"],
+            len(summary["objectNames"]),
+        )
+        param_word_half1_vector_cluster_hints = _build_vector_alignment_hints(
+            summary["paramWordHalf1VectorClusters"],
+            len(summary["objectNames"]),
+        )
+        subtype_word_clusters_raw = summary["subtypeWordClusters"]
+        subtype_word_clusters = {
+            key: {
+                "count": value["count"],
+                "objectNames": sorted(value["objectNames"])[:8],
+                "ordinals": sorted(value["ordinals"]),
+                "controlHalf0": _sorted_count_map(value["controlHalf0"]),
+                "paramHalf1": _sorted_count_map(value["paramHalf1"]),
+            }
+            for key, value in _sorted_count_map({k: v["count"] for k, v in subtype_word_clusters_raw.items()}).items()
+            for value in [subtype_word_clusters_raw[key]]
+        }
+        reused_subtype_words = sorted(
+            key for key, value in subtype_word_clusters_raw.items() if len(value["objectNames"]) > 1
+        )
+        subtype_word_assessment = "no subtypeWord clustering observed"
+        if subtype_word_clusters_raw:
+            if reused_subtype_words:
+                varying_overlay_subtypes = sorted(
+                    key
+                    for key in reused_subtype_words
+                    if len(subtype_word_clusters_raw[key]["controlHalf0"]) > 1 or len(subtype_word_clusters_raw[key]["paramHalf1"]) > 1
+                )
+                subtype_word_assessment = "some subtypeWord values span multiple named objects, so subtypeWord looks more like a family/category lane than a unique object id"
+                if varying_overlay_subtypes:
+                    highlighted = ", ".join(varying_overlay_subtypes[:4])
+                    subtype_word_assessment += f"; {highlighted} also carry multiple control/param overlays inside the same subtype family"
+            else:
+                subtype_word_assessment = "observed subtypeWord values are currently one-to-one with object names in this sample"
+        stable_fields: list[str] = []
+        varying_fields: list[str] = []
+        common_values: dict[str, str] = {}
+        for key, counts in payload_words.items():
+            if len(counts) == 1:
+                stable_fields.append(key)
+                common_values[key] = next(iter(counts))
+            elif len(counts) > 1:
+                varying_fields.append(key)
+
+        payload_assessment = "insufficient descriptor diversity for payload comparison"
+        if stable_fields or varying_fields:
+            if "controlWord" in stable_fields and "paramWord" in stable_fields and any(
+                field in varying_fields for field in ("vectorWordA", "vectorWordB")
+            ):
+                payload_assessment = "controlWord and paramWord look family-stable while vector words vary across descriptors"
+            elif "controlWord" in stable_fields and any(
+                field in varying_fields for field in ("paramWord", "vectorWordA", "vectorWordB")
+            ):
+                payload_assessment = "controlWord looks family-stable while later payload words vary across descriptors"
+            elif varying_fields:
+                payload_assessment = "multiple payload lanes vary inside this family; compare sampleDescriptors before naming fields"
+            else:
+                payload_assessment = "all observed payload words are currently stable within this family sample"
+
+        likely_vector_candidates = [
+            field_name for field_name in ("vectorWordA", "vectorWordB") if field_name in varying_fields
+        ]
+        likely_control_candidates = [
+            field_name for field_name in ("controlWord", "paramWord") if field_name in stable_fields
+        ]
+        object_profiles_raw = summary["objectProfiles"]
+        object_profiles: list[dict[str, Any]] = []
+        mutable_object_mutations: list[dict[str, Any]] = []
+        stable_within_object_names: list[str] = []
+        varying_across_object_names: list[str] = []
+        mutable_within_object_name_fields: list[str] = []
+        mutable_fields_by_object_name: dict[str, list[str]] = {}
+        if object_profiles_raw:
+            for key in ("controlWord", "paramWord", "vectorWordA", "vectorWordB"):
+                profile_values = []
+                all_single_value = True
+                any_multi_value = False
+                for profile in object_profiles_raw.values():
+                    values = profile["payloadWords"][key]
+                    if not values:
+                        continue
+                    if len(values) != 1:
+                        all_single_value = False
+                        any_multi_value = True
+                    else:
+                        profile_values.append(next(iter(values)))
+                if all_single_value and profile_values:
+                    stable_within_object_names.append(key)
+                if len(set(profile_values)) > 1:
+                    varying_across_object_names.append(key)
+                if any_multi_value:
+                    mutable_within_object_name_fields.append(key)
+
+            for object_name, profile in sorted(object_profiles_raw.items())[:8]:
+                profile_common_values: dict[str, str] = {}
+                mutable_fields: list[str] = []
+                payload_word_counts = {
+                    "controlWord": _sorted_count_map(profile["payloadWords"]["controlWord"]),
+                    "paramWord": _sorted_count_map(profile["payloadWords"]["paramWord"]),
+                    "vectorWordA": _sorted_count_map(profile["payloadWords"]["vectorWordA"]),
+                    "vectorWordB": _sorted_count_map(profile["payloadWords"]["vectorWordB"]),
+                }
+                for key, counts in payload_word_counts.items():
+                    if len(counts) == 1:
+                        profile_common_values[key] = next(iter(counts))
+                    elif len(counts) > 1:
+                        mutable_fields.append(key)
+                object_profiles.append(
+                    {
+                        "name": object_name,
+                        "observationCount": profile["observationCount"],
+                        "descriptorFamilies": _sorted_count_map(profile["descriptorFamilies"]),
+                        "subtypeWords": _sorted_count_map(profile["subtypeWords"]),
+                        "commonPayloadValues": profile_common_values,
+                        "mutableFields": mutable_fields,
+                    }
+                )
+                if mutable_fields:
+                    mutable_fields_by_object_name[object_name] = mutable_fields
+                    mutation_fields: dict[str, Any] = {}
+                    for key in mutable_fields:
+                        mutation_summary = _summarize_mutating_word(profile["payloadWords"][key])
+                        if mutation_summary:
+                            mutation_fields[key] = mutation_summary
+                    mutable_object_mutations.append(
+                        {
+                            "name": object_name,
+                            "observationCount": profile["observationCount"],
+                            "mutableFields": mutable_fields,
+                            "fieldMutations": mutation_fields,
+                        }
+                    )
+
+        object_specific_payload_fields = [
+            field_name for field_name in stable_within_object_names if field_name in varying_across_object_names
+        ]
+        object_stability_assessment = "insufficient repeated object names for per-object stability comparison"
+        if object_profiles:
+            if object_specific_payload_fields and mutable_within_object_name_fields:
+                object_stability_assessment = "some payload words are stable within each named object while other lanes mutate inside at least one repeated object name"
+            elif object_specific_payload_fields:
+                object_stability_assessment = "payload words are stable within repeated object names and vary across different named objects"
+            elif mutable_within_object_name_fields:
+                object_stability_assessment = "some payload words mutate within repeated observations of the same named object"
+            else:
+                object_stability_assessment = "repeated object names currently show the same payload words across observations"
+
+        subtype_mutation_correlations: dict[str, dict[str, Any]] = {}
+        mutable_subtype_words: list[str] = []
+        for subtype_word, subtype_info in subtype_word_clusters_raw.items():
+            object_names = sorted(subtype_info["objectNames"])
+            mutable_object_names = sorted(
+                object_name for object_name in object_names if object_name in mutable_fields_by_object_name
+            )
+            if mutable_object_names:
+                mutable_subtype_words.append(subtype_word)
+            mutable_field_names: set[str] = set()
+            mutable_control_half0: dict[str, int] = {}
+            mutable_param_half1: dict[str, int] = {}
+            for object_name in mutable_object_names:
+                for field_name in mutable_fields_by_object_name.get(object_name, []):
+                    mutable_field_names.add(field_name)
+                profile = object_profiles_raw.get(object_name)
+                if not isinstance(profile, dict):
+                    continue
+                control_counts = profile["payloadWords"].get("controlWord", {})
+                param_counts = profile["payloadWords"].get("paramWord", {})
+                for control_word, count in control_counts.items():
+                    control_value = _parse_hex_word(control_word)
+                    if control_value is None:
+                        continue
+                    key = f"0x{(control_value >> 16) & 0xFFFF:04x}"
+                    mutable_control_half0[key] = mutable_control_half0.get(key, 0) + count
+                for param_word, count in param_counts.items():
+                    param_value = _parse_hex_word(param_word)
+                    if param_value is None:
+                        continue
+                    key = f"0x{param_value & 0xFFFF:04x}"
+                    mutable_param_half1[key] = mutable_param_half1.get(key, 0) + count
+            subtype_mutation_correlations[subtype_word] = {
+                "objectNames": object_names,
+                "mutableObjectNames": mutable_object_names,
+                "mutableFields": sorted(mutable_field_names),
+                "controlHalf0": _sorted_count_map(subtype_info["controlHalf0"]),
+                "paramHalf1": _sorted_count_map(subtype_info["paramHalf1"]),
+                "mutableControlHalf0": _sorted_count_map(mutable_control_half0),
+                "mutableParamHalf1": _sorted_count_map(mutable_param_half1),
+            }
+        mutable_subtype_words = sorted(mutable_subtype_words)
+        subtype_mutation_assessment = "no mutable subtype families observed"
+        if mutable_subtype_words:
+            if (
+                len(mutable_subtype_words) == 1
+                and len(subtype_mutation_correlations[mutable_subtype_words[0]]["mutableObjectNames"]) == 1
+                and len(subtype_mutation_correlations[mutable_subtype_words[0]]["objectNames"]) > 1
+            ):
+                subtype_word = mutable_subtype_words[0]
+                mutable_name = subtype_mutation_correlations[subtype_word]["mutableObjectNames"][0]
+                subtype_mutation_assessment = (
+                    f"{subtype_word} is currently the only subtype family with an observed mutable object; "
+                    f"the mutation still looks object-specific to {mutable_name} inside that subtype family"
+                )
+            else:
+                highlighted = ", ".join(mutable_subtype_words[:4])
+                subtype_mutation_assessment = (
+                    f"mutable objects currently appear inside subtype families {highlighted}; compare mutableObjectNames before treating mutation as subtype-wide"
+                )
+
+        def _find_neighbor_index(index: int, direction: int) -> int | None:
+            source_log = history[index].get("sourceLog")
+            neighbor_index = index + direction
+            while 0 <= neighbor_index < len(history):
+                neighbor_entry = history[neighbor_index]
+                if neighbor_entry.get("channel") != "udp":
+                    neighbor_index += direction
+                    continue
+                if source_log and neighbor_entry.get("sourceLog") != source_log:
+                    neighbor_index += direction
+                    continue
+                return neighbor_index
+            return None
+
+        def _label_event(decoder: dict[str, Any]) -> str:
+            family = decoder.get("family")
+            if family == "peer_control_marker":
+                control_event = decoder.get("controlEvent")
+                if isinstance(control_event, str) and control_event:
+                    return control_event
+            if family == "peer_object_descriptor":
+                object_name = decoder.get("primaryObjectName")
+                if isinstance(object_name, str) and object_name:
+                    return object_name
+            object_event = decoder.get("objectSetupEvent")
+            if isinstance(object_event, str) and object_event:
+                return object_event
+            if isinstance(family, str) and family:
+                return family
+            return "unknown"
+
+        def _label_short_control(decoder: dict[str, Any]) -> str | None:
+            family = decoder.get("family")
+            if family == "peer_control_marker":
+                control_event = decoder.get("controlEvent")
+                if isinstance(control_event, str) and control_event:
+                    return control_event
+                return "peer_control_marker"
+            if family == "peer_object_control":
+                return "peer_object_control"
+            return None
+
+        mutable_object_observation_contexts: dict[str, list[dict[str, Any]]] = {}
+        mutable_object_transition_assessment = "no mutable object transition context observed"
+        mutable_object_state_timelines: dict[str, dict[str, Any]] = {}
+        mutable_object_state_timeline_assessment = "no mutable object state timeline observed"
+        object_observation_context_signatures: dict[str, dict[str, int]] = {}
+        po_sandwiched_objects: list[str] = []
+        po_leading_edge_objects: list[str] = []
+        repeated_object_context_assessment = "no repeated object observation context pattern observed"
+
+        def _classify_observation_context(prev_short_control: str | None, next_short_control: str | None) -> str:
+            if prev_short_control == "peer_control_unknown_po" and next_short_control == "peer_control_unknown_po":
+                return "po_sandwiched"
+            if prev_short_control == "peer_control_unknown_po" and next_short_control is None:
+                return "po_leading_edge"
+            if prev_short_control is None and next_short_control == "peer_control_unknown_po":
+                return "po_trailing_edge"
+            if prev_short_control is None and next_short_control is None:
+                return "no_short_control"
+            return "mixed_short_control"
+
+        for object_name, profile in sorted(object_profiles_raw.items()):
+            profile = object_profiles_raw.get(object_name)
+            if not isinstance(profile, dict):
+                continue
+            contexts: list[dict[str, Any]] = []
+            context_signature_counts: dict[str, int] = {}
+            for observation_index in profile.get("indices", []):
+                if not isinstance(observation_index, int):
+                    continue
+                decoder = history[observation_index].get("decoder") or {}
+                descriptor_sketch = decoder.get("descriptorSketch")
+                if not isinstance(descriptor_sketch, dict):
+                    continue
+                control_word = descriptor_sketch.get("controlWord")
+                param_word = descriptor_sketch.get("paramWord")
+                control_value = _parse_hex_word(control_word) if isinstance(control_word, str) else None
+                param_value = _parse_hex_word(param_word) if isinstance(param_word, str) else None
+                control_half0 = f"0x{(control_value >> 16) & 0xFFFF:04x}" if control_value is not None else None
+                param_half1 = f"0x{param_value & 0xFFFF:04x}" if param_value is not None else None
+                prev_index = _find_neighbor_index(observation_index, -1)
+                next_index = _find_neighbor_index(observation_index, 1)
+                prev_event = _label_event(history[prev_index].get("decoder") or {}) if prev_index is not None else None
+                next_event = _label_event(history[next_index].get("decoder") or {}) if next_index is not None else None
+                prev_short_control = _label_short_control(history[prev_index].get("decoder") or {}) if prev_index is not None else None
+                next_short_control = _label_short_control(history[next_index].get("decoder") or {}) if next_index is not None else None
+                context_signature = _classify_observation_context(prev_short_control, next_short_control)
+                context_signature_counts[context_signature] = context_signature_counts.get(context_signature, 0) + 1
+                contexts.append(
+                    {
+                        "controlHalf0": control_half0,
+                        "paramHalf1": param_half1,
+                        "subtypeWord": descriptor_sketch.get("subtypeWord"),
+                        "immediatePrevEvent": prev_event,
+                        "immediateNextEvent": next_event,
+                        "immediatePrevShortControl": prev_short_control,
+                        "immediateNextShortControl": next_short_control,
+                        "contextSignature": context_signature,
+                    }
+                )
+            if contexts:
+                object_observation_context_signatures[object_name] = _sorted_count_map(context_signature_counts)
+                if context_signature_counts.get("po_sandwiched"):
+                    po_sandwiched_objects.append(object_name)
+                if context_signature_counts.get("po_leading_edge"):
+                    po_leading_edge_objects.append(object_name)
+                if object_name in mutable_fields_by_object_name:
+                    mutable_object_observation_contexts[object_name] = contexts
+
+        for object_name, contexts in mutable_object_observation_contexts.items():
+            bracketed_half0: dict[str, int] = {}
+            unbracketed_half0: dict[str, int] = {}
+            for context in contexts:
+                control_half0 = context.get("controlHalf0")
+                if not isinstance(control_half0, str) or not control_half0:
+                    continue
+                is_po_bracketed = (
+                    context.get("immediatePrevShortControl") == "peer_control_unknown_po"
+                    and context.get("immediateNextShortControl") == "peer_control_unknown_po"
+                )
+                target = bracketed_half0 if is_po_bracketed else unbracketed_half0
+                target[control_half0] = target.get(control_half0, 0) + 1
+            po_only_half0 = sorted(key for key in bracketed_half0 if key not in unbracketed_half0)
+            non_po_half0 = sorted(unbracketed_half0)
+            if po_only_half0 and non_po_half0:
+                mutable_object_transition_assessment = (
+                    f"{object_name} has a controlHalf0 transition context: "
+                    f"{', '.join(po_only_half0)} is only observed when immediately bracketed by PO, "
+                    f"while {', '.join(non_po_half0)} is not"
+                )
+                break
+
+        for object_name in sorted(mutable_fields_by_object_name):
+            profile = object_profiles_raw.get(object_name)
+            if not isinstance(profile, dict):
+                continue
+            observations = profile.get("observations", [])
+            if not isinstance(observations, list) or not observations:
+                continue
+            ordered_observations = sorted(
+                observations,
+                key=lambda item: (
+                    str(item.get("time") or ""),
+                    str(item.get("sourceLog") or ""),
+                    int(item.get("lineNumber") or 0),
+                    int(item.get("index") or 0),
+                ),
+            )
+            control_half0_timeline = [
+                observation.get("controlHalf0")
+                for observation in ordered_observations
+                if isinstance(observation.get("controlHalf0"), str) and observation.get("controlHalf0")
+            ]
+            unique_control_half0_sequence: list[str] = []
+            for control_half0 in control_half0_timeline:
+                if not unique_control_half0_sequence or unique_control_half0_sequence[-1] != control_half0:
+                    unique_control_half0_sequence.append(control_half0)
+            reverse_transition_observed = (
+                len(unique_control_half0_sequence) >= 3
+                and unique_control_half0_sequence[0] == unique_control_half0_sequence[-1]
+            )
+            mutable_object_state_timelines[object_name] = {
+                "observationCount": len(ordered_observations),
+                "controlHalf0Timeline": control_half0_timeline,
+                "uniqueControlHalf0Sequence": unique_control_half0_sequence,
+                "finalObservedControlHalf0": control_half0_timeline[-1] if control_half0_timeline else None,
+                "reverseTransitionObserved": reverse_transition_observed,
+                "timeRange": [
+                    ordered_observations[0].get("time"),
+                    ordered_observations[-1].get("time"),
+                ] if ordered_observations else [],
+                "sampleObservations": [
+                    {
+                        "time": observation.get("time"),
+                        "sourceLog": observation.get("sourceLog"),
+                        "lineNumber": observation.get("lineNumber"),
+                        "controlHalf0": observation.get("controlHalf0"),
+                        "paramHalf1": observation.get("paramHalf1"),
+                    }
+                    for observation in ordered_observations[:6]
+                ],
+            }
+        if len(mutable_object_state_timelines) == 1:
+            object_name, timeline = next(iter(mutable_object_state_timelines.items()))
+            unique_sequence = timeline.get("uniqueControlHalf0Sequence", [])
+            if (
+                isinstance(unique_sequence, list)
+                and len(unique_sequence) == 2
+                and timeline.get("reverseTransitionObserved") is False
+            ):
+                mutable_object_state_timeline_assessment = (
+                    f"{object_name} currently shows a one-way observed controlHalf0 sequence "
+                    f"{unique_sequence[0]} -> {unique_sequence[1]} with no later reverse transition in the March 21 logs"
+                )
+            elif timeline.get("reverseTransitionObserved") is True and len(unique_sequence) >= 3:
+                mutable_object_state_timeline_assessment = (
+                    f"{object_name} shows a reversible observed controlHalf0 sequence {' -> '.join(unique_sequence)}"
+                )
+            else:
+                mutable_object_state_timeline_assessment = (
+                    f"{object_name} has a partially decoded mutable controlHalf0 timeline"
+                )
+
+        mutable_object_state_transitions: dict[str, list[dict[str, Any]]] = {}
+        mutable_object_transition_trigger_assessment = "no mutable object transition trigger context observed"
+        mutable_object_post_transition_revisits: dict[str, list[dict[str, Any]]] = {}
+        mutable_object_post_transition_assessment = "no mutable object post-transition revisit context observed"
+        for object_name in sorted(mutable_fields_by_object_name):
+            profile = object_profiles_raw.get(object_name)
+            if not isinstance(profile, dict):
+                continue
+            observations = profile.get("observations", [])
+            if not isinstance(observations, list) or len(observations) < 2:
+                continue
+            ordered_observations = sorted(
+                observations,
+                key=lambda item: (
+                    str(item.get("time") or ""),
+                    str(item.get("sourceLog") or ""),
+                    int(item.get("lineNumber") or 0),
+                    int(item.get("index") or 0),
+                ),
+            )
+            transitions: list[dict[str, Any]] = []
+            last_observation: dict[str, Any] | None = None
+            for observation in ordered_observations:
+                current_half0 = observation.get("controlHalf0")
+                if not isinstance(current_half0, str) or not current_half0:
+                    continue
+                if last_observation is None:
+                    last_observation = observation
+                    continue
+                previous_half0 = last_observation.get("controlHalf0")
+                if current_half0 == previous_half0:
+                    last_observation = observation
+                    continue
+                observation_index = observation.get("index")
+                prev_index = _find_neighbor_index(observation_index, -1) if isinstance(observation_index, int) else None
+                next_index = _find_neighbor_index(observation_index, 1) if isinstance(observation_index, int) else None
+                prev_decoder = history[prev_index].get("decoder") or {} if prev_index is not None else {}
+                next_decoder = history[next_index].get("decoder") or {} if next_index is not None else {}
+                preceding_event_families: dict[str, int] = {}
+                preceding_control_events: dict[str, int] = {}
+                preceding_object_names: dict[str, int] = {}
+                nearest_preceding_state_block: dict[str, Any] | None = None
+                following_event_families: dict[str, int] = {}
+                following_object_names: dict[str, int] = {}
+                later_same_object_control_half0: dict[str, int] = {}
+                post_transition_packet_count = 0
+                if isinstance(observation_index, int):
+                    source_log = observation.get("sourceLog")
+                    for window_index in range(max(0, observation_index - 8), observation_index):
+                        window_entry = history[window_index]
+                        if window_entry.get("channel") != "udp":
+                            continue
+                        if source_log and window_entry.get("sourceLog") != source_log:
+                            continue
+                        window_decoder = window_entry.get("decoder") or {}
+                        family = window_decoder.get("family")
+                        if isinstance(family, str) and family:
+                            preceding_event_families[family] = preceding_event_families.get(family, 0) + 1
+                        control_event = window_decoder.get("controlEvent")
+                        if isinstance(control_event, str) and control_event:
+                            preceding_control_events[control_event] = preceding_control_events.get(control_event, 0) + 1
+                        object_name_window = window_decoder.get("primaryObjectName")
+                        if isinstance(object_name_window, str) and object_name_window:
+                            preceding_object_names[object_name_window] = preceding_object_names.get(object_name_window, 0) + 1
+                    for state_index in range(observation_index - 1, -1, -1):
+                        state_entry = history[state_index]
+                        if state_entry.get("channel") != "udp":
+                            continue
+                        if source_log and state_entry.get("sourceLog") != source_log:
+                            continue
+                        state_decoder = state_entry.get("decoder") or {}
+                        if state_decoder.get("family") != "peer_state_block":
+                            continue
+                        nearest_preceding_state_block = {
+                            "time": state_entry.get("time"),
+                            "lineNumber": state_entry.get("lineNumber"),
+                            "stateHeader": state_decoder.get("stateHeader"),
+                            "unitCodes": state_decoder.get("unitCodes"),
+                            "stateObjectCount": state_decoder.get("stateObjectCount"),
+                        }
+                        break
+                    for window_index in range(observation_index + 1, len(history)):
+                        window_entry = history[window_index]
+                        if window_entry.get("channel") != "udp":
+                            continue
+                        if source_log and window_entry.get("sourceLog") != source_log:
+                            continue
+                        post_transition_packet_count += 1
+                        window_decoder = window_entry.get("decoder") or {}
+                        family = window_decoder.get("family")
+                        if isinstance(family, str) and family:
+                            following_event_families[family] = following_event_families.get(family, 0) + 1
+                        object_name_window = window_decoder.get("primaryObjectName")
+                        if isinstance(object_name_window, str) and object_name_window:
+                            following_object_names[object_name_window] = following_object_names.get(object_name_window, 0) + 1
+                            if object_name_window == object_name:
+                                descriptor_sketch_window = window_decoder.get("descriptorSketch")
+                                if isinstance(descriptor_sketch_window, dict):
+                                    control_word_window = descriptor_sketch_window.get("controlWord")
+                                    control_value_window = _parse_hex_word(control_word_window) if isinstance(control_word_window, str) else None
+                                    if control_value_window is not None:
+                                        key = f"0x{(control_value_window >> 16) & 0xFFFF:04x}"
+                                        later_same_object_control_half0[key] = later_same_object_control_half0.get(key, 0) + 1
+                transition_entry = {
+                    "fromControlHalf0": previous_half0,
+                    "toControlHalf0": current_half0,
+                    "previousObservationTime": last_observation.get("time"),
+                    "changedObservationTime": observation.get("time"),
+                    "previousObservationLineNumber": last_observation.get("lineNumber"),
+                    "changedObservationLineNumber": observation.get("lineNumber"),
+                    "immediatePrevEvent": _label_event(prev_decoder) if prev_decoder else None,
+                    "immediateNextEvent": _label_event(next_decoder) if next_decoder else None,
+                    "immediatePrevShortControl": _label_short_control(prev_decoder),
+                    "immediateNextShortControl": _label_short_control(next_decoder),
+                    "precedingEventFamilies": _sorted_count_map(preceding_event_families),
+                    "precedingControlEvents": _sorted_count_map(preceding_control_events),
+                    "precedingObjectNames": _sorted_count_map(preceding_object_names),
+                    "nearestPrecedingStateBlock": nearest_preceding_state_block,
+                    "postTransitionPacketCount": post_transition_packet_count if isinstance(observation_index, int) else 0,
+                    "followingEventFamilies": _sorted_count_map(following_event_families) if isinstance(observation_index, int) else {},
+                    "followingObjectNames": _sorted_count_map(following_object_names) if isinstance(observation_index, int) else {},
+                    "laterSameObjectControlHalf0": _sorted_count_map(later_same_object_control_half0) if isinstance(observation_index, int) else {},
+                }
+                transitions.append(transition_entry)
+                last_observation = observation
+            if transitions:
+                mutable_object_state_transitions[object_name] = transitions
+                mutable_object_post_transition_revisits[object_name] = transitions
+
+        if len(mutable_object_state_transitions) == 1:
+            object_name, transitions = next(iter(mutable_object_state_transitions.items()))
+            transition = transitions[0] if transitions else None
+            if isinstance(transition, dict):
+                preceding_families = transition.get("precedingEventFamilies", {})
+                preceding_controls = transition.get("precedingControlEvents", {})
+                if (
+                    transition.get("immediatePrevShortControl") == "peer_control_unknown_po"
+                    and transition.get("immediateNextShortControl") == "peer_control_unknown_po"
+                    and preceding_controls.get("peer_control_unknown_po")
+                    and preceding_families.get("peer_state_block")
+                    and not preceding_families.get("peer_object_control")
+                ):
+                    nearest_state = transition.get("nearestPrecedingStateBlock")
+                    nearest_state_unit_codes = nearest_state.get("unitCodes") if isinstance(nearest_state, dict) else None
+                    if isinstance(nearest_state_unit_codes, list) and nearest_state_unit_codes:
+                        mutable_object_transition_trigger_assessment = (
+                            f"{object_name} changes state inside the late PO burst after recent peer_state_block traffic "
+                            f"({', '.join(nearest_state_unit_codes)}), with no nearby peer_object_control"
+                        )
+                    else:
+                        mutable_object_transition_trigger_assessment = (
+                            f"{object_name} changes state inside the late PO burst after recent peer_state_block traffic, with no nearby peer_object_control"
+                        )
+                else:
+                    mutable_object_transition_trigger_assessment = (
+                        f"{object_name} has a partially decoded transition trigger context"
+                    )
+
+        if len(mutable_object_post_transition_revisits) == 1:
+            object_name, transitions = next(iter(mutable_object_post_transition_revisits.items()))
+            transition = transitions[0] if transitions else None
+            if isinstance(transition, dict):
+                later_same_object = transition.get("laterSameObjectControlHalf0", {})
+                following_object_names = transition.get("followingObjectNames", {})
+                if not later_same_object:
+                    trailing_names = [name for name in following_object_names if name != object_name]
+                    if trailing_names:
+                        mutable_object_post_transition_assessment = (
+                            f"{object_name} has no later descriptor revisit after the observed state change; "
+                            f"the remaining log tail only shows {', '.join(trailing_names[:3])}"
+                        )
+                    else:
+                        mutable_object_post_transition_assessment = (
+                            f"{object_name} has no later descriptor revisit after the observed state change in the current log tail"
+                        )
+                else:
+                    mutable_object_post_transition_assessment = (
+                        f"{object_name} is revisited after the observed state change with controlHalf0 values "
+                        f"{', '.join(later_same_object.keys())}"
+                    )
+
+        po_sandwiched_objects = sorted(po_sandwiched_objects)
+        po_leading_edge_objects = sorted(po_leading_edge_objects)
+        if po_sandwiched_objects:
+            repeated_object_context_assessment = (
+                f"PO-sandwiched descriptor observations appear for {', '.join(po_sandwiched_objects[:5])}"
+            )
+            if po_leading_edge_objects:
+                repeated_object_context_assessment += (
+                    f"; {', '.join(po_leading_edge_objects[:3])} also appears on a leading-PO trailing-edge observation"
+                )
+
+        po_context_control_comparisons: dict[str, dict[str, Any]] = {}
+        po_context_control_assessment = "no PO-context object control comparison available"
+        po_context_objects = sorted(set(po_sandwiched_objects) | set(po_leading_edge_objects))
+        for object_name in po_context_objects:
+            profile = object_profiles_raw.get(object_name)
+            if not isinstance(profile, dict):
+                continue
+            control_half0_counts: dict[str, int] = {}
+            for control_word, count in profile["payloadWords"].get("controlWord", {}).items():
+                control_value = _parse_hex_word(control_word)
+                if control_value is None:
+                    continue
+                key = f"0x{(control_value >> 16) & 0xFFFF:04x}"
+                control_half0_counts[key] = control_half0_counts.get(key, 0) + count
+            po_context_control_comparisons[object_name] = {
+                "contextSignatures": object_observation_context_signatures.get(object_name, {}),
+                "subtypeWords": _sorted_count_map(profile.get("subtypeWords", {})),
+                "controlHalf0": _sorted_count_map(control_half0_counts),
+                "paramWord": _sorted_count_map(profile["payloadWords"].get("paramWord", {})),
+                "mutableFields": mutable_fields_by_object_name.get(object_name, []),
+                "poContextRole": (
+                    "po_sandwiched"
+                    if object_name in po_sandwiched_objects
+                    else "po_leading_edge"
+                ),
+            }
+        if po_context_control_comparisons:
+            multi_state_po_sandwiched = sorted(
+                object_name
+                for object_name in po_sandwiched_objects
+                if len(po_context_control_comparisons.get(object_name, {}).get("controlHalf0", {})) > 1
+            )
+            single_state_po_sandwiched = sorted(
+                object_name
+                for object_name in po_sandwiched_objects
+                if len(po_context_control_comparisons.get(object_name, {}).get("controlHalf0", {})) == 1
+            )
+            po_context_control_assessment = "PO-context object control comparison is partially decoded"
+            if multi_state_po_sandwiched or single_state_po_sandwiched:
+                assessment_parts: list[str] = []
+                if multi_state_po_sandwiched:
+                    assessment_parts.append(
+                        f"among PO-sandwiched objects, only {', '.join(multi_state_po_sandwiched)} show multiple observed controlHalf0 values"
+                    )
+                if single_state_po_sandwiched:
+                    assessment_parts.append(
+                        f"{', '.join(single_state_po_sandwiched)} remain single-state across observed controlHalf0 values"
+                    )
+                if po_leading_edge_objects:
+                    assessment_parts.append(
+                        f"{', '.join(po_leading_edge_objects)} currently appears only on the PO-leading edge"
+                    )
+                po_context_control_assessment = "; ".join(assessment_parts)
+
+        ordered.append(
+            {
+                "payloadFamily": summary["payloadFamily"],
+                "packetCount": summary["packetCount"],
+                "descriptorFamilies": _sorted_count_map(summary["descriptorFamilies"]),
+                "descriptorArchetypes": _sorted_count_map(summary["descriptorArchetypes"]),
+                "objectKinds": _sorted_count_map(summary["objectKinds"]),
+                "objectNames": sorted(summary["objectNames"])[:8],
+                "controlSignatures": _sorted_count_map(summary["controlSignatures"]),
+                "payloadWords": payload_words,
+                "payloadWordByteProfiles": payload_word_byte_profiles,
+                "payloadWordHalfProfiles": payload_word_half_profiles,
+                "subtypeWordClusters": subtype_word_clusters,
+                "reusedSubtypeWords": reused_subtype_words,
+                "subtypeWordAssessment": subtype_word_assessment,
+                "controlWordHalf0Clusters": {
+                    key: {
+                        "count": value["count"],
+                        "objectNames": sorted(value["objectNames"])[:8],
+                        "ordinals": sorted(value["ordinals"]),
+                        "pairedHalf0": _sorted_count_map(value["pairedHalf0"]),
+                        "pairedHalf1": _sorted_count_map(value["pairedHalf1"]),
+                    }
+                    for key, value in _sorted_count_map({k: v["count"] for k, v in summary["controlWordHalf0Clusters"].items()}).items()
+                    for value in [summary["controlWordHalf0Clusters"][key]]
+                },
+                "controlWordHalf0ClusterHints": _build_halfword_cluster_hints(
+                    summary["controlWordHalf0Clusters"],
+                    len(summary["objectNames"]),
+                ),
+                "paramWordHalf1Clusters": {
+                    key: {
+                        "count": value["count"],
+                        "objectNames": sorted(value["objectNames"])[:8],
+                        "ordinals": sorted(value["ordinals"]),
+                        "pairedHalf0": _sorted_count_map(value["pairedHalf0"]),
+                        "pairedHalf1": _sorted_count_map(value["pairedHalf1"]),
+                    }
+                    for key, value in _sorted_count_map({k: v["count"] for k, v in summary["paramWordHalf1Clusters"].items()}).items()
+                    for value in [summary["paramWordHalf1Clusters"][key]]
+                },
+                "paramWordHalf1ClusterHints": _build_halfword_cluster_hints(
+                    summary["paramWordHalf1Clusters"],
+                    len(summary["objectNames"]),
+                ),
+                "controlWordHalf0VectorClusters": {
+                    key: {
+                        "count": value["count"],
+                        "objectNames": sorted(value["objectNames"])[:8],
+                        "ordinals": sorted(value["ordinals"]),
+                        "pairedVectorAHalf1": _sorted_count_map(value["pairedVectorAHalf1"]),
+                        "pairedVectorBHalf0": _sorted_count_map(value["pairedVectorBHalf0"]),
+                    }
+                    for key, value in _sorted_count_map({k: v["count"] for k, v in summary["controlWordHalf0VectorClusters"].items()}).items()
+                    for value in [summary["controlWordHalf0VectorClusters"][key]]
+                },
+                "controlWordHalf0VectorClusterHints": control_word_half0_vector_cluster_hints,
+                "paramWordHalf1VectorClusters": {
+                    key: {
+                        "count": value["count"],
+                        "objectNames": sorted(value["objectNames"])[:8],
+                        "ordinals": sorted(value["ordinals"]),
+                        "pairedVectorAHalf1": _sorted_count_map(value["pairedVectorAHalf1"]),
+                        "pairedVectorBHalf0": _sorted_count_map(value["pairedVectorBHalf0"]),
+                    }
+                    for key, value in _sorted_count_map({k: v["count"] for k, v in summary["paramWordHalf1VectorClusters"].items()}).items()
+                    for value in [summary["paramWordHalf1VectorClusters"][key]]
+                },
+                "paramWordHalf1VectorClusterHints": param_word_half1_vector_cluster_hints,
+                "controlWordHalf0VectorAssessment": _assess_vector_cluster_alignment(
+                    control_word_half0_vector_cluster_hints,
+                    "controlWordHalf0",
+                ),
+                "paramWordHalf1VectorAssessment": _assess_vector_cluster_alignment(
+                    param_word_half1_vector_cluster_hints,
+                    "paramWordHalf1",
+                ),
+                "stablePayloadFields": stable_fields,
+                "varyingPayloadFields": varying_fields,
+                "commonPayloadValues": common_values,
+                "likelyControlFields": likely_control_candidates,
+                "likelyVectorFields": likely_vector_candidates,
+                "objectStablePayloadFields": stable_within_object_names,
+                "objectVaryingAcrossNamesFields": varying_across_object_names,
+                "objectSpecificPayloadFields": object_specific_payload_fields,
+                "mutableWithinObjectNameFields": mutable_within_object_name_fields,
+                "objectStabilityAssessment": object_stability_assessment,
+                "subtypeMutationCorrelations": subtype_mutation_correlations,
+                "mutableSubtypeWords": mutable_subtype_words,
+                "subtypeMutationAssessment": subtype_mutation_assessment,
+                "objectObservationContextSignatures": object_observation_context_signatures,
+                "poSandwichedObjects": po_sandwiched_objects,
+                "poLeadingEdgeObjects": po_leading_edge_objects,
+                "objectObservationContextAssessment": repeated_object_context_assessment,
+                "poContextControlComparisons": po_context_control_comparisons,
+                "poContextControlAssessment": po_context_control_assessment,
+                "mutableObjectObservationContexts": mutable_object_observation_contexts,
+                "mutableObjectTransitionAssessment": mutable_object_transition_assessment,
+                "mutableObjectStateTimelines": mutable_object_state_timelines,
+                "mutableObjectStateTimelineAssessment": mutable_object_state_timeline_assessment,
+                "mutableObjectStateTransitions": mutable_object_state_transitions,
+                "mutableObjectTransitionTriggerAssessment": mutable_object_transition_trigger_assessment,
+                "mutableObjectPostTransitionRevisits": mutable_object_post_transition_revisits,
+                "mutableObjectPostTransitionAssessment": mutable_object_post_transition_assessment,
+                "payloadAssessment": payload_assessment,
+                "sampleDescriptors": summary["sampleDescriptors"],
+                "sampleObjectProfiles": object_profiles,
+                "mutableObjectMutations": mutable_object_mutations,
+            }
+        )
+    return ordered
+
+
+def summarize_peer_udp_sessions(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sessions: dict[str, dict[str, Any]] = {}
+    for idx, entry in enumerate(history):
+        if entry.get("channel") != "udp":
+            continue
+        decoder = entry.get("decoder") or {}
+        family = str(decoder.get("family", ""))
+        if not family.startswith("peer_"):
+            continue
+
+        peer = str(entry.get("peer", ""))
+        if not peer:
+            continue
+        summary = sessions.setdefault(
+            peer,
+            {
+                "peer": peer,
+                "firstSeen": entry.get("time"),
+                "lastSeen": entry.get("time"),
+                "packetCount": 0,
+                "families": {},
+                "markers": set(),
+                "controlEvents": {},
+                "timingSamples": {},
+                "objectSetupEvents": {},
+                "steamIds": set(),
+                "asciiStrings": set(),
+                "unitCodes": set(),
+                "objectCodes": set(),
+                "objectNames": set(),
+                "objectKinds": set(),
+                "objectKindCounts": {},
+                "descriptorPatterns": {},
+                "descriptorFamilyHints": {},
+                "descriptorArchetypeHints": {},
+                "descriptorPayloadFamilyHints": {},
+                "descriptorControlSignatures": {},
+                "descriptorIdentityWords": {},
+                "latestStateHeader": None,
+                "latestObjectHeader": None,
+                "latestObjectDescriptor": None,
+                "phaseSequence": [],
+                "_lastPhase": None,
+                "_firstIndex": idx,
+                "_lastIndex": idx,
+            },
+        )
+
+        summary["lastSeen"] = entry.get("time")
+        summary["packetCount"] += 1
+        summary["families"][family] = summary["families"].get(family, 0) + 1
+        summary["_lastIndex"] = idx
+
+        marker = decoder.get("marker")
+        if isinstance(marker, str) and marker:
+            summary["markers"].add(marker)
+        control_event = decoder.get("controlEvent")
+        if isinstance(control_event, str) and control_event:
+            summary["controlEvents"][control_event] = summary["controlEvents"].get(control_event, 0) + 1
+            timing_fields = decoder.get("timingFields")
+            if isinstance(timing_fields, dict) and timing_fields:
+                summary["timingSamples"][control_event] = timing_fields
+        object_event = decoder.get("objectSetupEvent")
+        if isinstance(object_event, str) and object_event:
+            summary["objectSetupEvents"][object_event] = summary["objectSetupEvents"].get(object_event, 0) + 1
+
+        for key in ("steamIds", "asciiStrings"):
+            values = decoder.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, str) and value:
+                        summary[key].add(value)
+        unit_codes = decoder.get("unitCodes")
+        if isinstance(unit_codes, list):
+            for value in unit_codes:
+                if isinstance(value, str) and value:
+                    summary["unitCodes"].add(value)
+        for key in ("objectCodes", "objectNames"):
+            values = decoder.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, str) and value:
+                        summary[key].add(value)
+        object_kind = decoder.get("objectKind")
+        if isinstance(object_kind, str) and object_kind:
+            summary["objectKinds"].add(object_kind)
+            summary["objectKindCounts"][object_kind] = summary["objectKindCounts"].get(object_kind, 0) + 1
+        descriptor_pattern = decoder.get("descriptorPattern")
+        if isinstance(descriptor_pattern, str) and descriptor_pattern:
+            summary["descriptorPatterns"][descriptor_pattern] = summary["descriptorPatterns"].get(descriptor_pattern, 0) + 1
+        descriptor_family_hint = decoder.get("descriptorFamilyHint")
+        if isinstance(descriptor_family_hint, str) and descriptor_family_hint:
+            summary["descriptorFamilyHints"][descriptor_family_hint] = summary["descriptorFamilyHints"].get(descriptor_family_hint, 0) + 1
+        descriptor_archetype_hint = decoder.get("descriptorArchetypeHint")
+        if isinstance(descriptor_archetype_hint, str) and descriptor_archetype_hint:
+            summary["descriptorArchetypeHints"][descriptor_archetype_hint] = summary["descriptorArchetypeHints"].get(descriptor_archetype_hint, 0) + 1
+        descriptor_payload_family_hint = decoder.get("descriptorPayloadFamilyHint")
+        if isinstance(descriptor_payload_family_hint, str) and descriptor_payload_family_hint:
+            summary["descriptorPayloadFamilyHints"][descriptor_payload_family_hint] = summary["descriptorPayloadFamilyHints"].get(descriptor_payload_family_hint, 0) + 1
+        descriptor_payload_hints = decoder.get("descriptorPayloadHints")
+        if isinstance(descriptor_payload_hints, dict):
+            control_signature = descriptor_payload_hints.get("controlSignature")
+            if isinstance(control_signature, str) and control_signature:
+                summary["descriptorControlSignatures"][control_signature] = summary["descriptorControlSignatures"].get(control_signature, 0) + 1
+        descriptor_field_hints = decoder.get("descriptorFieldHints")
+        if isinstance(descriptor_field_hints, dict):
+            identity_words = descriptor_field_hints.get("identityWords")
+            if isinstance(identity_words, dict):
+                for key, value in identity_words.items():
+                    if isinstance(value, str) and value:
+                        bucket = summary["descriptorIdentityWords"].setdefault(key, {})
+                        bucket[value] = bucket.get(value, 0) + 1
+        state_header = decoder.get("stateHeader")
+        if isinstance(state_header, dict) and state_header:
+            summary["latestStateHeader"] = state_header
+        object_header = decoder.get("objectHeader")
+        if isinstance(object_header, dict) and object_header:
+            summary["latestObjectHeader"] = object_header
+        if family == "peer_object_descriptor":
+            latest_descriptor: dict[str, Any] = {}
+            for key in (
+                "primaryObjectCode",
+                "primaryObjectName",
+                "objectNameStem",
+                "objectKind",
+                "objectOrdinal",
+                "sideCodePrefix",
+                "sideLabel",
+                "personRole",
+                "descriptorFamilyHint",
+                "descriptorArchetypeHint",
+                "descriptorPayloadFamilyHint",
+                "descriptorSketch",
+                "descriptorFieldHints",
+                "descriptorPayloadHints",
+            ):
+                value = decoder.get(key)
+                if value is not None:
+                    latest_descriptor[key] = value
+            if latest_descriptor:
+                summary["latestObjectDescriptor"] = latest_descriptor
+
+        phase = _phase_for_udp_family(family)
+        if phase != "other" and phase != summary["_lastPhase"]:
+            summary["phaseSequence"].append(phase)
+            summary["_lastPhase"] = phase
+
+    ordered: list[dict[str, Any]] = []
+    for summary in sorted(sessions.values(), key=lambda item: item["_firstIndex"]):
+        phase_sequence = list(summary["phaseSequence"])
+        inferred_stage = "peer_unknown"
+        if "state" in phase_sequence:
+            inferred_stage = "state_exchange"
+        elif "objects" in phase_sequence:
+            inferred_stage = "object_setup"
+        elif "control" in phase_sequence or "identity" in phase_sequence:
+            inferred_stage = "p2p_bootstrap"
+
+        ordered.append(
+            {
+                "peer": summary["peer"],
+                "firstSeen": summary["firstSeen"],
+                "lastSeen": summary["lastSeen"],
+                "packetCount": summary["packetCount"],
+                "families": summary["families"],
+                "markers": sorted(summary["markers"]),
+                "controlEvents": summary["controlEvents"],
+                "timingSamples": summary["timingSamples"],
+                "objectSetupEvents": summary["objectSetupEvents"],
+                "steamIds": sorted(summary["steamIds"]),
+                "asciiStrings": sorted(summary["asciiStrings"])[:8],
+                "unitCodes": sorted(summary["unitCodes"])[:8],
+                "objectCodes": sorted(summary["objectCodes"])[:8],
+                "objectNames": sorted(summary["objectNames"])[:8],
+                "objectKinds": sorted(summary["objectKinds"]),
+                "objectKindCounts": summary["objectKindCounts"],
+                "descriptorPatterns": summary["descriptorPatterns"],
+                "descriptorFamilyHints": summary["descriptorFamilyHints"],
+                "descriptorArchetypeHints": summary["descriptorArchetypeHints"],
+                "descriptorPayloadFamilyHints": summary["descriptorPayloadFamilyHints"],
+                "descriptorControlSignatures": summary["descriptorControlSignatures"],
+                "descriptorIdentityWords": summary["descriptorIdentityWords"],
+                "latestStateHeader": summary["latestStateHeader"],
+                "latestObjectHeader": summary["latestObjectHeader"],
+                "latestObjectDescriptor": summary["latestObjectDescriptor"],
+                "phaseSequence": phase_sequence,
+                "inferredStage": inferred_stage,
+            }
+        )
+    return ordered
 
 
 @dataclass
@@ -273,6 +3066,7 @@ class ServerState:
         peer: str,
         msg_type: str,
         payload: Any,
+        decoder: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         entry = {
             "time": utc_now_str(),
@@ -282,6 +3076,8 @@ class ServerState:
             "type": msg_type,
             "preview": compact_preview(payload),
         }
+        if decoder:
+            entry["decoder"] = decoder
         self.protocol_history.append(entry)
         if len(self.protocol_history) > MAX_PROTOCOL_HISTORY:
             self.protocol_history = self.protocol_history[-MAX_PROTOCOL_HISTORY:]
@@ -408,17 +3204,20 @@ class BZRUDPProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         self.rx_count += 1
         hex_data = data.hex()
+        decoder = decode_bzr_udp_datagram(data)
         self.state.record_protocol_event(
             channel="udp",
             direction="rx",
             peer=f"{addr[0]}:{addr[1]}",
             msg_type="udp_datagram",
             payload=hex_data,
+            decoder=decoder,
         )
         self.logger.debug("UDP RX <- %s:%d | %s", addr[0], addr[1], hex_data)
 
-        reply = self._build_reply(data)
+        reply = self._build_reply(data, addr)
         if reply and self.transport:
+            reply_decoder = decode_bzr_udp_datagram(reply)
             self.transport.sendto(reply, addr)
             self.tx_count += 1
             self.state.record_protocol_event(
@@ -427,19 +3226,24 @@ class BZRUDPProtocol(asyncio.DatagramProtocol):
                 peer=f"{addr[0]}:{addr[1]}",
                 msg_type="udp_datagram",
                 payload=reply.hex(),
+                decoder=reply_decoder,
             )
             self.logger.debug("UDP TX -> %s:%d | %s", addr[0], addr[1], reply.hex())
 
     @staticmethod
-    def _build_reply(data: bytes) -> bytes:
+    def _build_reply(data: bytes, addr: tuple[str, int]) -> bytes:
         if not data:
             return b""
 
-        # Observed BZRNet probe packet starts with 0x40 and server replies with
-        # the original payload plus small server-time trailer bytes.
+        # Official 1338 replies echo the probe and append a 7-byte trailer:
+        # 0x04 + observed IPv4 + observed UDP port (big-endian).
         if data[0] == 0x40 and len(data) >= 18:
-            ms = int(time.time() * 1000) & 0xFFFFFFFFFFFF
-            return data + b"\x04" + ms.to_bytes(6, "big")
+            try:
+                ip_bytes = socket.inet_aton(addr[0])
+                port_bytes = int(addr[1]).to_bytes(2, "big")
+                return data + b"\x04" + ip_bytes + port_bytes
+            except (OSError, OverflowError):
+                return data
 
         # For unknown packet types, echo to keep local probes iterative.
         return data
@@ -573,7 +3377,7 @@ class BZRWebSocketServer:
         if isinstance(content, str):
             return content.strip()
         if isinstance(content, dict):
-            for key in ("id", "userId", "targetId", "member", "peerId", "friendID"):
+            for key in ("player", "id", "userId", "targetId", "member", "peerId", "friendID"):
                 value = content.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
@@ -1077,17 +3881,22 @@ class BZRWebSocketServer:
     async def handle_p2p_signal(self, session: UserSession, content: Any, *, route: bool) -> None:
         target_id = self._extract_target_user_id(content)
         target_session = self.state.sessions_by_user_id.get(target_id) if target_id else None
+        reset = False
+        if isinstance(content, dict) and "reset" in content:
+            reset = self._coerce_bool(content.get("reset"))
         event_name = "DoP2PRoute" if route else "DoP2PConnect"
         self.state.record_stdout_entry(
             "info",
             f"{event_name} from {session.user_id} target={target_id or '?'} route={compact_preview(content)}",
         )
-        payload = {
+        base_payload = {
             "type": "OnLobbyMemberP2PConnect",
             "time": utc_now_str(),
             "success": target_session is not None,
             "lobbyId": session.current_lobby_id,
             "changedLobby": session.current_lobby_id,
+            "connect": not route,
+            "reset": reset,
             "sourceUserId": session.user_id,
             "sourceName": session.name,
             "targetId": target_id,
@@ -1100,10 +3909,20 @@ class BZRWebSocketServer:
             "users": {session.user_id: self.state.build_user_snapshot(session)},
         }
         if target_session:
-            payload["target"] = self.state.build_user_snapshot(target_session)
-            payload["users"][target_session.user_id] = self.state.build_user_snapshot(target_session)
-            await self.send(target_session.ws, "OnLobbyMemberP2PConnect", payload)
-        await self.send(session.ws, "OnLobbyMemberP2PConnect", payload)
+            base_payload["target"] = self.state.build_user_snapshot(target_session)
+            base_payload["users"][target_session.user_id] = self.state.build_user_snapshot(target_session)
+
+            target_payload = dict(base_payload)
+            target_payload["member"] = session.user_id
+            target_payload["memberName"] = session.name
+            await self.send(target_session.ws, "OnLobbyMemberP2PConnect", target_payload)
+
+        session_payload = dict(base_payload)
+        session_payload["member"] = target_id or session.user_id
+        session_payload["memberName"] = (
+            target_session.name if target_session else (target_id or session.name)
+        )
+        await self.send(session.ws, "OnLobbyMemberP2PConnect", session_payload)
 
     async def handle_chat(self, session: UserSession, text: str) -> None:
         text = text.strip()
@@ -1616,6 +4435,7 @@ def build_status_payload(
             "client": SUPPORTED_CLIENT_MESSAGES,
             "server": SUPPORTED_SERVER_MESSAGES,
         },
+        "protocolSummary": summarize_protocol_history(state.protocol_history),
         "recentProtocolEvents": state.protocol_history[-20:],
     }
 
@@ -1666,6 +4486,7 @@ async def serve_health_http(
             payload = {
                 "ok": True,
                 "time": utc_now_str(),
+                "summary": summarize_protocol_history(state.protocol_history),
                 "protocol": {"history": list(state.protocol_history)},
                 "stdout": {"history": list(state.stdout_history)},
             }

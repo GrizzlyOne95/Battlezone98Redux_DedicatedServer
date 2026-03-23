@@ -79,7 +79,13 @@ Current best interpretation:
 
 - client sends an 18-byte bootstrap/probe packet on UDP `1338`
 - server replies with the original payload plus a 7-byte trailer
-- the trailer is consistent with a marker byte plus server time data
+- in the March 21 two-PC capture, the trailer decodes as
+  `0x04 + public IPv4 + public UDP port`
+
+March 21 examples:
+
+- `04 d8 47 2e 2f fe 2f` -> `216.71.46.47:65071`
+- `04 d8 47 2e 2f c6 39` -> `216.71.46.47:50745`
 
 ### 3. Live WebSocket auth payload fields
 
