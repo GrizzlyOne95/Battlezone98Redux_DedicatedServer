@@ -1,0 +1,36 @@
+{
+  "baseline": [
+    "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_IanPC\\game1.pcapng",
+    "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_KateriPC\\Kat_PC.pcapng"
+  ],
+  "candidate": [
+    "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_IanPC\\game1.pcapng",
+    "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_KateriPC\\Kat_PC.pcapng"
+  ],
+  "baselineSubtypeWords": [
+    "0x0c00",
+    "0x0d00",
+    "0x0e00",
+    "0x0f00"
+  ],
+  "candidateSubtypeWords": [
+    "0x0c00",
+    "0x0d00",
+    "0x0e00",
+    "0x0f00"
+  ],
+  "identical": true,
+  "summary": "baseline and candidate consensus artifacts match exactly",
+  "subtypeConsensusDiff": {
+    "added": [],
+    "removed": [],
+    "changed": [],
+    "unchangedCount": 4
+  },
+  "objectConsensusDiff": {
+    "added": [],
+    "removed": [],
+    "changed": [],
+    "unchangedCount": 0
+  }
+}

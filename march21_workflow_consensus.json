@@ -1,0 +1,123 @@
+{
+  "pcaps": [
+    "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_IanPC\\game1.pcapng",
+    "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_KateriPC\\Kat_PC.pcapng"
+  ],
+  "objectNames": [],
+  "subtypeWords": [
+    "0x0c00",
+    "0x0d00",
+    "0x0e00",
+    "0x0f00"
+  ],
+  "window": 4,
+  "objectConsensusReports": [],
+  "subtypeConsensusReports": [
+    {
+      "subtypeWord": "0x0c00",
+      "pcapCount": 2,
+      "pcaps": [
+        "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_IanPC\\game1.pcapng",
+        "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_KateriPC\\Kat_PC.pcapng"
+      ],
+      "objectCounts": [
+        2
+      ],
+      "objectNameSets": [
+        [
+          "npscr29_scrap",
+          "npscr34_scrap"
+        ]
+      ],
+      "mutableObjectSets": [
+        []
+      ],
+      "singleSampleObjectSets": [
+        [
+          "npscr34_scrap"
+        ]
+      ],
+      "assessment": "all pcaps agree no mutable objects were observed; all pcaps agree single-sample objects are npscr34_scrap; all pcaps agree subtype roster is npscr29_scrap, npscr34_scrap"
+    },
+    {
+      "subtypeWord": "0x0d00",
+      "pcapCount": 2,
+      "pcaps": [
+        "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_IanPC\\game1.pcapng",
+        "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_KateriPC\\Kat_PC.pcapng"
+      ],
+      "objectCounts": [
+        2
+      ],
+      "objectNameSets": [
+        [
+          "npscr110_scrap",
+          "npscr24_scrap"
+        ]
+      ],
+      "mutableObjectSets": [
+        []
+      ],
+      "singleSampleObjectSets": [
+        [
+          "npscr24_scrap"
+        ]
+      ],
+      "assessment": "all pcaps agree no mutable objects were observed; all pcaps agree single-sample objects are npscr24_scrap; all pcaps agree subtype roster is npscr110_scrap, npscr24_scrap"
+    },
+    {
+      "subtypeWord": "0x0e00",
+      "pcapCount": 2,
+      "pcaps": [
+        "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_IanPC\\game1.pcapng",
+        "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_KateriPC\\Kat_PC.pcapng"
+      ],
+      "objectCounts": [
+        2
+      ],
+      "objectNameSets": [
+        [
+          "npscr111_scrap",
+          "npscr35_scrap"
+        ]
+      ],
+      "mutableObjectSets": [
+        [
+          "npscr111_scrap"
+        ]
+      ],
+      "singleSampleObjectSets": [
+        [
+          "npscr35_scrap"
+        ]
+      ],
+      "assessment": "all pcaps agree mutable objects are npscr111_scrap; all pcaps agree single-sample objects are npscr35_scrap; all pcaps agree subtype roster is npscr111_scrap, npscr35_scrap"
+    },
+    {
+      "subtypeWord": "0x0f00",
+      "pcapCount": 2,
+      "pcaps": [
+        "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_IanPC\\game1.pcapng",
+        "C:\\Users\\iestu\\Documents\\Google Drive\\Ian Files\\Battlezone Files\\Wireshark_KateriPC\\Kat_PC.pcapng"
+      ],
+      "objectCounts": [
+        2
+      ],
+      "objectNameSets": [
+        [
+          "npscr112_scrap",
+          "npscr36_scrap"
+        ]
+      ],
+      "mutableObjectSets": [
+        []
+      ],
+      "singleSampleObjectSets": [
+        [
+          "npscr36_scrap"
+        ]
+      ],
+      "assessment": "all pcaps agree no mutable objects were observed; all pcaps agree single-sample objects are npscr36_scrap; all pcaps agree subtype roster is npscr112_scrap, npscr36_scrap"
+    }
+  ]
+}
