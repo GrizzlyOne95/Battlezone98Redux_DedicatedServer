@@ -2,6 +2,11 @@
 
 Date: 2026-03-18
 
+> Status (2026-07-16): the clean end-to-end run in this checklist was completed
+> by the March 21 host/joiner captures and re-verified by SHA-256. Do not repeat
+> Run 1. Use `BZRNET_PHASE2_CAPTURE_GUIDE_20260716.md` for the remaining forced
+> relay and `reasonCode` work.
+
 ## Goal
 
 Capture one or more clean sessions against the official BZRNet service so we

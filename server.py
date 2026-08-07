@@ -101,6 +101,17 @@ DEFAULT_WHITELIST = {
     "minor": 0,
 }
 
+# reasonCode values returned on OnLobbyJoined / OnFailure. The client dispatcher
+# (0x006BF2A0) reads a numeric "reasonCode"; the stock enum is not yet recovered
+# (needs a live capture), so these are provisional-but-stable: 0 == success.
+REASON_OK = 0
+JOIN_FAIL_MISSING_ID = 1
+JOIN_FAIL_INVALID_ID = 2
+JOIN_FAIL_NOT_FOUND = 3
+JOIN_FAIL_LOCKED = 4
+JOIN_FAIL_BAD_PASSWORD = 5
+JOIN_FAIL_FULL = 6
+
 SUPPORTED_CLIENT_MESSAGES = [
     "Authorization",
     "CreateGame",
@@ -3003,6 +3014,8 @@ class ServerState:
             "inLounge": s.in_lounge,
             "isInLounge": s.in_lounge,
             "isAdmin": s.is_admin,
+            # Client dispatcher (0x006BF2A0) reads isAuth off the user object.
+            "isAuth": True,
             "lobby": -1 if s.current_lobby_id is None else s.current_lobby_id,
         }
         if s.wan_address:
@@ -3016,8 +3029,16 @@ class ServerState:
         return snapshot
 
     def serialize_lobby(self, lobby: LobbyState) -> dict[str, Any]:
+        # The client reads name/isChat/lobbyId directly off the lobby object
+        # (dispatcher 0x006BF2A0). name/isChat aren't stored as struct fields;
+        # BZR encodes them in the lobby "name" metadata (e.g. "~chat~pub~~..."
+        # vs "~game~pub~~..."), so surface them from metadata here.
+        name = str(lobby.metadata.get("name", ""))
         return {
             "id": lobby.lobby_id,
+            "lobbyId": lobby.lobby_id,
+            "name": name,
+            "isChat": name.startswith("~chat~"),
             "owner": lobby.owner,
             "createdTime": lobby.created_time,
             "metadata": lobby.metadata,
@@ -3788,33 +3809,36 @@ class BZRWebSocketServer:
         await self.push_lobby_changed(lobby)
 
     async def handle_join_lobby(self, session: UserSession, content: dict[str, Any]) -> None:
+        # Client reads reasonCode (numeric) off OnLobbyJoined/OnFailure, not the
+        # human "reason" string. Exact stock enum is not yet known (needs a live
+        # capture), so these codes are provisional but stable and non-zero.
         requested_lid = content.get("id")
         if requested_lid is None:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reason": "Missing lobby id"})
+            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_MISSING_ID, "reason": "Missing lobby id"})
             return
 
         try:
             lid = int(requested_lid)
         except Exception:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reason": "Invalid lobby id"})
+            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_INVALID_ID, "reason": "Invalid lobby id"})
             return
 
         lobby = self.state.lobbies.get(lid)
         if not lobby:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reason": "Lobby not found"})
+            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_NOT_FOUND, "reason": "Lobby not found"})
             return
 
         if lobby.is_locked:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reason": "Lobby is locked"})
+            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_LOCKED, "reason": "Lobby is locked"})
             return
 
         supplied_password = str(content.get("password", ""))
         if lobby.password and supplied_password != lobby.password:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reason": "Invalid password"})
+            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_BAD_PASSWORD, "reason": "Invalid password"})
             return
 
         if len(lobby.users) >= max(1, lobby.member_limit) and session.user_id not in lobby.users:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reason": "Lobby full"})
+            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_FULL, "reason": "Lobby full"})
             return
 
         if session.current_lobby_id != lid:
@@ -3841,7 +3865,7 @@ class BZRWebSocketServer:
                 },
             )
 
-        await self.send(session.ws, "OnLobbyJoined", {"success": True, "id": lid, "time": utc_now_str()})
+        await self.send(session.ws, "OnLobbyJoined", {"success": True, "reasonCode": REASON_OK, "id": lid, "time": utc_now_str()})
         await self.push_lobby_changed(lobby)
         await self.push_full_lobby_list()
 
@@ -3896,6 +3920,9 @@ class BZRWebSocketServer:
             "lobbyId": session.current_lobby_id,
             "changedLobby": session.current_lobby_id,
             "connect": not route,
+            # Client dispatcher reads "player" + "reset" on OnLobbyMemberP2PConnect
+            # (and "player" + "port" on OnP2PRoute). "player" is set per-recipient
+            # below to the peer they should connect to.
             "reset": reset,
             "sourceUserId": session.user_id,
             "sourceName": session.name,
@@ -3915,14 +3942,28 @@ class BZRWebSocketServer:
             target_payload = dict(base_payload)
             target_payload["member"] = session.user_id
             target_payload["memberName"] = session.name
-            await self.send(target_session.ws, "OnLobbyMemberP2PConnect", target_payload)
+            target_payload["player"] = session.user_id
+            await self._send_p2p(target_session.ws, target_payload, route=route)
 
         session_payload = dict(base_payload)
         session_payload["member"] = target_id or session.user_id
         session_payload["memberName"] = (
             target_session.name if target_session else (target_id or session.name)
         )
-        await self.send(session.ws, "OnLobbyMemberP2PConnect", session_payload)
+        session_payload["player"] = target_id or session.user_id
+        await self._send_p2p(session.ws, session_payload, route=route)
+
+    async def _send_p2p(self, ws: Any, payload: dict[str, Any], *, route: bool) -> None:
+        """Deliver a P2P signal. DoP2PConnect -> OnLobbyMemberP2PConnect;
+        DoP2PRoute -> the client's distinct OnP2PRoute handler (reads player+port)."""
+        await self.send(ws, "OnLobbyMemberP2PConnect", payload)
+        if route:
+            route_payload = dict(payload)
+            route_payload["type"] = "OnP2PRoute"
+            # port: the relay/route port the peer should use. No relay is running,
+            # so echo the stock relay port; real relay work fills this properly.
+            route_payload.setdefault("port", 1339)
+            await self.send(ws, "OnP2PRoute", route_payload)
 
     async def handle_chat(self, session: UserSession, text: str) -> None:
         text = text.strip()
