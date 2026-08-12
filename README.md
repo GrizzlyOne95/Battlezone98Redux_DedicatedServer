@@ -10,7 +10,8 @@ For the ANet-to-BZR comparison and the recommended community failover architectu
 This repo now includes a runnable compatibility shim that emulates key BZRNet behavior:
 
 *   **WebSocket Lobby Service** on `:1337`
-*   **UDP P2P Handshake Shim** on `:1338`
+*   **UDP Public-Endpoint Probe** on `:1338`
+*   **Opaque UDP Relay Fallback** on `:1339` (WS-associated peer pairs; provisional stock association parity)
 *   **Health/Status HTTP Endpoint** on `:8080` (`/health`, `/status`)
 *   **Protocol/Capture Endpoints** on `:8080` (`/protocol`, `/captures`)
 *   **Persistent state snapshots** (lobby metadata) to JSON
@@ -40,7 +41,7 @@ The server currently handles:
 *   `SetPlayerData` -> `OnUserDataChanged`
 *   `SetLobbyData` / `DeleteLobbyData` -> `OnLobbyDataChanged`
 *   `DoUpdateWAN` / `DoUpdateLAN` -> `OnWANUpdated` / `OnLANUpdated`
-*   `DoP2PConnect` / `DoP2PRoute` -> `OnLobbyMemberP2PConnect`
+*   `DoP2PConnect` -> `OnLobbyMemberP2PConnect`; `DoP2PRoute` -> real route association plus `OnP2PRoute` when successful
 *   `LockLobby`, `SetLobbyMemberLimit`, `DoSetLobbyOwner`, `DoKickUser`
 *   `Ping` / `DoPing` -> `OnHeartbeat`
 *   `GetUserList` / `GetStatLog` / `GetFullLog` / `GetLogLevel`
@@ -80,7 +81,8 @@ python server.py ^
 Default bind addresses:
 
 *   WebSocket: `ws://0.0.0.0:1337`
-*   UDP: `0.0.0.0:1338`
+*   UDP endpoint probe: `0.0.0.0:1338`
+*   UDP relay: `0.0.0.0:1339`
 *   Health: `http://127.0.0.1:8080/health`
 *   Protocol: `http://127.0.0.1:8080/protocol`
 *   Captures: `http://127.0.0.1:8080/captures`
@@ -167,14 +169,17 @@ battlezone98redux.exe /netpktlog /netlog=3 /bzrnetlog=3 /bzrserver=127.0.0.1 /bz
 Notes:
 
 *   The game binary also contains a hardcoded WebSocket URL for BZRNet (`...:1337`), so DNS/hosts override may be needed for full end-to-end local redirection.
-*   The UDP shim currently focuses on handshake compatibility and iterative packet probing.
-*   A community-hosted matchmaking replacement appears feasible for most cases, but relay-assisted NAT traversal is still an open gap for strict-NAT users.
+*   UDP `1338` performs the capture-confirmed public endpoint probe.
+*   UDP `1339` now forwards WS-associated peer-pair datagrams byte-for-byte; it does not deserialize `7a75`, `0x5f`, or other gameplay payloads.
+*   The official `1339` association/allocation envelope is still unrecovered. The community relay intentionally drops ambiguous multi-target mappings, so strict/symmetric-NAT parity remains a live validation target.
+*   Run `python stock_client_compat_test.py` for in-process checks built around the executable-confirmed client message shapes.
 
 ### Preemptive Ops Checklist
 
 *   Open/forward ports:
     *   TCP `1337` (WebSocket lobby)
-    *   UDP `1338` (P2P handshake/probe)
+    *   UDP `1338` (public endpoint probe)
+    *   UDP `1339` (opaque relay fallback)
     *   TCP `8080` (health endpoint; can be LAN-only)
 *   Set DNS/hosts failover for `battlezone98mp.webdev.rebellion.co.uk` to your server IP if official host is unavailable.
 *   Run periodic health checks against `http://<server>:8080/health`.

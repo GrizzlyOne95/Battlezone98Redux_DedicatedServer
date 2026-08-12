@@ -144,7 +144,8 @@ async def ws_smoke(host: str, port: int, timeout: float) -> tuple[bool, str]:
             json.dumps(
                 {
                     "type": "CreateGame",
-                    "content": {"name": "SmokeLobby", "isPrivate": False, "memberLimit": 8, "password": ""},
+                    # Stock CreateGame builder sends no synthetic name field.
+                    "content": {"isPrivate": False, "memberLimit": 8, "password": ""},
                 }
             )
         )
@@ -317,7 +318,14 @@ def decoder_smoke() -> tuple[bool, str]:
         ),
     ]
     for payload_hex, marker, control_event, confidence, expected in cases:
-        decoded = decode_bzr_udp_datagram(bytes.fromhex(payload_hex))
+        raw = bytes.fromhex(payload_hex)
+        decoded = decode_bzr_udp_datagram(raw)
+        transport_header = decoded.get("transportHeader", {})
+        expected_sequence = int.from_bytes(raw[16:18], "big")
+        if transport_header.get("headerBytes") != 18 or decoded.get("payloadOffset") != 18:
+            return False, f"{marker} common transport boundary mismatch: {decoded}"
+        if transport_header.get("sequence") != expected_sequence or transport_header.get("sequenceEncoding") != "u16-be":
+            return False, f"{marker} transport sequence mismatch: {decoded}"
         if decoded.get("family") != "peer_control_marker":
             return False, f"{marker} marker did not decode as peer_control_marker: {decoded}"
         if decoded.get("marker") != marker:

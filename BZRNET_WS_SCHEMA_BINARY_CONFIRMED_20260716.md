@@ -108,7 +108,7 @@ explicitly rejected (`Binary Payload not supported`) — everything is text JSON
 | `DoSendChat` | chat body |
 | `DoP2PConnect` | `player`, `reset` |
 | `DoP2PRoute` | `player` |
-| `DoEnterLounge` | *(empty content)* |
+| `DoEnterLounge` | JSON number `1` (builder initializes the serialized content value to integer `1`) |
 
 ## Current `server.py` alignment (2026-07-16 working tree)
 
@@ -120,15 +120,20 @@ The current working tree now:
   snapshots;
 - exposes `isAuth` and the other binary-read fields on user snapshots;
 - carries the binary-confirmed `player` field in P2P signals;
-- emits the distinct `OnP2PRoute` reply with `player` and provisional port
-  `1339`;
+- emits `OnChatMessage.isChat` and includes the parsed lobby object directly in
+  successful `OnLobbyJoined` acknowledgements;
+- emits the distinct `OnP2PRoute` reply only after a real UDP `1339` route has
+  been associated for the requested same-lobby peer pair;
 - emits `whitelist.{major,minor,list}`.
 
 The inner `data.type` on server events is not a parity bug: the March 21 stock
 capture shows the official service sending it. The client ignores the duplicate
 type after dispatch, but retaining it matches the captured service envelope.
 
-Actual relay allocation and UDP `1339` forwarding remain unimplemented.
+UDP `1339` forwarding is implemented as a provisional community endpoint-pair relay.
+The official relay allocation/association envelope is still unrecovered, so this is
+not yet a claim of stock relay protocol parity. Ambiguous multi-peer endpoint mappings
+are rejected rather than guessed.
 
 ## Capture-confirmed runtime values
 
@@ -144,8 +149,9 @@ Actual relay allocation and UDP `1339` forwarding remain unimplemented.
 ## Still unresolved (needs live capture, not static)
 
 - Official `reasonCode` enum values beyond observed success code `0`.
-- Relay `1339` allocation, envelope, routing identifiers, keepalive, timeout,
-  and forwarding behavior.
+- Official relay `1339` allocation/association envelope, routing identifiers,
+  keepalive, and timeout semantics. The community relay now forwards registered
+  peer-pair datagrams opaquely, but official association parity still needs capture.
 - Full in-match `Net`/`NetPlayer` payload semantics. This is separate from
   matchmaking/relay parity because a transparent relay can forward the payload
   without decoding it.
