@@ -5,6 +5,7 @@ Battlezone 98 Redux dedicated-server compatibility shim.
 This service provides:
 1. A WebSocket lobby server (default port 1337) for BZRNet-style JSON messages.
 2. A UDP shim (default port 1338) for initial BZRNet P2P handshake probing.
+3. An opaque UDP relay (default port 1339) for WS-negotiated peer fallback.
 
 It is intentionally lightweight and in-memory to accelerate local testing and
 community-hosted failover scenarios.
@@ -37,6 +38,10 @@ DEFAULT_WS_HOST = "0.0.0.0"
 DEFAULT_WS_PORT = 1337
 DEFAULT_UDP_HOST = "0.0.0.0"
 DEFAULT_UDP_PORT = 1338
+DEFAULT_RELAY_HOST = "0.0.0.0"
+DEFAULT_RELAY_PORT = 1339
+DEFAULT_RELAY_ROUTE_TTL_SECONDS = 180
+BZR_TRANSPORT_HEADER_BYTES = 18
 DEFAULT_HEALTH_HOST = "127.0.0.1"
 DEFAULT_HEALTH_PORT = 8080
 DEFAULT_STATE_FILE = "data/server_state.json"
@@ -163,6 +168,7 @@ SUPPORTED_SERVER_MESSAGES = [
     "OnLobbyListChanged",
     "OnLobbyMemberListChanged",
     "OnLobbyMemberP2PConnect",
+    "OnP2PRoute",
     "OnLobbyRemoved",
     "OnRelayUpdated",
     "OnStdoutLogEntry",
@@ -377,6 +383,38 @@ def _hex_u16(data: bytes, offset: int) -> str:
 
 def _hex_u32(data: bytes, offset: int) -> str:
     return f"0x{_read_u32_le(data, offset):08x}"
+
+
+def _decode_bzr_transport_header(data: bytes) -> dict[str, Any]:
+    """Decode only the independently corroborated common BZRNet wrapper.
+
+    Bytes 0..17 form the common transport header, bytes 16..17 are a big-endian
+    16-bit sequence number, and application/control payload starts at byte 18.
+    Fields that are not yet named with confidence remain deliberately opaque.
+    """
+    if len(data) < BZR_TRANSPORT_HEADER_BYTES:
+        return {}
+
+    sequence = int.from_bytes(data[16:18], "big")
+    flags_byte = data[0]
+    return {
+        "payloadOffset": BZR_TRANSPORT_HEADER_BYTES,
+        "transportHeader": {
+            "headerBytes": BZR_TRANSPORT_HEADER_BYTES,
+            "headerHex": data[:BZR_TRANSPORT_HEADER_BYTES].hex(),
+            "flagsByte": f"0x{flags_byte:02x}",
+            "packetKind": data[1],
+            "packetKindHex": f"0x{data[1]:02x}",
+            "opaqueBytes2To15": data[2:16].hex(),
+            "sequence": sequence,
+            "sequenceEncoding": "u16-be",
+            "payloadOffset": BZR_TRANSPORT_HEADER_BYTES,
+            "payloadBytes": max(0, len(data) - BZR_TRANSPORT_HEADER_BYTES),
+            "reliabilityHint": "reliable" if flags_byte & 0x80 else "unreliable",
+            "boundaryConfidence": "high",
+            "sequenceConfidence": "high",
+        },
+    }
 
 
 def _decode_pp_marker_payload(payload: bytes) -> dict[str, Any]:
@@ -653,6 +691,9 @@ def decode_bzr_udp_datagram(data: bytes) -> dict[str, Any]:
     if not data:
         decoded["family"] = "empty"
         return decoded
+
+    if len(data) >= BZR_TRANSPORT_HEADER_BYTES:
+        decoded.update(_decode_bzr_transport_header(data))
 
     if len(data) >= 18 and data[0] == 0x40 and data[1] == 0x02:
         if len(data) == 18:
@@ -3273,6 +3314,277 @@ class BZRUDPProtocol(asyncio.DatagramProtocol):
         self.logger.warning("UDP error: %s", exc)
 
 
+def _parse_ipv4_endpoint(value: str) -> tuple[str, int] | None:
+    text = str(value or "").strip()
+    host, sep, port_text = text.rpartition(":")
+    if not sep or not host or not port_text:
+        return None
+    try:
+        socket.inet_aton(host)
+        port = int(port_text)
+    except (OSError, ValueError):
+        return None
+    if not (1 <= port <= 65535):
+        return None
+    return host, port
+
+
+@dataclass
+class RelayRoute:
+    lobby_id: int
+    user_a: str
+    user_b: str
+    endpoint_a: tuple[str, int]
+    endpoint_b: tuple[str, int]
+    observed_a: tuple[str, int] | None = None
+    observed_b: tuple[str, int] | None = None
+    created_monotonic: float = field(default_factory=time.monotonic)
+    last_activity_monotonic: float = field(default_factory=time.monotonic)
+
+
+class BZRRelayProtocol(asyncio.DatagramProtocol):
+    """Transparent datagram relay for WS-associated peer pairs.
+
+    This intentionally does not deserialize gameplay payloads.  The official
+    1339 allocation/association envelope is not yet recovered, so the community
+    fallback associates routes from DoP2PRoute plus each user's known WAN
+    endpoint.  If an endpoint maps to more than one candidate peer, forwarding
+    stops rather than guessing and risking cross-session delivery.
+    """
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        state: ServerState,
+        *,
+        route_ttl_seconds: int = DEFAULT_RELAY_ROUTE_TTL_SECONDS,
+    ) -> None:
+        self.logger = logger
+        self.state = state
+        self.route_ttl_seconds = max(15, int(route_ttl_seconds))
+        self.transport: asyncio.DatagramTransport | None = None
+        self.listen_port = DEFAULT_RELAY_PORT
+        self.routing_enabled = True
+        self.routes: dict[tuple[str, str], RelayRoute] = {}
+        self.rx_count = 0
+        self.tx_count = 0
+        self.drop_count = 0
+        self.ambiguous_drop_count = 0
+        self.unmapped_drop_count = 0
+        self.expired_route_count = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.routing_enabled and self.transport is not None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+        sockname = transport.get_extra_info("sockname")
+        if isinstance(sockname, tuple) and len(sockname) >= 2:
+            try:
+                self.listen_port = int(sockname[1])
+            except Exception:
+                pass
+        self.logger.info("UDP relay listening on %s", sockname)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.routing_enabled = bool(enabled)
+        if not self.routing_enabled:
+            self.routes.clear()
+
+    def metrics(self) -> dict[str, Any]:
+        self._expire_routes()
+        return {
+            "enabled": self.enabled,
+            "listenPort": self.listen_port if self.transport is not None else None,
+            "activeRoutes": len(self.routes),
+            "packetsRxTotal": self.rx_count,
+            "packetsTxTotal": self.tx_count,
+            "packetsDroppedTotal": self.drop_count,
+            "ambiguousDropsTotal": self.ambiguous_drop_count,
+            "unmappedDropsTotal": self.unmapped_drop_count,
+            "expiredRoutesTotal": self.expired_route_count,
+            "routeTtlSeconds": self.route_ttl_seconds,
+            "associationMode": "ws-route-endpoint-pair",
+            "officialAssociationParity": False,
+        }
+
+    def _expire_routes(self) -> None:
+        now = time.monotonic()
+        expired = [
+            key
+            for key, route in self.routes.items()
+            if now - route.last_activity_monotonic > self.route_ttl_seconds
+        ]
+        for key in expired:
+            self.routes.pop(key, None)
+            self.expired_route_count += 1
+
+    def remove_user(self, user_id: str, *, lobby_id: int | None = None) -> None:
+        removed = []
+        for key, route in self.routes.items():
+            if user_id not in key:
+                continue
+            if lobby_id is not None and route.lobby_id != lobby_id:
+                continue
+            removed.append(key)
+        for key in removed:
+            self.routes.pop(key, None)
+
+    def register_route(self, source: UserSession, target: UserSession) -> tuple[bool, str]:
+        self._expire_routes()
+        if not self.enabled:
+            return False, "relay transport is disabled"
+        if source.user_id == target.user_id:
+            return False, "relay target must be another player"
+        if source.current_lobby_id is None or source.current_lobby_id != target.current_lobby_id:
+            return False, "relay peers must be in the same lobby"
+
+        source_endpoint = _parse_ipv4_endpoint(source.wan_address)
+        target_endpoint = _parse_ipv4_endpoint(target.wan_address)
+        if source_endpoint is None or target_endpoint is None:
+            return False, "both relay peers need a WAN ip:port endpoint"
+
+        key = tuple(sorted((source.user_id, target.user_id)))
+        previous = self.routes.get(key)
+        if key[0] == source.user_id:
+            endpoint_a, endpoint_b = source_endpoint, target_endpoint
+        else:
+            endpoint_a, endpoint_b = target_endpoint, source_endpoint
+
+        route = RelayRoute(
+            lobby_id=int(source.current_lobby_id),
+            user_a=key[0],
+            user_b=key[1],
+            endpoint_a=endpoint_a,
+            endpoint_b=endpoint_b,
+        )
+        if previous is not None:
+            if previous.endpoint_a == endpoint_a:
+                route.observed_a = previous.observed_a
+            if previous.endpoint_b == endpoint_b:
+                route.observed_b = previous.observed_b
+            route.created_monotonic = previous.created_monotonic
+        self.routes[key] = route
+        self.state.record_stdout_entry(
+            "info",
+            f"Relay route registered lobby={route.lobby_id} {route.user_a}<->{route.user_b} "
+            f"endpoints={route.endpoint_a[0]}:{route.endpoint_a[1]}<->{route.endpoint_b[0]}:{route.endpoint_b[1]}",
+        )
+        return True, "ok"
+
+    def _match_sender(self, addr: tuple[str, int]) -> tuple[RelayRoute, str] | None:
+        exact: dict[tuple[str, str], tuple[RelayRoute, str]] = {}
+        for key, route in self.routes.items():
+            if addr == route.endpoint_a or addr == route.observed_a:
+                exact[("|".join(key), "a")] = (route, "a")
+            if addr == route.endpoint_b or addr == route.observed_b:
+                exact[("|".join(key), "b")] = (route, "b")
+        if len(exact) == 1:
+            return next(iter(exact.values()))
+        if len(exact) > 1:
+            self.ambiguous_drop_count += 1
+            return None
+
+        # A changed NAT source port can be learned only when the source IP still
+        # identifies one unique side.  Multiple candidates are deliberately not
+        # guessed because the unrecovered stock relay may carry an association id.
+        ip_matches: dict[tuple[str, str], tuple[RelayRoute, str]] = {}
+        for key, route in self.routes.items():
+            a_ips = {route.endpoint_a[0]}
+            b_ips = {route.endpoint_b[0]}
+            if route.observed_a:
+                a_ips.add(route.observed_a[0])
+            if route.observed_b:
+                b_ips.add(route.observed_b[0])
+            if addr[0] in a_ips:
+                ip_matches[("|".join(key), "a")] = (route, "a")
+            if addr[0] in b_ips:
+                ip_matches[("|".join(key), "b")] = (route, "b")
+        if len(ip_matches) == 1:
+            return next(iter(ip_matches.values()))
+        if len(ip_matches) > 1:
+            self.ambiguous_drop_count += 1
+        return None
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.rx_count += 1
+        self._expire_routes()
+
+        # Relay forwarding stays deliberately opaque and cheap. Sample only the
+        # common 18-byte wrapper for diagnostics instead of running the deep
+        # 7a75/0x5f decoder on every gameplay datagram. Drops are always logged.
+        sampled = self.rx_count <= 8 or self.rx_count % 64 == 0
+        decoder: dict[str, Any] | None = None
+        preview = {"bytes": len(data), "lead": data[:32].hex()}
+        if sampled:
+            decoder = _decode_bzr_transport_header(data)
+            if decoder:
+                decoder["family"] = "relay_opaque"
+            self.state.record_protocol_event(
+                channel="relay",
+                direction="rx",
+                peer=f"{addr[0]}:{addr[1]}",
+                msg_type="relay_datagram",
+                payload=preview,
+                decoder=decoder,
+            )
+
+        if not self.enabled:
+            self.drop_count += 1
+            return
+
+        ambiguous_before = self.ambiguous_drop_count
+        matched = self._match_sender(addr)
+        if matched is None:
+            self.drop_count += 1
+            if self.ambiguous_drop_count == ambiguous_before:
+                self.unmapped_drop_count += 1
+            if decoder is None:
+                decoder = _decode_bzr_transport_header(data)
+                if decoder:
+                    decoder["family"] = "relay_opaque"
+            self.state.record_protocol_event(
+                channel="relay",
+                direction="drop",
+                peer=f"{addr[0]}:{addr[1]}",
+                msg_type="relay_unroutable",
+                payload=preview,
+                decoder=decoder,
+            )
+            return
+
+        route, side = matched
+        if side == "a":
+            route.observed_a = addr
+            target = route.observed_b or route.endpoint_b
+        else:
+            route.observed_b = addr
+            target = route.observed_a or route.endpoint_a
+        route.last_activity_monotonic = time.monotonic()
+
+        if target == addr or self.transport is None:
+            self.drop_count += 1
+            return
+
+        # Preserve the complete datagram and packet boundary exactly. The relay
+        # never rewrites sequence numbers or interprets the payload after byte 18.
+        self.transport.sendto(data, target)
+        self.tx_count += 1
+        if sampled:
+            self.state.record_protocol_event(
+                channel="relay",
+                direction="tx",
+                peer=f"{target[0]}:{target[1]}",
+                msg_type="relay_datagram",
+                payload=preview,
+                decoder=decoder,
+            )
+
+    def error_received(self, exc: Exception) -> None:
+        self.logger.warning("UDP relay error: %s", exc)
+
+
 class BZRWebSocketServer:
     def __init__(
         self,
@@ -3282,12 +3594,14 @@ class BZRWebSocketServer:
         motd: str = "",
         max_lobbies: int = 500,
         retain_empty_lobbies: bool = False,
+        relay_protocol: BZRRelayProtocol | None = None,
     ):
         self.state = state
         self.log = logger
         self.motd = motd.strip()
         self.max_lobbies = max(1, int(max_lobbies))
         self.retain_empty_lobbies = bool(retain_empty_lobbies)
+        self.relay_protocol = relay_protocol
         self.ws_messages_total = 0
         self.auth_total = 0
         self.chat_total = 0
@@ -3319,7 +3633,9 @@ class BZRWebSocketServer:
                 "compatibility.websocketLobby=true",
                 "compatibility.udpHandshakeShim=true",
                 "compatibility.directPeerSessionsExpected=true",
-                "compatibility.relayTransportImplemented=false",
+                f"compatibility.relayTransportImplemented={str(bool(self.relay_protocol)).lower()}",
+                f"compatibility.relayTransportEnabled={str(bool(self.relay_protocol and self.relay_protocol.enabled)).lower()}",
+                "compatibility.relayOfficialAssociationParity=false",
                 "compatibility.steamTicketValidation=false",
             ]
         )
@@ -3566,7 +3882,11 @@ class BZRWebSocketServer:
     def _normalize_lobby_name(self, raw_name: str) -> str:
         if not raw_name:
             return "~chat~pub~~MyLobby"
-        return raw_name if raw_name.startswith("~chat~pub~~") else f"~chat~pub~~{raw_name}"
+        # CreateGame pre-normalizes its internal metadata name to ~game~. Do not
+        # run that already-normalized value back through the chat-lobby prefix.
+        if raw_name.startswith(("~chat~pub~~", "~game~pub~~")):
+            return raw_name
+        return f"~chat~pub~~{raw_name}"
 
     def _normalize_game_name(self, raw_name: str) -> str:
         if not raw_name:
@@ -3587,6 +3907,8 @@ class BZRWebSocketServer:
             return
 
         lobby = self.state.lobbies.get(lid)
+        if self.relay_protocol is not None:
+            self.relay_protocol.remove_user(session.user_id, lobby_id=lid)
         session.current_lobby_id = None
         session.in_lounge = True
         if not lobby:
@@ -3705,7 +4027,7 @@ class BZRWebSocketServer:
             {
                 "type": "OnRelayUpdated",
                 "time": utc_now_str(),
-                "enabled": False,
+                "enabled": bool(self.relay_protocol and self.relay_protocol.enabled),
                 "requested": self.state.relay_requested,
             },
         )
@@ -3741,6 +4063,7 @@ class BZRWebSocketServer:
                     "speakerId": "SERVER",
                     "text": self.motd,
                     "lobbyId": None,
+                    "isChat": True,
                     "time": utc_now_str(),
                     "system": True,
                 },
@@ -3865,7 +4188,20 @@ class BZRWebSocketServer:
                 },
             )
 
-        await self.send(session.ws, "OnLobbyJoined", {"success": True, "reasonCode": REASON_OK, "id": lid, "time": utc_now_str()})
+        lobby_blob = self.state.serialize_lobby(lobby)
+        await self.send(
+            session.ws,
+            "OnLobbyJoined",
+            {
+                "success": True,
+                "reasonCode": REASON_OK,
+                "id": lid,
+                "lobbyId": lid,
+                "time": utc_now_str(),
+                "lobby": lobby_blob,
+                "lobbies": {str(lid): lobby_blob},
+            },
+        )
         await self.push_lobby_changed(lobby)
         await self.push_full_lobby_list()
 
@@ -3913,28 +4249,49 @@ class BZRWebSocketServer:
             "info",
             f"{event_name} from {session.user_id} target={target_id or '?'} route={compact_preview(content)}",
         )
+
+        relay_route_ok = False
+        relay_reason = ""
+        relay_port: int | None = None
+        if route:
+            if target_session is None:
+                relay_reason = "target player is not connected"
+            elif self.relay_protocol is None:
+                relay_reason = "relay transport is unavailable"
+            else:
+                relay_route_ok, relay_reason = self.relay_protocol.register_route(session, target_session)
+                if relay_route_ok:
+                    relay_port = self.relay_protocol.listen_port
+
+        success = target_session is not None and (not route or relay_route_ok)
         base_payload = {
             "type": "OnLobbyMemberP2PConnect",
             "time": utc_now_str(),
-            "success": target_session is not None,
+            "success": success,
             "lobbyId": session.current_lobby_id,
             "changedLobby": session.current_lobby_id,
             "connect": not route,
-            # Client dispatcher reads "player" + "reset" on OnLobbyMemberP2PConnect
-            # (and "player" + "port" on OnP2PRoute). "player" is set per-recipient
-            # below to the peer they should connect to.
+            # Client dispatcher reads player+reset on OnLobbyMemberP2PConnect and
+            # player+port on OnP2PRoute. Never advertise a relay port unless the
+            # backend has actually registered a routable pair.
             "reset": reset,
             "sourceUserId": session.user_id,
             "sourceName": session.name,
             "targetId": target_id,
             "requested": content,
             "routeRequested": route,
-            "relayEnabled": False,
+            "relayEnabled": bool(self.relay_protocol and self.relay_protocol.enabled),
             "sourceWanAddress": session.wan_address,
             "sourceLanAddresses": list(session.lan_addresses),
             "user": self.state.build_user_snapshot(session),
             "users": {session.user_id: self.state.build_user_snapshot(session)},
         }
+        if route and not relay_route_ok:
+            base_payload["relayReason"] = relay_reason
+            self.state.record_stdout_entry(
+                "warn",
+                f"DoP2PRoute rejected source={session.user_id} target={target_id or '?'}: {relay_reason}",
+            )
         if target_session:
             base_payload["target"] = self.state.build_user_snapshot(target_session)
             base_payload["users"][target_session.user_id] = self.state.build_user_snapshot(target_session)
@@ -3943,7 +4300,7 @@ class BZRWebSocketServer:
             target_payload["member"] = session.user_id
             target_payload["memberName"] = session.name
             target_payload["player"] = session.user_id
-            await self._send_p2p(target_session.ws, target_payload, route=route)
+            await self._send_p2p(target_session.ws, target_payload, route_port=relay_port if relay_route_ok else None)
 
         session_payload = dict(base_payload)
         session_payload["member"] = target_id or session.user_id
@@ -3951,18 +4308,15 @@ class BZRWebSocketServer:
             target_session.name if target_session else (target_id or session.name)
         )
         session_payload["player"] = target_id or session.user_id
-        await self._send_p2p(session.ws, session_payload, route=route)
+        await self._send_p2p(session.ws, session_payload, route_port=relay_port if relay_route_ok else None)
 
-    async def _send_p2p(self, ws: Any, payload: dict[str, Any], *, route: bool) -> None:
-        """Deliver a P2P signal. DoP2PConnect -> OnLobbyMemberP2PConnect;
-        DoP2PRoute -> the client's distinct OnP2PRoute handler (reads player+port)."""
+    async def _send_p2p(self, ws: Any, payload: dict[str, Any], *, route_port: int | None) -> None:
+        """Deliver direct-connect signaling and an allocated relay route when valid."""
         await self.send(ws, "OnLobbyMemberP2PConnect", payload)
-        if route:
+        if route_port is not None and payload.get("success") is True:
             route_payload = dict(payload)
             route_payload["type"] = "OnP2PRoute"
-            # port: the relay/route port the peer should use. No relay is running,
-            # so echo the stock relay port; real relay work fills this properly.
-            route_payload.setdefault("port", 1339)
+            route_payload["port"] = int(route_port)
             await self.send(ws, "OnP2PRoute", route_payload)
 
     async def handle_chat(self, session: UserSession, text: str) -> None:
@@ -3972,11 +4326,15 @@ class BZRWebSocketServer:
         self.chat_total += 1
 
         lid = session.current_lobby_id
+        is_chat = True
+        if lid is not None and lid in self.state.lobbies:
+            is_chat = bool(self.state.serialize_lobby(self.state.lobbies[lid]).get("isChat"))
         chat_payload = {
             "author": session.name,
             "speakerId": session.user_id,
             "text": text,
             "lobbyId": lid,
+            "isChat": is_chat,
             "time": utc_now_str(),
         }
         self.state.record_stdout_entry("info", f"Chat from {session.user_id} in lobby {lid}: {text}")
@@ -4353,23 +4711,28 @@ class BZRWebSocketServer:
             return
 
         if msg_type == "SetRelay":
+            if not session.is_admin:
+                await self.send_error(ws, "SetRelay denied: admin only")
+                return
             requested = self._coerce_bool(content.get("toggle")) if isinstance(content, dict) else self._coerce_bool(content)
-            self.state.relay_requested = requested
+            available = self.relay_protocol is not None
+            if self.relay_protocol is not None:
+                self.relay_protocol.set_enabled(requested)
+            enabled = bool(self.relay_protocol and self.relay_protocol.enabled)
+            self.state.relay_requested = enabled
             self.state.mark_dirty()
-            if requested:
-                self.state.record_stdout_entry(
-                    "warn",
-                    "Relay enable requested, but packet relay is not implemented in community failover mode",
-                )
+            success = (enabled == requested) if available else (not requested)
+            if requested and not enabled:
+                self.state.record_stdout_entry("warn", "Relay enable requested, but UDP relay transport is unavailable")
             await self.send(
                 ws,
                 "OnEnableRelayChanged",
-                {"enabled": False, "requested": requested, "success": False, "time": utc_now_str()},
+                {"enabled": enabled, "requested": requested, "success": success, "time": utc_now_str()},
             )
             await self.send(
                 ws,
                 "OnRelayUpdated",
-                {"enabled": False, "requested": requested, "success": False, "time": utc_now_str()},
+                {"enabled": enabled, "requested": requested, "success": success, "time": utc_now_str()},
             )
             return
 
@@ -4450,6 +4813,7 @@ def build_status_payload(
     state: ServerState,
     ws_server: BZRWebSocketServer,
     udp_protocol: BZRUDPProtocol,
+    relay_protocol: BZRRelayProtocol | None,
     started_monotonic: float,
 ) -> dict[str, Any]:
     return {
@@ -4462,13 +4826,22 @@ def build_status_payload(
             "packetsRxTotal": udp_protocol.rx_count,
             "packetsTxTotal": udp_protocol.tx_count,
         },
+        "relay": relay_protocol.metrics() if relay_protocol is not None else {
+            "enabled": False,
+            "listenPort": None,
+            "activeRoutes": 0,
+            "associationMode": "unavailable",
+            "officialAssociationParity": False,
+        },
         "compatibility": {
             "observedOfficialHost": "battlezone98mp.webdev.rebellion.co.uk",
             "websocketLobby": True,
             "udpHandshakeShim": True,
             "directPeerSessionsExpected": True,
             "relayControlMessages": True,
-            "relayTransportImplemented": False,
+            "relayTransportImplemented": relay_protocol is not None,
+            "relayTransportEnabled": bool(relay_protocol and relay_protocol.enabled),
+            "relayOfficialAssociationParity": False,
             "steamTicketValidation": False,
             "adminLogPayloadCompatibility": True,
         },
@@ -4488,6 +4861,7 @@ async def serve_health_http(
     state: ServerState,
     ws_server: BZRWebSocketServer,
     udp_protocol: BZRUDPProtocol,
+    relay_protocol: BZRRelayProtocol | None,
     started_monotonic: float,
 ) -> None:
     try:
@@ -4521,6 +4895,7 @@ async def serve_health_http(
                 state=state,
                 ws_server=ws_server,
                 udp_protocol=udp_protocol,
+                relay_protocol=relay_protocol,
                 started_monotonic=started_monotonic,
             )
         elif path == "/captures":
@@ -4541,7 +4916,9 @@ async def serve_health_http(
                     "hostname": "battlezone98mp.webdev.rebellion.co.uk",
                     "websocketPort": DEFAULT_WS_PORT,
                     "udpProbePort": DEFAULT_UDP_PORT,
-                    "relayPortObserved": 1339,
+                    "relayPortObserved": DEFAULT_RELAY_PORT,
+                    "relayAssociationMode": "ws-route-endpoint-pair",
+                    "relayOfficialAssociationParity": False,
                 },
                 "supportedMessages": {
                     "client": SUPPORTED_CLIENT_MESSAGES,
@@ -4608,12 +4985,24 @@ async def run_server(args: argparse.Namespace) -> None:
     )
     state.load_state()
 
+    relay_protocol: BZRRelayProtocol | None = None
+    if not args.disable_relay and args.relay_port > 0:
+        relay_protocol = BZRRelayProtocol(
+            logger.getChild("relay"),
+            state,
+            route_ttl_seconds=args.relay_route_ttl_seconds,
+        )
+        state.relay_requested = True
+    else:
+        state.relay_requested = False
+
     ws_server = BZRWebSocketServer(
         state,
         logger.getChild("ws"),
         motd=args.motd,
         max_lobbies=args.max_lobbies,
         retain_empty_lobbies=args.retain_empty_lobbies,
+        relay_protocol=relay_protocol,
     )
 
     loop = asyncio.get_running_loop()
@@ -4640,6 +5029,13 @@ async def run_server(args: argparse.Namespace) -> None:
         local_addr=(args.udp_host, args.udp_port),
     )
 
+    relay_transport: asyncio.DatagramTransport | None = None
+    if relay_protocol is not None:
+        relay_transport, _ = await loop.create_datagram_endpoint(
+            lambda: relay_protocol,
+            local_addr=(args.relay_host, args.relay_port),
+        )
+
     health_server = None
     if args.health_port > 0:
         health_server = await asyncio.start_server(
@@ -4649,6 +5045,7 @@ async def run_server(args: argparse.Namespace) -> None:
                 state=state,
                 ws_server=ws_server,
                 udp_protocol=udp_protocol,
+                relay_protocol=relay_protocol,
                 started_monotonic=started_monotonic,
             ),
             host=args.health_host,
@@ -4669,6 +5066,8 @@ async def run_server(args: argparse.Namespace) -> None:
     ):
         logger.info("WebSocket server listening on ws://%s:%d", args.ws_host, args.ws_port)
         logger.info("UDP shim listening on %s:%d", args.udp_host, args.udp_port)
+        if relay_protocol is not None:
+            logger.info("UDP relay listening on %s:%d", args.relay_host, args.relay_port)
         if health_server:
             logger.info("Health endpoint listening on http://%s:%d/health", args.health_host, args.health_port)
         logger.info("Press Ctrl+C to stop.")
@@ -4684,6 +5083,8 @@ async def run_server(args: argparse.Namespace) -> None:
         await health_server.wait_closed()
 
     udp_transport.close()
+    if relay_transport is not None:
+        relay_transport.close()
     await asyncio.sleep(0.05)
 
 
@@ -4693,6 +5094,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ws-port", type=int, default=DEFAULT_WS_PORT, help=f"WebSocket bind port (default: {DEFAULT_WS_PORT})")
     parser.add_argument("--udp-host", default=DEFAULT_UDP_HOST, help=f"UDP bind host (default: {DEFAULT_UDP_HOST})")
     parser.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help=f"UDP bind port (default: {DEFAULT_UDP_PORT})")
+    parser.add_argument("--relay-host", default=DEFAULT_RELAY_HOST, help=f"UDP relay bind host (default: {DEFAULT_RELAY_HOST})")
+    parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP relay port, 0 to disable (default: {DEFAULT_RELAY_PORT})")
+    parser.add_argument("--relay-route-ttl-seconds", type=int, default=DEFAULT_RELAY_ROUTE_TTL_SECONDS, help="Inactive relay route expiration interval")
+    parser.add_argument("--disable-relay", action="store_true", help="Disable the community UDP relay transport")
     parser.add_argument("--health-host", default=DEFAULT_HEALTH_HOST, help=f"Health HTTP bind host (default: {DEFAULT_HEALTH_HOST})")
     parser.add_argument("--health-port", type=int, default=DEFAULT_HEALTH_PORT, help=f"Health HTTP bind port, 0 to disable (default: {DEFAULT_HEALTH_PORT})")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"Path to persistent state JSON (default: {DEFAULT_STATE_FILE})")

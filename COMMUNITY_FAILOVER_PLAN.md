@@ -72,7 +72,8 @@ This is the minimum useful service.
 Components:
 
 * TCP `1337`: WebSocket lobby service
-* UDP `1338`: BZRNet probe / handshake shim
+* UDP `1338`: capture-confirmed public endpoint probe
+* UDP `1339`: opaque fallback relay for WS-associated peer pairs
 * TCP `8080`: health and status endpoint
 * persistent lobby state snapshots
 * MOTD, admin controls, whitelist delivery
@@ -115,9 +116,10 @@ Recommended:
 * optional Steam ticket verification if you later want stronger abuse controls
 * moderator banlist / allowlist persistence
 
-### Phase 3: Relay or NAT Assistance
+### Phase 3: Relay Parity and NAT Hardening
 
-Only build this if Phase 1 testing shows a meaningful failure rate.
+A conservative UDP `1339` relay now exists. The remaining work is to recover and
+validate the official allocation/association semantics and strict-NAT behavior.
 
 Why it may be needed:
 
@@ -133,8 +135,9 @@ Options:
 
 Recommendation:
 
-* do not block community failover on relay work
-* collect real-world connection failures first
+* keep direct P2P as the normal path and use relay only as fallback
+* capture the stock `1339` association flow before claiming exact protocol parity
+* preserve datagram contents and boundaries; do not reimplement client reliability/state machinery server-side
 
 ## Auth Policy Recommendation
 
@@ -193,6 +196,6 @@ The existing `server.py` already covers the right shape for Phase 1:
 Immediate priorities are:
 
 1. preserve payload compatibility with the observed admin and monitor tooling
-2. document the cutover path clearly
+2. validate stock-client WS field parity and exact builder shapes
 3. test direct-peer success across real Internet clients
-4. postpone relay work until the data says it is needed
+4. capture and graduate the provisional `1339` endpoint-pair relay to official allocation/association parity
