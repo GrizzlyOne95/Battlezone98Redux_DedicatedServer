@@ -107,14 +107,19 @@ DEFAULT_WHITELIST = {
 }
 
 # reasonCode values returned on OnLobbyJoined / OnFailure. The client dispatcher
-# (0x006BF2A0) reads a numeric "reasonCode"; the stock enum is not yet recovered
-# (needs a live capture), so these are provisional-but-stable: 0 == success.
+# (0x006BF2A0) reads a numeric "reasonCode"; 0 == success.
+#
+# Live-confirmed against the official service (2026-08-24): joining a lobby that
+# "no longer exists" returns reasonCode=4 with
+# reason="Join Lobby Failed, Lobby no longer exists".
+# All other failure values remain provisional and are numbered to avoid the
+# confirmed slot; renumber again only with fresh official evidence.
 REASON_OK = 0
 JOIN_FAIL_MISSING_ID = 1
 JOIN_FAIL_INVALID_ID = 2
-JOIN_FAIL_NOT_FOUND = 3
-JOIN_FAIL_LOCKED = 4
-JOIN_FAIL_BAD_PASSWORD = 5
+JOIN_FAIL_BAD_PASSWORD = 3
+JOIN_FAIL_NOT_FOUND = 4
+JOIN_FAIL_LOCKED = 5
 JOIN_FAIL_FULL = 6
 
 SUPPORTED_CLIENT_MESSAGES = [
@@ -3080,7 +3085,10 @@ class ServerState:
             "lobbyId": lobby.lobby_id,
             "name": name,
             "isChat": name.startswith("~chat~"),
-            "owner": lobby.owner,
+            # Official admin page (scripts/bzdatagrids.js) renders owner == -1 as
+            # "none"; an ownerless/restored lobby must therefore serialize -1,
+            # not "".
+            "owner": lobby.owner if lobby.owner else -1,
             "createdTime": lobby.created_time,
             "metadata": lobby.metadata,
             "memberLimit": lobby.member_limit,
@@ -3294,21 +3302,16 @@ class BZRUDPProtocol(asyncio.DatagramProtocol):
 
     @staticmethod
     def _build_reply(data: bytes, addr: tuple[str, int]) -> bytes:
-        if not data:
-            return b""
-
-        # Official 1338 replies echo the probe and append a 7-byte trailer:
-        # 0x04 + observed IPv4 + observed UDP port (big-endian).
-        if data[0] == 0x40 and len(data) >= 18:
-            try:
-                ip_bytes = socket.inet_aton(addr[0])
-                port_bytes = int(addr[1]).to_bytes(2, "big")
-                return data + b"\x04" + ip_bytes + port_bytes
-            except (OSError, OverflowError):
-                return data
-
-        # For unknown packet types, echo to keep local probes iterative.
-        return data
+        # Live-verified against the official service (2026-08-24): UDP 1338 echoes
+        # ANY received datagram verbatim and appends a 7-byte trailer:
+        # 0x04 + observed IPv4 (network order) + observed UDP port (big-endian).
+        # Empty datagrams get a trailer-only 7-byte reply.
+        try:
+            ip_bytes = socket.inet_aton(addr[0])
+            port_bytes = int(addr[1]).to_bytes(2, "big")
+            return data + b"\x04" + ip_bytes + port_bytes
+        except (OSError, OverflowError):
+            return data
 
     def error_received(self, exc: Exception) -> None:
         self.logger.warning("UDP error: %s", exc)
@@ -3852,15 +3855,28 @@ class BZRWebSocketServer:
             await asyncio.gather(*targets, return_exceptions=True)
 
     async def push_lobby_list(self, ws: Any, msg_type: str = "OnGetLobbyList") -> None:
-        await self.send(ws, msg_type, {"lobbies": self.state.serialize_lobbies()})
+        await self.send(ws, msg_type, self._lobby_list_payload())
+
+    def _lobby_list_payload(self) -> dict[str, Any]:
+        # The official service includes a "totalUsers" counter in list/changed
+        # envelopes (observed live 2026-08-24; the official value can even go
+        # negative via an internal wrap -- we always report the true count).
+        return {
+            "lobbies": self.state.serialize_lobbies(),
+            "totalUsers": len(self.state.sessions_by_user_id),
+        }
 
     async def push_lobby_changed(self, lobby: LobbyState) -> None:
         await self.broadcast_all(
-            "OnLobbyChanged", {"lobbies": {str(lobby.lobby_id): self.state.serialize_lobby(lobby)}}
+            "OnLobbyChanged",
+            {
+                "lobbies": {str(lobby.lobby_id): self.state.serialize_lobby(lobby)},
+                "totalUsers": len(self.state.sessions_by_user_id),
+            },
         )
 
     async def push_full_lobby_list(self) -> None:
-        await self.broadcast_all("OnLobbyListChanged", {"lobbies": self.state.serialize_lobbies()})
+        await self.broadcast_all("OnLobbyListChanged", self._lobby_list_payload())
 
     def _apply_player_data(self, session: UserSession, key: str, value: Any) -> None:
         if key == "name":
@@ -3920,13 +3936,16 @@ class BZRWebSocketServer:
             del lobby.users[session.user_id]
             self.state.mark_dirty()
             self.state.record_stdout_entry("info", f"{session.name} left lobby {lid}")
+            # "member" carries the affected user's server-assigned ID upstream
+            # (official behavior confirmed live 2026-08-24); memberName is our
+            # human-readable addition.
             await self.broadcast_all(
                 "OnLobbyMemberListChanged",
                 {
                     "lobbyId": lid,
                     "id": session.user_id,
-                    "member": session.name,
-                    "memberId": session.user_id,
+                    "member": session.user_id,
+                    "memberName": session.name,
                     "removed": True,
                     "user": self.state.build_user_snapshot(session),
                     "users": {session.user_id: self.state.build_user_snapshot(session)},
@@ -4131,13 +4150,57 @@ class BZRWebSocketServer:
         self.state.mark_dirty()
         await self.push_lobby_changed(lobby)
 
-    async def handle_join_lobby(self, session: UserSession, content: dict[str, Any]) -> None:
-        # Client reads reasonCode (numeric) off OnLobbyJoined/OnFailure, not the
-        # human "reason" string. Exact stock enum is not yet known (needs a live
-        # capture), so these codes are provisional but stable and non-zero.
-        requested_lid = content.get("id")
+    async def handle_join_lobby(self, session: UserSession, content: Any) -> None:
+        # Client reads reasonCode (numeric) off OnLobbyJoined/OnFailure.
+        # Live-confirmed official behavior (2026-08-24):
+        #   - content must be an object; scalar content yields
+        #     OnFailure "DoJoinLobby failure bad content data type";
+        #   - stock clients send {"id": <number>, "password": <string>}.
+        # We accept the exact stock shape plus liberal variants (missing or
+        # numeric-typed fields) because community tooling relies on them, but a
+        # non-object/non-scalar content is rejected with the official wording.
+        password = ""
+        if isinstance(content, dict):
+            requested_lid = content.get("id")
+            raw_password = content.get("password", "")
+            password = "" if raw_password is None else str(raw_password)
+        elif isinstance(content, bool):
+            await self.send(
+                session.ws,
+                "OnFailure",
+                {
+                    "type": "OnFailure",
+                    "time": utc_now_str(),
+                    "success": False,
+                    "reason": "DoJoinLobby failure bad content data type",
+                },
+            )
+            return
+        elif isinstance(content, (int, str)):
+            # Official admin page (scripts/bzadmin.js joinLobby) sends a bare id.
+            # The current official service rejects it, but we stay liberal on input.
+            requested_lid = content
+        else:
+            requested_lid = None
+
         if requested_lid is None:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_MISSING_ID, "reason": "Missing lobby id"})
+            if not isinstance(content, dict) or "id" not in content:
+                await self.send(
+                    session.ws,
+                    "OnFailure",
+                    {
+                        "type": "OnFailure",
+                        "time": utc_now_str(),
+                        "success": False,
+                        "reason": "DoJoinLobby failure bad content data type",
+                    },
+                )
+                return
+            await self.send(
+                session.ws,
+                "OnLobbyJoined",
+                {"success": False, "reasonCode": JOIN_FAIL_MISSING_ID, "reason": "Missing lobby id"},
+            )
             return
 
         try:
@@ -4148,15 +4211,23 @@ class BZRWebSocketServer:
 
         lobby = self.state.lobbies.get(lid)
         if not lobby:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_NOT_FOUND, "reason": "Lobby not found"})
+            # Official wording + confirmed reasonCode 4 (2026-08-24).
+            await self.send(
+                session.ws,
+                "OnLobbyJoined",
+                {
+                    "success": False,
+                    "reasonCode": JOIN_FAIL_NOT_FOUND,
+                    "reason": "Join Lobby Failed, Lobby no longer exists",
+                },
+            )
             return
 
         if lobby.is_locked:
             await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_LOCKED, "reason": "Lobby is locked"})
             return
 
-        supplied_password = str(content.get("password", ""))
-        if lobby.password and supplied_password != lobby.password:
+        if lobby.password and password != lobby.password:
             await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_BAD_PASSWORD, "reason": "Invalid password"})
             return
 
@@ -4175,13 +4246,21 @@ class BZRWebSocketServer:
             self.state.mark_dirty()
             self.state.record_stdout_entry("info", f"{session.user_id} joined lobby {lid}")
 
+            # Official join sequence observed live 2026-08-24 (for the joiner):
+            #   OnLobbyChanged(full snapshot incl. joiner)
+            #   -> OnLobbyMemberListChanged {member: <userId>, lobbyId, removed:false}
+            #   -> OnLobbyJoined {success:true, reasonCode:0}
+            #   -> OnLobbyChanged + OnLobbyDataChanged metadata sync pair.
+            # "member" carries the affected user's server-assigned ID upstream;
+            # memberName is our human-readable addition for community tooling.
+            await self.push_lobby_changed(lobby)
             await self.broadcast_all(
                 "OnLobbyMemberListChanged",
                 {
                     "lobbyId": lid,
                     "id": session.user_id,
-                    "member": session.name,
-                    "memberId": session.user_id,
+                    "member": session.user_id,
+                    "memberName": session.name,
                     "removed": False,
                     "user": self.state.build_user_snapshot(session),
                     "users": {session.user_id: self.state.build_user_snapshot(session)},
@@ -4195,6 +4274,10 @@ class BZRWebSocketServer:
             {
                 "success": True,
                 "reasonCode": REASON_OK,
+                # Upstream acks are FLAT (raw paired pcaps 2026-03-21 + live
+                # 2026-08-24). The nested lobby/lobbies snapshots below are a
+                # community superset; the stock dispatcher tolerates extras.
+                "reason": "",
                 "id": lid,
                 "lobbyId": lid,
                 "time": utc_now_str(),
@@ -4202,7 +4285,17 @@ class BZRWebSocketServer:
                 "lobbies": {str(lid): lobby_blob},
             },
         )
-        await self.push_lobby_changed(lobby)
+        if session.current_lobby_id == lid and lobby:
+            await self.push_lobby_changed(lobby)
+            await self.broadcast_all(
+                "OnLobbyDataChanged",
+                {
+                    "type": "OnLobbyDataChanged",
+                    "time": utc_now_str(),
+                    "success": True,
+                    "changedLobby": lid,
+                },
+            )
         await self.push_full_lobby_list()
 
     async def handle_update_wan(self, session: UserSession, content: Any) -> None:
@@ -4492,7 +4585,7 @@ class BZRWebSocketServer:
             return
 
         if msg_type == "DoJoinLobby":
-            await self.handle_join_lobby(session, content if isinstance(content, dict) else {})
+            await self.handle_join_lobby(session, content)
             return
 
         if msg_type == "DoExitLobby":
