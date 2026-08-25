@@ -3015,6 +3015,9 @@ class LobbyState:
     password: str = ""
     created_time: str = field(default_factory=utc_now_str)
     users: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Persistent lobbies (e.g. the seeded ~chat~pub~~default room) survive even
+    # when empty. The official service keeps such bridge-owned rooms forever.
+    persistent: bool = False
 
 
 class ServerState:
@@ -3195,7 +3198,7 @@ class ServerState:
                 # Users are not restored; sessions are runtime-only.
                 lobby = LobbyState(
                     lobby_id=lid,
-                    owner="",
+                    owner=str(raw_lobby.get("owner", "") or ""),
                     metadata=dict(raw_lobby.get("metadata", {})),
                     member_limit=int(raw_lobby.get("memberLimit", 20000)),
                     is_private=bool(raw_lobby.get("isPrivate", False)),
@@ -3203,6 +3206,7 @@ class ServerState:
                     password=str(raw_lobby.get("password", "")),
                     created_time=str(raw_lobby.get("createdTime", utc_now_str())),
                     users={},
+                    persistent=bool(raw_lobby.get("persistent", False)),
                 )
                 self.lobbies[lid] = lobby
 
@@ -3215,6 +3219,40 @@ class ServerState:
             )
         except Exception:
             self.log.exception("Failed to load state file: %s", self.state_file)
+
+    def ensure_default_lobby(self) -> None:
+        """Seed the persistent ~chat~pub~~default chat lobby.
+
+        Raw paired stock-client captures (2026-03-21) show every stock client
+        joins ~chat~pub~~default immediately after entering the lounge and
+        before creating/joining any game lobby; the official service keeps this
+        bridge-owned room in existence at all times. Mirror that so the stock
+        first-join flow works against this server.
+        """
+        for lobby in self.lobbies.values():
+            if str(lobby.metadata.get("name", "")).startswith("~chat~") and "default" in str(
+                lobby.metadata.get("name", "")
+            ).lower():
+                lobby.persistent = True
+                return
+        lid = self.allocate_lobby_id()
+        lobby = LobbyState(
+            lobby_id=lid,
+            owner="B1000001",
+            member_limit=20000,
+            metadata={
+                "name": "~chat~pub~~default",
+                "gameType": "1",
+                "gameSettings": "*",
+                "GameVersion": "2.2.301",
+                "userCount": "0",
+                "userPack": "!BRIDGE                         ",
+            },
+            persistent=True,
+        )
+        self.lobbies[lid] = lobby
+        self.mark_dirty()
+        self.log.info("Seeded persistent default chat lobby %d (~chat~pub~~default)", lid)
 
     def _state_payload(self) -> dict[str, Any]:
         persisted_lobbies = []
@@ -3229,6 +3267,7 @@ class ServerState:
                     "isLocked": lobby.is_locked,
                     "password": lobby.password,
                     "createdTime": lobby.created_time,
+                    "persistent": lobby.persistent,
                 }
             )
         return {
@@ -3958,7 +3997,7 @@ class BZRWebSocketServer:
             self.state.mark_dirty()
 
         if not lobby.users:
-            if self.retain_empty_lobbies:
+            if self.retain_empty_lobbies or lobby.persistent:
                 await self.push_lobby_changed(lobby)
             else:
                 del self.state.lobbies[lid]
@@ -5084,6 +5123,7 @@ async def run_server(args: argparse.Namespace) -> None:
         admin_ids=admin_ids,
     )
     state.load_state()
+    state.ensure_default_lobby()
 
     relay_protocol: BZRRelayProtocol | None = None
     if not args.disable_relay and args.relay_port > 0:
