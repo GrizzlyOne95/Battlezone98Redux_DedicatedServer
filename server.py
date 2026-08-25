@@ -109,18 +109,20 @@ DEFAULT_WHITELIST = {
 # reasonCode values returned on OnLobbyJoined / OnFailure. The client dispatcher
 # (0x006BF2A0) reads a numeric "reasonCode"; 0 == success.
 #
-# Live-confirmed against the official service (2026-08-24): joining a lobby that
-# "no longer exists" returns reasonCode=4 with
-# reason="Join Lobby Failed, Lobby no longer exists".
-# All other failure values remain provisional and are numbered to avoid the
-# confirmed slot; renumber again only with fresh official evidence.
+# Live-confirmed against the official service:
+#   2026-08-24  4 = "Join Lobby Failed, Lobby no longer exists"
+#   2026-08-25  5 = "Join Lobby Failed, Trying to join a lobby you're already in"
+#                   (checked BEFORE lock/full when a member rejoins)
+# Remaining values are provisional and numbered to avoid the confirmed slots;
+# renumber only with fresh official evidence.
 REASON_OK = 0
 JOIN_FAIL_MISSING_ID = 1
 JOIN_FAIL_INVALID_ID = 2
 JOIN_FAIL_BAD_PASSWORD = 3
 JOIN_FAIL_NOT_FOUND = 4
-JOIN_FAIL_LOCKED = 5
-JOIN_FAIL_FULL = 6
+JOIN_FAIL_ALREADY_IN = 5
+JOIN_FAIL_LOCKED = 6
+JOIN_FAIL_FULL = 7
 
 SUPPORTED_CLIENT_MESSAGES = [
     "Authorization",
@@ -3220,6 +3222,17 @@ class ServerState:
         except Exception:
             self.log.exception("Failed to load state file: %s", self.state_file)
 
+    DEFAULT_LOBBY_NAME = "~chat~pub~~default"
+
+    @classmethod
+    def _is_default_lobby(cls, lobby: LobbyState) -> bool:
+        """Exact, normalized identification of the canonical default room.
+
+        Substring matching would wrongly promote user-created rooms such as
+        '~chat~pub~~Default Maps Discussion' to undeletable persistent status.
+        """
+        return str(lobby.metadata.get("name", "")).strip().lower() == cls.DEFAULT_LOBBY_NAME
+
     def ensure_default_lobby(self) -> None:
         """Seed the persistent ~chat~pub~~default chat lobby.
 
@@ -3227,12 +3240,11 @@ class ServerState:
         joins ~chat~pub~~default immediately after entering the lounge and
         before creating/joining any game lobby; the official service keeps this
         bridge-owned room in existence at all times. Mirror that so the stock
-        first-join flow works against this server.
+        first-join flow works against this server. Only an EXACT canonical name
+        match qualifies (see _is_default_lobby).
         """
         for lobby in self.lobbies.values():
-            if str(lobby.metadata.get("name", "")).startswith("~chat~") and "default" in str(
-                lobby.metadata.get("name", "")
-            ).lower():
+            if self._is_default_lobby(lobby):
                 lobby.persistent = True
                 return
         lid = self.allocate_lobby_id()
@@ -3241,7 +3253,7 @@ class ServerState:
             owner="B1000001",
             member_limit=20000,
             metadata={
-                "name": "~chat~pub~~default",
+                "name": self.DEFAULT_LOBBY_NAME,
                 "gameType": "1",
                 "gameSettings": "*",
                 "GameVersion": "2.2.301",
@@ -4265,6 +4277,20 @@ class BZRWebSocketServer:
                     "success": False,
                     "reasonCode": JOIN_FAIL_NOT_FOUND,
                     "reason": "Join Lobby Failed, Lobby no longer exists",
+                },
+            )
+            return
+
+        # Live-confirmed upstream (2026-08-25): a member rejoining their current
+        # lobby gets a FAILURE with reasonCode 5, checked BEFORE lock/full.
+        if session.current_lobby_id == lid:
+            await self.send(
+                session.ws,
+                "OnLobbyJoined",
+                {
+                    "success": False,
+                    "reasonCode": JOIN_FAIL_ALREADY_IN,
+                    "reason": "Join Lobby Failed, Trying to join a lobby you're already in",
                 },
             )
             return
