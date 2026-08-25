@@ -207,7 +207,25 @@ Verified against the community server by the compat suite and soak:
 6. Whether joining without prior `SetPlayerData` identity is what caused the observed "no longer exists" rejection for a freshly-authorized web user, or whether that lobby/state was special (single observation; flagged MEDIUM confidence in fixtures).
 7. Steam-vs-GOG client deltas beyond auth material.
 
-Resolved since the first draft of this report: reasonCode 5 semantics (confirmed), upstream password non-enforcement via the CreateGame/SetLobbyData path (observed), owner `DoKickUser` silently no-ops upstream across scalar/`{'id'}`/`{'player'}` content shapes (kicked client receives no event; likely gated on admin/BB status — our functional owner-kick is a documented moderation superset), and `DoExitLounge` silence.
+Resolved since the first draft of this report: reasonCode 5 semantics (confirmed), upstream password non-enforcement via the CreateGame/SetLobbyData path (observed twice), owner `DoKickUser` silently no-ops upstream across scalar/`{'id'}`/`{'player'}` content shapes (kicked client receives no event; likely gated on admin/BB status — our functional owner-kick is a documented moderation superset), `DoExitLounge` and `DeleteLobbyData`(unknown key) silence.
+
+Protocol-edge behaviors confirmed 2026-08-25 (round 3):
+
+| Input | Upstream behavior |
+|---|---|
+| Malformed JSON | `OnFailure` `"Invalid Message Data : <raw>"`, connection stays usable — mirrored by the community server now |
+| Verb before Authorization | silently ignored, socket stays open |
+| Binary WS frame | silently ignored |
+| Unknown verb | silently ignored |
+| Second `Authorization` on one socket | silently ignored (first identity sticks) |
+| `Authorization` without `authtype` | socket closed, code **4002**, no message |
+| `authtype:"steam"` without ticket | `OnAuthorization success:false` then close **4002** — Steam ticket validation EXISTS upstream |
+| `authtype:"gog"` without ticket | ACCEPTED (`success:true`) but the placeholder id is echoed back unassigned |
+| Wrong admin key | accepted as normal user (admin surface simply not enabled) |
+
+Notable upstream quirk: `OnChatMessage` carries no `author` field (re-confirmed live), so Rebellion's own admin page renders an undefined chat author. The community server includes `author` as a deliberate display fix.
+
+Community divergences retained deliberately: permissive auth (no ticket validation, no 4002 closes) for failover resilience; re-auth allowed (tools rely on it); pre-auth verbs answered with an error instead of silence; chat includes `author`; functional owner-kick.
 
 ## 15. Bugs discovered
 

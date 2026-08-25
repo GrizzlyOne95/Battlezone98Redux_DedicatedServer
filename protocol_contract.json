@@ -16,7 +16,10 @@
       "Binary WS frames are rejected upstream ('Binary Payload not supported'); everything is text JSON (stock-binary).",
       "OnAuthorization must be the first inbound message or stock aborts ('OnAuthorization must be first message') (stock-binary).",
       "Official payloads ride under 'data'; GameWatcher also accepts 'content' because the service has emitted both historically (gamewatcher BZ98ChatObserver.cs).",
-      "Official time format inside data: 'YYYY-MM-DD HH:MM:SS' UTC; lobby createdTime is ISO-8601 with ms and Z."
+      "Official time format inside data: 'YYYY-MM-DD HH:MM:SS' UTC; lobby createdTime is ISO-8601 with ms and Z.",
+      "Malformed JSON upstream (2026-08-25): OnFailure with reason 'Invalid Message Data : <raw payload>'; connection stays usable. Community server mirrors this wording (capped echo).",
+      "Pre-auth verbs, binary frames, unknown verbs, and a SECOND Authorization are all silently ignored upstream (2026-08-25); re-auth does not rebind identity.",
+      "Authorization edge behavior upstream: missing authtype closes the socket (4002) with no message; authtype=steam without a ticket yields OnAuthorization success:false then close 4002 - Steam ticket validation EXISTS; authtype=gog without a ticket is ACCEPTED with success:true but the client-supplied placeholder id is echoed back unassigned."
     ]
   },
   "udp_1338": {
@@ -512,7 +515,8 @@
       },
       "stock_binary": "dispatcher reads text/speakerId/lobbyId/isChat",
       "stock_live_capture": "{type,time,success,text,lobbyId,speakerId}; 'author' absent in stock-captured chat; text may be engine protocol strings like '~AT~S<sid>~2~2'",
-      "official_web_js": "reads author/text/color/time",
+      "official_web_js": "reads author/text/color/time - yet upstream never sends author, so the official admin page renders an undefined chat author (upstream quirk); community server includes author as a display fix",
+      "official_live_2026_08_25": "keys {type,time,success,text,lobbyId,speakerId}; author absent again",
       "lobby_monitor": "author||speakerId fallback",
       "gamewatcher": "speakerId/author/text/time",
       "dedicated_server": "{author,speakerId,text,lobbyId,time[,system,private]}",
@@ -606,6 +610,7 @@
         "key": "string"
       },
       "stock_binary": "builder 0x006C6040",
+      "official_live": "unknown/nonexistent key silently ignored",
       "dedicated_server": "removes metadata key; broadcasts deleted=true",
       "flags": {
         "stock": true,

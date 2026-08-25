@@ -4602,7 +4602,19 @@ class BZRWebSocketServer:
         try:
             envelope = json.loads(raw_message)
         except json.JSONDecodeError:
-            await self.send_error(ws, "Invalid JSON")
+            # Live-verified upstream (2026-08-25): malformed JSON yields
+            # OnFailure 'Invalid Message Data : <raw>' and the connection
+            # stays usable. Mirror the wording; cap echoed length for safety.
+            await self.send(
+                ws,
+                "OnFailure",
+                {
+                    "type": "OnFailure",
+                    "time": utc_now_str(),
+                    "success": False,
+                    "reason": f"Invalid Message Data : {raw_message[:1000]}",
+                },
+            )
             return
 
         if not isinstance(envelope, dict):
