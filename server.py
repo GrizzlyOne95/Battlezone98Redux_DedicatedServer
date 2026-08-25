@@ -4904,8 +4904,9 @@ class BZRWebSocketServer:
             return
 
         if msg_type == "DoExitLounge":
+            # Upstream parity (2026-08-25 evidence): the lounge exit is a
+            # SILENT state transition - no response frame is sent.
             session.in_lounge = False
-            await self.send(ws, "OnDoExitLounge", {"success": True, "time": utc_now_str()})
             return
 
         if msg_type == "DoSendChat":
@@ -4936,13 +4937,17 @@ class BZRWebSocketServer:
                 key = str(content.get("key", "")).strip()
                 if key:
                     lobby = self.state.lobbies[lid]
-                    lobby.metadata.pop(key, None)
-                    self.state.mark_dirty()
-                    await self.broadcast_all(
-                        "OnLobbyDataChanged",
-                        self._build_lobby_data_payload(lobby, key=key, deleted=True),
-                    )
-                    await self.push_lobby_changed(lobby)
+                    # Upstream parity (2026-08-25 evidence): deleting a
+                    # key that does not exist is silently ignored - no
+                    # state mutation, no dirty flag, no broadcast.
+                    if key in lobby.metadata:
+                        lobby.metadata.pop(key, None)
+                        self.state.mark_dirty()
+                        await self.broadcast_all(
+                            "OnLobbyDataChanged",
+                            self._build_lobby_data_payload(lobby, key=key, deleted=True),
+                        )
+                        await self.push_lobby_changed(lobby)
             return
 
         if msg_type == "LockLobby":
@@ -5159,8 +5164,11 @@ class BZRWebSocketServer:
             )
             return
 
-        # Keep unknown messages non-fatal for compatibility.
-        await self.send_stdout(ws, "info", f"Unhandled message type: {msg_type}")
+        # Upstream parity (2026-08-25 evidence): unknown verbs are silently
+        # ignored. Keep them non-fatal and server-side only - the previous
+        # OnStdoutLogEntry reply was a client-visible protocol message the
+        # real server never emits.
+        self.log.info("Unhandled message type: %s", msg_type)
 
     async def unregister(self, ws: Any) -> None:
         session = self.state.sessions_by_ws.pop(ws, None)

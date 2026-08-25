@@ -213,7 +213,7 @@ Protocol-edge behaviors confirmed 2026-08-25 (round 3):
 
 | Input | Upstream behavior |
 |---|---|
-| Malformed JSON | `OnFailure` `"Invalid Message Data : <raw>"`, connection stays usable — mirrored by the community server now |
+| Malformed JSON | `OnFailure` `"Invalid Message Data : <raw>"`, connection stays usable - mirrored by the community server now (**intentional safety divergence**: echoed `<raw>` is capped at ~1000 characters, so longer payloads are NOT byte-for-byte identical to upstream) |
 | Verb before Authorization | silently ignored, socket stays open |
 | Binary WS frame | silently ignored |
 | Unknown verb | silently ignored |
