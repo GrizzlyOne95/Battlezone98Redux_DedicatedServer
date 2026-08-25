@@ -3396,6 +3396,184 @@ class RelayRoute:
     last_activity_monotonic: float = field(default_factory=time.monotonic)
 
 
+def _is_reliable_nonfinal_fragment(data: bytes) -> bool:
+    """True when a datagram is a reliable BZRNet fragment that is not the final one.
+
+    PROVEN-native flag semantics (BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md §4.1):
+    bit 0x80 marks reliable traffic; bit 0x40 is added only on the final
+    fragment (or on single-packet unreliable sends).  A bare 0x80 therefore
+    identifies a middle reliable fragment.  This predicate is the ONLY packet
+    interpretation performed by fault injection.
+    """
+    return (
+        len(data) >= BZR_TRANSPORT_HEADER_BYTES
+        and bool(data[0] & 0x80)
+        and not bool(data[0] & 0x40)
+    )
+
+
+class RelayFaultInjector:
+    """Opt-in Phase-2 impairment hook for the UDP relay (default OFF).
+
+    Contract: BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md §4.  The single
+    supported mode drops the k-th bare-0x80 (reliable, non-final) datagram per
+    directed peer stream.  It never rewrites, reorders, reassembles, or
+    retransmits anything; when inactive it is not consulted at all so the hot
+    path stays byte-transparent.
+    """
+
+    MODES = ("drop_reliable_midfrag",)
+
+    def __init__(self, spec: str) -> None:
+        spec = (spec or "").strip()
+        if not spec:
+            raise ValueError("empty fault-injection spec")
+        mode_part, _, param_part = spec.partition(":")
+        mode = mode_part.strip()
+        if mode not in self.MODES:
+            raise ValueError(f"unsupported fault-injection mode {mode!r}; known: {self.MODES}")
+        params: dict[str, str] = {}
+        for chunk in param_part.split(","):
+            if not chunk:
+                continue
+            key, sep, value = chunk.partition("=")
+            if not sep:
+                raise ValueError(f"fault-injection parameter {chunk!r} must be key=value")
+            params[key.strip()] = value.strip()
+        if "k" not in params:
+            raise ValueError("fault-injection requires k=<ordinal>")
+        k = int(params["k"])
+        if k <= 0:
+            raise ValueError("fault-injection k must be >= 1")
+        self.mode = mode
+        self.k = k
+        self.observed_count = 0
+        self.forwarded_count = 0
+        self.dropped_count = 0
+        self._stream_match_ordinals: dict[tuple[str, int, str, int], int] = {}
+        self.last_dropped: dict[str, Any] | None = None
+
+    @property
+    def active(self) -> bool:
+        return True
+
+    def decide_drop(self, data: bytes, stream_key: tuple[str, int, str, int]) -> bool:
+        """Return True exactly once per stream, on the k-th matching fragment.
+
+        Sole accounting point: every offered datagram increments ``observed``;
+        passing datagrams increment ``forwarded``, a selected one ``dropped``.
+        """
+        self.observed_count += 1
+        if not _is_reliable_nonfinal_fragment(data):
+            self.forwarded_count += 1
+            return False
+        ordinal = self._stream_match_ordinals.get(stream_key, 0) + 1
+        self._stream_match_ordinals[stream_key] = ordinal
+        if ordinal == self.k:
+            self.dropped_count += 1
+            self.last_dropped = {
+                "streamKey": stream_key,
+                "matchOrdinal": ordinal,
+                "seqA": int.from_bytes(data[10:14], "big"),
+                "seqB": int.from_bytes(data[14:18], "big"),
+                "payloadBytes": max(0, len(data) - BZR_TRANSPORT_HEADER_BYTES),
+            }
+            return True
+        self.forwarded_count += 1
+        return False
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "k": self.k,
+            "active": True,
+            "observed": self.observed_count,
+            "forwarded": self.forwarded_count,
+            "dropped": self.dropped_count,
+            "lastDropped": self.last_dropped,
+        }
+
+
+class RelayTraceWriter:
+    """Forensic JSONL trace of relayed datagrams (opt-in; local-only output).
+
+    One line per routed datagram with transport-envelope fields only.  Payload
+    bytes are deliberately never written: decoding beyond the header is not
+    needed for later comparison (work order §4 forensic minimum).  Traces may
+    contain real endpoints; they live beside runtime state and must never be
+    committed raw.
+    """
+
+    FORMAT_NAME = "bzr-relay-trace"
+    FORMAT_VERSION = 1
+
+    def __init__(self, path: str, run_id: str) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.lines_written = 0
+        self._fh = open(path, "a", encoding="utf-8", newline="\n")
+        self._write_line(
+            {
+                "format": self.FORMAT_NAME,
+                "version": self.FORMAT_VERSION,
+                "runId": run_id,
+            }
+        )
+
+    def _write_line(self, record: dict[str, Any]) -> None:
+        self._fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._fh.flush()
+        self.lines_written += 1
+
+    def log(
+        self,
+        *,
+        direction: str,
+        source: tuple[str, int],
+        target: tuple[str, int],
+        data: bytes,
+        disposition: str,
+        match_ordinal: int | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "runId": self.run_id,
+            "tsMonotonic": round(time.monotonic(), 6),
+            "tsUnixMs": int(time.time() * 1000),
+            "direction": direction,
+            "source": f"{source[0]}:{source[1]}",
+            "target": f"{target[0]}:{target[1]}",
+            "disposition": disposition,
+        }
+        header_hex = data[:18].hex() if len(data) >= 18 else ""
+        record["transport"] = {
+            "flagsByte": f"0x{data[0]:02x}" if data else None,
+            "kindNibble": (data[1] & 0x0F) if len(data) >= 2 else None,
+            "headerTimestampUnixMs": int.from_bytes(data[2:10], "big") if len(data) >= 10 else None,
+            "seqA": int.from_bytes(data[10:14], "big") if len(data) >= 14 else None,
+            "seqB": int.from_bytes(data[14:18], "big") if len(data) >= 18 else None,
+            "headerBytes": len(header_hex) // 2,
+            "payloadBytes": max(0, len(data) - BZR_TRANSPORT_HEADER_BYTES),
+            "wireBytes": len(data),
+        }
+        if match_ordinal is not None:
+            record["matchOrdinal"] = match_ordinal
+        self._write_line(record)
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "path": self.path,
+            "linesWritten": self.lines_written,
+            "runId": self.run_id,
+        }
+
+    def close(self) -> None:
+        try:
+            self._fh.flush()
+        finally:
+            self._fh.close()
+
+
 class BZRRelayProtocol(asyncio.DatagramProtocol):
     """Transparent datagram relay for WS-associated peer pairs.
 
@@ -3412,6 +3590,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         state: ServerState,
         *,
         route_ttl_seconds: int = DEFAULT_RELAY_ROUTE_TTL_SECONDS,
+        fault_injector: RelayFaultInjector | None = None,
+        trace_writer: RelayTraceWriter | None = None,
     ) -> None:
         self.logger = logger
         self.state = state
@@ -3426,6 +3606,10 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         self.ambiguous_drop_count = 0
         self.unmapped_drop_count = 0
         self.expired_route_count = 0
+        # Phase-2 instrumentation. Both default to None: when absent the hot
+        # path below is unchanged byte-transparent forwarding.
+        self.fault_injector = fault_injector
+        self.trace_writer = trace_writer
 
     @property
     def enabled(self) -> bool:
@@ -3461,6 +3645,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             "routeTtlSeconds": self.route_ttl_seconds,
             "associationMode": "ws-route-endpoint-pair",
             "officialAssociationParity": False,
+            "faultInjector": self.fault_injector.metrics() if self.fault_injector else {"mode": "", "active": False},
+            "trace": self.trace_writer.metrics() if self.trace_writer else {"enabled": False},
         }
 
     def _expire_routes(self) -> None:
@@ -3623,6 +3809,46 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
 
         # Preserve the complete datagram and packet boundary exactly. The relay
         # never rewrites sequence numbers or interprets the payload after byte 18.
+        #
+        # Phase-2 instrumentation hook (work order §4): optional forensic trace
+        # plus an optional single-shot reliable-midfragment drop. Both are OFF
+        # unless explicitly enabled; with both off this path is identical to
+        # previous behavior. The injector performs no interpretation beyond the
+        # bare-0x80 predicate and never rewrites or reorders anything; the
+        # sendto below always transmits `data` unmodified.
+        instrumented = self.fault_injector is not None or self.trace_writer is not None
+        if instrumented:
+            stream_key = (addr[0], addr[1], target[0], target[1])
+            direction = f"{addr[0]}:{addr[1]}->{target[0]}:{target[1]}"
+            match_ordinal: int | None = None
+            drop_for_faultinject = False
+            if self.fault_injector is not None:
+                drop_for_faultinject = self.fault_injector.decide_drop(data, stream_key)
+                match_ordinal = self.fault_injector._stream_match_ordinals.get(stream_key)
+            disposition = "dropped_faultinject" if drop_for_faultinject else "forwarded"
+            if self.trace_writer is not None:
+                self.trace_writer.log(
+                    direction=direction,
+                    source=addr,
+                    target=target,
+                    data=data,
+                    disposition=disposition,
+                    match_ordinal=match_ordinal,
+                )
+            if drop_for_faultinject:
+                assert self.fault_injector is not None
+                info = self.fault_injector.last_dropped or {}
+                self.drop_count += 1
+                self.logger.warning(
+                    "FAULT-INJECT dropped reliable midfragment stream=%s ordinal=%s seqA=%s seqB=%s payload=%s",
+                    stream_key,
+                    info.get("matchOrdinal"),
+                    info.get("seqA"),
+                    info.get("seqB"),
+                    info.get("payloadBytes"),
+                )
+                return
+
         self.transport.sendto(data, target)
         self.tx_count += 1
         if sampled:
@@ -5165,10 +5391,23 @@ async def run_server(args: argparse.Namespace) -> None:
 
     relay_protocol: BZRRelayProtocol | None = None
     if not args.disable_relay and args.relay_port > 0:
+        fault_injector: RelayFaultInjector | None = None
+        trace_writer: RelayTraceWriter | None = None
+        if args.fault_inject:
+            fault_injector = RelayFaultInjector(args.fault_inject)
+            logger.warning(
+                "FAULT-INJECTION ENABLED (%s) -- diagnostics only; never run in normal service",
+                args.fault_inject,
+            )
+        if args.relay_trace:
+            trace_writer = RelayTraceWriter(args.relay_trace, run_id=uuid.uuid4().hex[:12])
+            logger.info("Relay forensic trace writing to %s", args.relay_trace)
         relay_protocol = BZRRelayProtocol(
             logger.getChild("relay"),
             state,
             route_ttl_seconds=args.relay_route_ttl_seconds,
+            fault_injector=fault_injector,
+            trace_writer=trace_writer,
         )
         state.relay_requested = True
     else:
@@ -5276,6 +5515,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP relay port, 0 to disable (default: {DEFAULT_RELAY_PORT})")
     parser.add_argument("--relay-route-ttl-seconds", type=int, default=DEFAULT_RELAY_ROUTE_TTL_SECONDS, help="Inactive relay route expiration interval")
     parser.add_argument("--disable-relay", action="store_true", help="Disable the community UDP relay transport")
+    parser.add_argument(
+        "--fault-inject",
+        default=os.getenv("BZRNET_FAULT_INJECT", ""),
+        help=(
+            "Phase-2 relay impairment, DEFAULT OFF. Format: drop_reliable_midfrag:k=N "
+            "(drops the Nth bare-0x80 reliable non-final fragment per directed peer stream). "
+            "Instrumentation only; never enable in normal service."
+        ),
+    )
+    parser.add_argument(
+        "--relay-trace",
+        default=os.getenv("BZRNET_RELAY_TRACE", ""),
+        help="Optional JSONL forensic trace of routed relay datagrams (transport envelope fields only; local-only output)",
+    )
     parser.add_argument("--health-host", default=DEFAULT_HEALTH_HOST, help=f"Health HTTP bind host (default: {DEFAULT_HEALTH_HOST})")
     parser.add_argument("--health-port", type=int, default=DEFAULT_HEALTH_PORT, help=f"Health HTTP bind port, 0 to disable (default: {DEFAULT_HEALTH_PORT})")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"Path to persistent state JSON (default: {DEFAULT_STATE_FILE})")
