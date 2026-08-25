@@ -3973,7 +3973,14 @@ class BZRWebSocketServer:
 
     async def handle_authorization(self, ws: Any, content: dict[str, Any]) -> None:
         requested_id = str(content.get("id", "")).strip()
-        user_id = requested_id or f"U{uuid.uuid4().hex[:12]}"
+        # Official behavior (live 2026-08-24): web clients send id "0" and the
+        # service ASSIGNS a unique identity (B100xxxx), ignoring the request.
+        # Honor explicit non-placeholder ids from community tooling, but treat
+        # "0"/empty as "assign me an id" so multiple such clients never collide.
+        if requested_id in {"", "0"}:
+            user_id = f"U{uuid.uuid4().hex[:12]}"
+        else:
+            user_id = requested_id
         name = str(content.get("name") or content.get("playerName") or user_id)
 
         if user_id in self.state.sessions_by_user_id:
