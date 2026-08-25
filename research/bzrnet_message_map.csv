@@ -1,0 +1,51 @@
+opcode,name,plane,direction,min_length,max_length,reliable,native_send,native_receive,session_states,confidence,notes
+Authorization,BZR_AUTH,ws_tcp1337,C->S,n/a,n/a,text-json,FUN_VA_0x6c6e60_shared_builder,BZRNetInterface dispatcher VA_0x6bf2a0,pre-auth,CONFIRMED,"{type,content} envelope; authtype steam/gog/web; apiVer 3.6; clientVersion 2.2.301"
+OnAuthorization,BZR_AUTH_ACK,ws_tcp1337,S->C,,,n/a,,VA_0x6bf2a0 dispatch,pre-auth,CONFIRMED,must be first inbound or client aborts
+DoEnterLounge,BZR_ENTER_LOUNGE,ws_tcp1337,C->S,n/a,n/a,text-json,VA_0x6c6320,VA_0x6bf2a0,lounge,CONFIRMED,sends boolean true
+CreateGame,BZR_CREATE_GAME,ws_tcp1337,C->S,n/a,n/a,text-json,VA_0x6c4350,VA_0x6bf2a0,lounge,CONFIRMED,"{memberLimit,isPrivate,password}; friendly name arrives via SetLobbyData"
+DoJoinLobby,BZR_JOIN_LOBBY,ws_tcp1337,C->S,n/a,n/a,text-json,VA_0x6c46b0,VA_0x6bf2a0,lounge,CONFIRMED,"exactly {id:number,password:string}"
+OnLobbyJoined,BZR_JOIN_LOBBY_ACK,ws_tcp1337,S->C,,,n/a,,VA_0x6bf2a0,lobby,CONFIRMED,"flat ack; reasonCode 0/4/5 confirmed live; 1,2,3,6,7 provisional"
+DoP2PConnect,BZR_P2P_CONNECT_SIG,ws_tcp1337,C->S,n/a,n/a,text-json,VA_0x6c59c0,VA_0x6bf2a0,game-lobby,CONFIRMED,"{player,reset}"
+OnLobbyMemberP2PConnect,BZR_P2P_CONNECT_SIG_ACK,ws_tcp1337,S->C,,,n/a,,VA_0x6bf2a0,game-lobby,CONFIRMED,"{member,lobbyId,connect,reset}; signaling and first peer UDP race"
+DoP2PRoute,BZR_P2P_ROUTE_REQ,ws_tcp1337,C->S,n/a,n/a,text-json,VA_0x6c5d20,VA_0x6bf2a0,p2p-fallback,CONFIRMED,{player}; forced-relay path (/iprelay route state 5)
+OnP2PRoute,BZR_P2P_ROUTE_ACK,ws_tcp1337,S->C,,,n/a,,VA_0x6bf2a0,p2p-fallback,CONFIRMED,"{player,port:1339,success}; no allocation token; endpoint-based relay association"
+DISCOVERY_PROBE,UDP1338_PROBE,udp1338,C->S,18,18,unreliable,FUN_VA_0x6c6e60_path,FUN_VA_0x6c83f0_listener,always,PROVEN-native+capture,flags 0x40 kind 2; cadence ~10s then ~30s; continues during match
+DISCOVERY_REPLY,UDP1338_REPLY,udp1338,S->C,7,37,unreliable,,VA_0x6c6e60 handler,always,PROVEN-native+capture,echo||len(4|16)||observed IPv4||port BE u16; v4 total 25 B; unconditional incl empty input
+HDR_FLAGS,BZRNET_TRANSPORT_FLAGS,transport,both,1,1,,,,any,PROVEN-native,bit7 0x80=reliable; bit6 0x40=final-fragment/single; writer FUN_0075beb0 sets 0x80 per fragment + 0x40 on last only
+HDR_KIND,BZRNET_TRANSPORT_KIND,transport,both,1,1,,,,any,PROVEN-native,byte1 low nibble parsed (&0xF); observed 2=discovery 3/4/5=identity/handshake family
+HDR_TIMESTAMP,BZRNET_TRANSPORT_TS,transport,both,8,8,,,,any,PROVEN-native,bytes2..9 u64 BE unix-ms; writer FUN_00760670; receiver validates +/-60000ms skew on discovery path
+HDR_SEQ_A,BZRNET_TRANSPORT_SEQ_A,transport,S->R,4,4,reliable-stream,,parse at +10 in FUN_006c6e60,in-match,PROVEN-native,u32 BE from conn+0x88; incremented per reliable fragment sent
+HDR_SEQ_B,BZRNET_TRANSPORT_SEQ_B,transport,S->R,4,4,,,,any,CORRELATED,u32 BE from conn+0x84 at bytes14..17; believed ack/secondary counter; PR#1 instrumentation saw variation only in low16
+IDENTITY_HELLO,P2P_IDENTITY,udp-peer,both,36,36,unreliable,,dispatcher family kinds 3/4/5,p2p-connect,PROVEN-capture,kinds 0x4003/0x4004/0x4005 carrying ASCII SteamID+NUL; exchanged in lobby before launch
+PP,GAME_PING,game-payload,both,22,22,unreliable,NetPlayer::SendPing VA_0x576480,dispatcher VA_0x570500 case u16le 0x5050,in-match NetState==4,PROVEN-native,PING_PACKET: master_send_time/offset/host_start_time/delay/BAddOffset (LE); logs PING SENT / PING RECEIVED
+GA,GAME_PING_ARRAY,game-payload,both,26,,unreliable,NetPlayer::SendOutPings,dispatcher case 0x4147 (wire GA),in-match,PROVEN-native,batched ping entries 6 words per player
+PR,GAME_PING_REPLY,game-payload,R->S,14,14,reliable?,FUN_007596b0 len14,dispatcher case 0x5250 -> HandlePingReply VA_0x571e20,in-match,PROVEN-native,PINGREPLY_PACKET master/slave u32 pair (+extra word observed in captures)
+PC,GAME_CHAT_PUBLIC,game-payload,both,4,,reliable?,CSteamLobby::SendChat path,dispatcher case 0x4350 -> VA_0x624550,in-match,PROVEN-native,<name(<=32)> message text
+pS,GAME_CHAT_WHISPER,game-payload,C<->H,4,,unknown,,dispatcher case 0x5370,in-match,PROVEN-native,'<From: name> msg' format
+MK,GAME_KILL,game-payload,H->C,6,,reliable?,Net::SendKill VA_0x4d6050,dispatcher case 0x4b4d -> VA_0x626130,in-match,PROVEN-native,killer/victim/team/weapon byte fields
+PS,GAME_SPAWN_POINT,game-payload,H->C,20,20,reliable?,NetPlayer::SendSpawnPoint VA_0x576390,dispatcher case 0x5350 -> VA_0x571c70,loading->in-match,PROVEN-native,SPAWNPOINT_PACKET xyz floats + bTeamNumber; RECEIPT TRANSITIONS NetState 3->4
+SS,GAME_SYNC_STEP,game-payload,both,3,3,unreliable,NetPlayer::SendOutSyncs,dispatcher case 0x5353 -> VA_0x577360,launch sync/in-match,PROVEN-native,subcode byte checked against current step value
+KA,GAME_ACTIVITY_ACK,game-payload,both,2,2,unreliable,,dispatcher case 0x414b -> VA_0x5773f0,in-match,PROVEN-native,stamps per-player last-seen time (keepalive role; confirms prior medium-confidence heuristic)
+PB,GAME_BANDWIDTH,game-payload,both,10,10,unreliable,Net::AdjustBandwidth VA_0x5732d0 path,dispatcher case 0x4250,in-match,PROVEN-native,BANDWIDTH_PACKET: dwBandwidth u32 + interval4ms u8
+AC,GAME_CHEAT_CHECK,game-payload,both,6,6,unknown,,dispatcher case 0x4341,in-match,PROVEN-native,integrity probe; mismatch logs MAY BE CHEATING
+AK,GAME_DIALOG_OPEN_A,game-payload,H->C,2,2,unknown,,dispatcher case 0x4b41 -> one-shot dialog VA_0x5d4690(0xb),in-match,PROVEN-native,opens in-game escape/dialog UI; one-shot guard DAT_00917f4c
+KK,GAME_DIALOG_OPEN_B,game-payload,H->C,2,2,unknown,,dispatcher case 0x4b4b -> same dialog path,in-match,PROVEN-native,same as AK
+GS,GAME_DIALOG_OPEN_C,game-payload,H->C,2,2,unknown,,dispatcher case 0x5347 -> same dialog path,in-match,PROVEN-native,same as AK/KK
+RO,GAME_OBJECT_REMOVE,game-payload,H->C,2,,unknown,,dispatcher case 0x4f52 -> VA_00584620,in-match,CORRELATED,object event family; host-gated
+PO,GAME_OBJECT_POSITION,game-payload,both,2,,unreliable?,position sender path,dispatcher case 0x4f50 -> VA_004b7710,in-match,CORRELATED+native,object position/control stream; matches captured PO marker near object_counter traffic
+GM,GAME_STATE_DELTA,game-payload,both,2,,unknown,,dispatcher case 0x4d47 -> VA_004b7780,in-match,CORRELATED,
+XO,GAME_OBJ_CREATE_A,game-payload,H->C,2,,reliable?,descriptor builder,dispatcher case 0x6f78 -> VA_00584c40,in-match,CORRELATED,matches captured 7a75 descriptor roster semantics
+IO,GAME_OBJ_CREATE_B,game-payload,H->C,2,,reliable?,descriptor builder,dispatcher case 0x6f69 -> VA_00584c40 alt-arg,in-match,CORRELATED,second create family
+XX,GAME_OBJ_EVENT_XX,game-payload,both,2,,unknown,,dispatcher case 0x7878 -> VA_00584bb0,in-match,CORRELATED,
+PK,GAME_OBJECT_PREP,game-payload,both,2,,unknown,,dispatcher case 0x4b50 -> VA_00625f90,in-match,UNKNOWN,
+NS,GAME_NEW_SYNC,game-payload,C->H,2,,unknown,,dispatcher case 0x736e -> VA_00573ae0,in-match,UNKNOWN,
+LA,GAME_PAIR_A,game-payload,H->C,8,,unknown,,dispatcher case 0x616c -> VA_005e0bc0+VA_005e12b0,in-match,INFERRED,two bounded i32 values (<16)
+LU,GAME_PAIR_B,game-payload,H->C,8,,unknown,,dispatcher case 0x756c -> VA_005e0bc0+VA_005e12e0,in-match,INFERRED,two bounded i32 values (<16)
+AS,GAME_HOST_AUTOKICKED,game-payload,H->C,4,,unknown,,dispatcher case 0x534a (len>3),in-match,PROVEN-native,target mini-id word; logs multi_message host_autokicked
+KS,GAME_HOST_KICKED,game-payload,H->C,4,,unknown,,dispatcher case 0x534b (len>3),in-match,PROVEN-native,target mini-id word; logs multi_message host_kicked
+LS,GAME_LOBBY_LOCKED,game-payload,H->C,2,2,unknown,,dispatcher case 0x534c,in-match,PROVEN-native,logs locked notice
+US,GAME_LOBBY_UNLOCKED,game-payload,H->C,2,2,unknown,,dispatcher case 0x5355,in-match,PROVEN-native,logs unlocked notice
+STATE_0x5F,GAME_STATE_BLOCK,game-payload,both,8,,mixed,TempStateSendAll VA_0x4b9da0 path,dispatcher '_' branch -> aux VA_00584620 + stream VA_004b7750,in-match,PROVEN-native,first byte 0x5F; byte1 aux size; bandwidth-governed broadcast (Bps/nppst log fields)
+RG,GAME_RESET,game-payload,H->C,2,,unknown,,dispatcher case 0x4752 -> VA_005aa2b0,in-match,INFERRED,
+PT,GAME_TEAM_SCORE,game-payload,H->C,6,6,unknown,,dispatcher case 0x5450 -> VA_004f6ae0,in-match,INFERRED,u32 arg with 0x78/0x3c limit constants
+RELAY_FORWARD,UDP1339_RELAY,udp1339,both,18+,2048,transparent,community relay opaque,official envelope UNKNOWN,p2p-fallback,UNKNOWN,allocation envelope keepalive timeout unrecovered; OnP2PRoute signaling fully mapped
