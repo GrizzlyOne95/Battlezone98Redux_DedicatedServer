@@ -47,17 +47,32 @@ Cell verdicts: PASS / PASS-with-notes / FAIL(+exact missing semantic). A FAIL th
 
 ## 4. Controlled impairment (highest-value experiment)
 
-**Goal:** determine what a stock client actually does when one middle reliable fragment disappears — distinguishing "opaque forwarding is sufficient" from "server eventually needs retransmission/reset boundary awareness".
+**Execution order (normative):**
 
-**Injection point:** force the relayed path so match traffic traverses our UDP 1339 endpoint-pair relay (both clients run `/iprelay` against the community server). Add to the relay an **opt-in test-mode drop rule**, default OFF, diagnostics-only:
+1. **Implement relay instrumentation only.** Default-off flag, exact match predicate, counters/logging, correlation IDs. **No protocol interpretation** may be added while implementing it.
+2. **Prove transparent forced-relay operation first.** Stock↔stock through :1339 must behave identically to the corresponding direct baseline *before* fault injection is ever enabled.
+3. **Execute the matrix exactly as frozen.** This document is the test contract; surprising observations do not alter expected behavior.
+4. **Every FAIL stops at a named §5 handler** (archaeology report). No generalized "interop failed" verdicts; no archaeology gate opened on symptoms alone.
+5. **Impairment only where the matrix requires it**, and **every impairment cell has an immediately preceding forced-relay, impairment-OFF control run** — otherwise a relay bug could masquerade as evidence that bare-`0x80` fragments are semantically important.
+6. After the matrix, obey §5 frozen priorities.
 
-- env/flag e.g. `BZRNET_FAULT_INJECT=drop_reliable_midfrag:k=N`
-- drops the Nth datagram whose decoded header matches `flags & 0x80 && !(flags & 0x40)` (a bare-`0x80` reliable fragment, i.e., NOT final);
-- logs every drop (timestamp, seq_a/seq_b, direction, peer pair).
+**Relay shall not help (non-goals, normative):** no resequencing, reassembly, retransmission, timeout compensation, normalization, duplicate suppression, or fragment awareness of any kind beyond the literal fault-selection predicate below. In normal mode the relay must remain as close to a byte-transparent datagram forwarder as possible, so any success is attributable to stock client behavior rather than an accidentally built compatibility layer.
 
-This is test instrumentation, not protocol behavior change; it must ship behind the default-off flag and never activate in normal service. If the relay path proves impractical for a cell, fallback injector: OS-level UDP impairment (clumsy / Network Emulator) filtered by first-byte pattern `0x80…`.
+**Injection point:** force the relayed path so match traffic traverses our UDP 1339 endpoint-pair relay (both clients run `/iprelay` against the community server). Relay instrumentation:
 
-**Expected outcomes and decision rule:**
+- `--fault-inject drop_reliable_midfrag:k=N` (or `BZRNET_FAULT_INJECT` env), **default OFF**;
+- predicate: decoded header satisfies `len ≥ 18 AND (flags & 0x80) AND NOT (flags & 0x40)` — a reliable fragment that is not final (equality to literal `0x80` is what captures have shown so far; the masked form is the contract);
+- selects the **k-th matching datagram within each directed peer-pair stream** (per `src→dst` 5-tuple), so impairment hits one stream deterministically;
+- logs every drop (timestamp, seq_a/seq_b, direction, peer pair, per-stream match ordinal);
+- counters for **observed / forwarded / dropped** datagrams exposed on `/status`.
+
+This is test instrumentation, not protocol behavior change; it must ship behind the default-off flag and never activate in normal service. If the relay path proves impractical for a cell, fallback injector: OS-level UDP impairment (clumsy / Network Emulator) filtered by first-byte pattern `0x80…`; use the documented fallback rather than redesigning the experiment mid-run.
+
+**Forensic relay-trace minimum (per relayed datagram, opt-in via `--relay-trace <file>` / `BZRNET_RELAY_TRACE`, JSON Lines, local-only — never commit raw traces):** experiment/run ID, monotonic + wall timestamp, direction, UDP source tuple, UDP destination tuple, transport flags byte, kind nibble, seq_a, seq_b, payload length, forwarding disposition (`forwarded|dropped|dropped_faultinject`), per-stream ordinal. Payload bytes are **not** logged; decoding beyond the header is not required for later comparison and is deliberately omitted.
+
+
+
+**Expected outcomes and decision rule** (classify each impairment run, together with its impairment-OFF control run, against this table):
 
 | Observation | Interpretation | Gate |
 |---|---|---|
