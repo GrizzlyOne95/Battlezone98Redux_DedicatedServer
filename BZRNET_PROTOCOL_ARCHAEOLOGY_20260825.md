@@ -5,6 +5,8 @@
 **Binary authority:** Battlezone 98 Redux **GOG 2.2.301**, SHA-256 `8D71F56C1314E69A8AD38F4EEAF20A8FF825965A84CF196E5F77EA4CC3377413` (clean, unpacked; runtime memory verified byte-identical to disk on 2026-08-20 via OpenShim runtime capture, base `0x400000`, no relocation delta).
 **Companion artifacts:** [`research/bzrnet_message_map.csv`](research/bzrnet_message_map.csv) (machine-readable), [`research/bzrnet_packet_decoder.py`](research/bzrnet_packet_decoder.py) (deterministic decoder + self-test), [`research/decomp_evidence_20260825/`](research/decomp_evidence_20260825/) (46 decompiled native functions cited below).
 
+**Phase status:** this document closes **Protocol Archaeology Phase 1** (commit `67e4689` + layering addendum). Generic packet archaeology is frozen; the successor milestone is **"Stock Client Interoperability & Fault-Injection Matrix"** — defined in [`BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md`](BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md). Remaining unknowns (§14) are to be resolved experimentally, not by another broad decompile sweep.
+
 **Relationship to prior work.** This report *extends*, and where stated *supersedes*, the 2026-08-24 interoperability report. The WS/matchmaking plane (TCP 1337), the UDP 1338 discovery reply rule, the reason-code registry, and the community-server fix history are **unchanged** and are not re-derived here. The new material is the native (decompiled) proof of the transport framing, the full in-match game-plane opcode table, the reliability machinery, and the session state machine.
 
 Evidence labels used throughout:
@@ -50,6 +52,51 @@ Evidence labels used throughout:
                        (feeds Auth +        to decode D)       spawn/state sync)
                        DoUpdateWAN/LAN)
 ```
+
+### 2.1 Layer model and semantic obligations (normative)
+
+This is the canonical layering for all future work. Each layer states **how much the dedicated server must understand** — the distinction that keeps this project from drifting into a full Battlezone network reimplementation when the native evidence says one is not needed:
+
+```
+WS :1337
+  matchmaking / session authority            [MUST understand]
+      |   Authorization, lobby state, identity metadata,
+      |   P2P signaling (DoP2PConnect / OnLobbyMemberP2PConnect /
+      |   DoP2PRoute / OnP2PRoute), reason codes
+      v
+UDP :1338
+  allocation / connection establishment      [MUST understand enough to route]
+      |   unconditional echo + observed-endpoint trailer;
+      |   feeds wanAddress / lanAddresses used for peer candidate selection
+      v
+P2P transport framing  (18-byte BZRNet header, both planes C)
+      flags   0x80 reliable / 0x40 final-fragment    [MAY understand —
+      ts      u64 BE unix-ms, ±60 s tolerance         validation &
+      seq_a   u32 BE (reliable stream counter)        diagnostics only]
+      seq_b   u32 BE (ack/secondary, role CORRELATED)
+      fragmentation ≤ 1450 B per reliable datagram, ≤2048 B per receive
+      |
+      v
+2-byte game opcode  (PP PR GA PC pS MK PS SS KA PB AS KS LS US AK KK GS
+                      PO xo io xx RO GM PK NS LA LU PT RG AC '_')  [MAY observe]
+      |
+      v
+opaque game payload                           [SHOULD REMAIN OPAQUE unless required]
+```
+
+Obligation ↔ coverage map:
+
+| Layer | Obligation | Server today | Basis |
+|---|---|---|---|
+| WS :1337 | MUST understand | SUPPORTED (42-record contract) | CONFIRMED live + binary |
+| UDP :1338 | MUST understand enough to establish routing | SUPPORTED (echo/trailer rule) | PROVEN-native + capture |
+| Transport envelope | MAY understand (validation/diagnostics) | PASS-THROUGH; decoder available | §4, §8 |
+| Game opcode | MAY observe | PASS-THROUGH; taxonomy mapped | §5 |
+| Game payload | SHOULD remain opaque unless required | opaque by design | §5, §11 |
+
+The decisive structural fact protecting this design: **no peer/game-plane message contains third-party addressing information** (exhaustive review of the recovered dispatcher, §11). The relay therefore never needs to read below the transport envelope to route correctly — opaque forwarding is an architecture supported natively, not an implementation guess.
+
+---
 
 Native module map (GOG 2.2.301 VAs; PDB advisory names cross-checked per `private_pdb_semantic_ranking.md` policy):
 
@@ -270,7 +317,7 @@ Classification per protocol family (standalone `server.py`):
 
 Prioritized interoperability backlog (re-ranked; P0 items unchanged in substance from 2026-08-24 §21):
 
-- **P0 — stock-client interop confidence:** run the §19 real-client matrix (GOG + Steam vs community server via hosts redirect) — nothing discovered this pass changes this being the top risk holder.
+- **P0 — stock-client interop confidence:** run the **Stock Client Interoperability & Fault-Injection Matrix** ([`BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md`](BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md)) — real GOG + Steam clients vs community server via hosts redirect, the 11-cell transition matrix plus controlled reliable-fragment impairment. This is now the highest-leverage conversion of protocol knowledge into an implementation go/no-go decision.
 - **P0 — official failure codes:** execute Capture B scenarios (bad-password first) to replace provisional reasonCodes.
 - **P1 — relay completeness:** Capture A paired `/iprelay` run; feed results into `udp_1339`; then feature-flagged allocation-aware relay.
 - **P1 — observability adoption:** integrate `research/bzrnet_packet_decoder.py` into `/captures` summaries and the compat suite so future captures classify under the *proven* taxonomy instead of heuristics.
