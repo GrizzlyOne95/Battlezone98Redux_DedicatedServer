@@ -65,6 +65,7 @@ DOC = {
             "2026-08-24)"
         ),
         "official_host": "battlezone98mp.webdev.rebellion.co.uk -> 68.183.35.188 (2026-08-24)",
+        "client_cadence": "stock probes ~10s after connect then every ~30s (raw pcaps 2026-03-21)",
         "confidence": "CONFIRMED",
     },
     "udp_1339": {
@@ -99,6 +100,10 @@ rec(
     },
     required_fields=["authtype"],
     stock_binary="builder 0x006C6E60 shared with DoUpdateWAN/DoUpdateLAN; steam branch adds steamAppTicket+realname+authtype=steam",
+    stock_live_capture=("steam 2.2.301 sends {apiVer:'3.6', authtype:'steam', clientVersion:'2.2.301', "
+                        "id:'S<steam64>', inLounge:false, lanAddresses:[~8 entries], name, realname, "
+                        "steamAppTicket, wanAddress}; the CLIENT supplies its S-id and the server keeps it"),
+
     official_web_js="{authtype:'web', key:<query>, id:'0', apiVer:'0.0'}",
     official_live="accepted verbatim; assigned web id B100xxxx",
     lobby_monitor="{authtype:'web', key, id:'0', apiVer:'0.0', name?, playerName?, clientVersion}",
@@ -136,8 +141,9 @@ rec(
 
 rec(
     message="DoEnterLounge", direction="client->server",
-    content_shape="boolean true (all known clients send scalar true)",
-    stock_binary="builder 0x006C6320",
+    content_shape="boolean true (live-stock capture 2026-03-21 pair + all known clients send scalar true; the earlier 'numeric payload' hypothesis is disproven by raw pcap)",
+    stock_binary="builder 0x006C6320; live stock pcap shows content:true",
+    stock_live_capture="boolean true (game1.pcapng frame 9585 region / Kat_PC.pcapng)",
     official_web_js="content:true",
     official_live="accepted; replies OnLobbyListChanged only - NO OnDoEnterLounge ack exists upstream",
     lobby_monitor="content:true", gamewatcher="content:true",
@@ -180,6 +186,7 @@ rec(
     message="CreateGame", direction="client->server",
     content_shape={"memberLimit": "int", "isPrivate": "bool", "password": "string"},
     stock_binary="builder 0x006C4350 minimal memberLimit/isPrivate/password (no name field in builder)",
+    stock_live_capture='{"isPrivate":true,"memberLimit":8,"password":"..."} exactly; friendly name arrives afterwards via SetLobbyData key=name',
     dedicated_server="wraps CreateLobby with ~game~pub~~ name + nextmid/gameType/gameSettings defaults",
     flags={"stock": True, "dedicated_server": True}, confidence="CONFIRMED",
 )
@@ -194,6 +201,7 @@ rec(
     official_web_js="sends bare numeric id (broken against current official service)",
     lobby_monitor="{'id': int-or-str, 'password': ''}",
     dedicated_server="accepts stock shape + liberal variants; bool content rejected with official wording",
+    stock_live_capture="both host and joiner send {'id': <int>, 'password': ''} ; stock ALWAYS joins ~chat~pub~~default right after entering the lounge, exits it, then creates/joins the game lobby",
     expected_responses=["OnLobbyJoined", "OnFailure"],
     flags={"stock": True, "official_live": True, "lobby_monitor": True, "dedicated_server": True},
     confidence="CONFIRMED",
@@ -212,10 +220,11 @@ rec(
         "1,2,3,5,6": "provisional community mapping (missing id / invalid id / bad password / locked / full)",
     },
     nested_payload_note=(
-        "earlier research reported nested lobby/user structures in success payloads; live "
-        "observation showed a flat ack followed by separate OnLobbyChanged snapshots carrying "
-        "the nested data; treat nested structures as OPTIONAL tolerated input"
+        "RESOLVED: raw paired stock pcaps (2026-03-21) plus live observation show the success "
+        "ack is FLAT {type,time,success,id,reason:'',reasonCode:0}; nested lobby/user structures "
+        "are NOT sent upstream. They remain tolerated input only."
     ),
+    stock_live_capture="flat ack confirmed in both game1.pcapng and Kat_PC.pcapng",
     flags={"stock": True, "official_live": True, "dedicated_server": True},
     confidence="CONFIRMED",
 )
@@ -280,6 +289,7 @@ rec(
     content_shape={"member": "AFFECTED USER ID (not display name!)", "lobbyId": "int",
                    "removed": "bool"},
     official_live='{"member":"B1000006" (joiner id),"lobbyId":1000,"removed":false} between OnLobbyChanged and OnLobbyJoined',
+    stock_live_capture="paired pcaps corroborate member=userId semantics upstream",
     stock_binary="dispatcher reads member/removed/lobbyId/users",
     lobby_monitor="reads member as DISPLAY NAME (divergence; tolerated)",
     dedicated_server="member=userId since 2026-08-24 fix; adds memberName/users supersets",
@@ -309,6 +319,7 @@ rec(
     message="DoExitLobby", direction="client->server",
     content_shape="numeric lobby id scalar (admin JS) or object; officially the numeric scalar IS accepted for exit",
     stock_binary="builder 0x006C5760",
+    stock_live_capture="stock sends bare int lobby id ('content':1004); reply is OnLobbyRemoved + OnLobbyListChanged, no explicit exit ack observed",
     official_live="numeric scalar accepted; removal broadcast via OnLobbyChanged; no explicit ack observed",
     lobby_monitor="sends current_lobby_id int",
     dedicated_server="acks OnDoExitLobby {success,id} then broadcasts",
@@ -333,6 +344,7 @@ rec(
     content_shape={"author": "display name", "speakerId": "userId", "text": "string",
                    "time": "string", "color?": "(admin page only)"},
     stock_binary="dispatcher reads text/speakerId/lobbyId/isChat",
+    stock_live_capture="{type,time,success,text,lobbyId,speakerId}; 'author' absent in stock-captured chat; text may be engine protocol strings like '~AT~S<sid>~2~2'",
     official_web_js="reads author/text/color/time",
     lobby_monitor="author||speakerId fallback",
     gamewatcher="speakerId/author/text/time",
@@ -359,6 +371,7 @@ rec(
     message="OnUserDataChanged", direction="server->client broadcast",
     content_shape={"changedLobby": "int (+ optional user snapshot supersets)"},
     stock_binary="dispatcher reads user object fields",
+    stock_live_capture="upstream emits {type,time,success,member:<userId>,lobbyId:<int>} minimally; richer snapshots are community supersets",
     lobby_monitor="reads only member (log line)",
     dedicated_server="{id,userId,member,memberName,key,value,changedLobby,user,users}",
     flags={"stock": True, "lobby_monitor": True, "dedicated_server": True},
@@ -469,6 +482,7 @@ rec(
     message="DoP2PConnect", direction="client->server",
     content_shape={"player": "target userId", "reset": "bool"},
     stock_binary="builder 0x006C59C0; capture-confirmed {'player':'TARGET','reset':false}",
+    stock_live_capture="raw paired pcaps show both peers exchanging DoP2PConnect after game-lobby join",
     dedicated_server="relays OnLobbyMemberP2PConnect to both parties (member=origin id for recipient)",
     flags={"stock": True, "dedicated_server": True}, confidence="CONFIRMED",
 )
