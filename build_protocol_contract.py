@@ -25,7 +25,7 @@ DOC = {
         "per message record. Regenerate derived docs with "
         "render_protocol_contract.py."
     ),
-    "last_live_verification": "2026-08-24",
+    "last_live_verification": "2026-08-25",
     "envelope": {
         "client_to_server": {"type": "string", "content": "any"},
         "server_to_client": {
@@ -70,15 +70,29 @@ DOC = {
     },
     "udp_1339": {
         "purpose": "relay / NAT fallback transport",
-        "association": (
-            "UNKNOWN - allocation envelope not recovered. Signaling context: "
-            "/iprelay sets global 0x00946708; HandleP2PConnect state 5 sends "
-            "DoP2PRoute; OnP2PRoute success stores an endpoint pair and enters "
-            "state 6 ('Starting RELAY Connect'); failure resets ('Failed RELAY "
-            "Connect'). Relayed sends share the seq/ack packet format per "
-            "'BZRNet P2P REL Sent Packet (%u,%u)' strings."
+        "onp2proute_payload_live": (
+            "EXACT payload captured 2026-08-25 from both route parties: "
+            "{type:'OnP2PRoute', time, success:true, player:<OTHER userId>, port:1339}. "
+            "NO allocation token, route id, nonce, or host address is delivered - there is "
+            "nothing in the signaling to key an association with."
         ),
-        "confidence": "LOW",
+        "association_inference": (
+            "Given no token exists in signaling, association must be ENDPOINT-based at the "
+            "relay: it learns source endpoints of datagrams arriving on 1339 within a "
+            "WS-known peer context and forwards opaquely. This matches the community "
+            "implementation's ws-route-endpoint-pair design."
+        ),
+        "same_nat_probe": (
+            "Two same-public-IP sockets probing 1339 (header-framed and raw payloads) after "
+            "a successful WS route registration received NO echo/relay/ack traffic "
+            "(2026-08-25). Consistent with ip-level ambiguity rejection; forwarding between "
+            "distinct network paths remains unverified pending a two-network capture."
+        ),
+        "remaining_unknown": (
+            "allocation envelope (if any), keepalive, timeout, per-datagram prefix bytes, "
+            "behavior across distinct NATs"
+        ),
+        "confidence": "LOW (structure) / MEDIUM (association model)",
     },
 }
 
@@ -158,7 +172,8 @@ rec(
     message="DoExitLounge", direction="client->server",
     content_shape="empty/scalar",
     stock_binary="builder 0x006C65B0",
-    dedicated_server="acks OnDoExitLounge",
+    official_live="silent (no ack observed)",
+    dedicated_server="acks OnDoExitLounge (superset)",
     flags={"stock": True, "dedicated_server": True}, confidence="HIGH",
 )
 
@@ -216,8 +231,13 @@ rec(
                    "{success:false,id,reason:'Join Lobby Failed, Lobby no longer exists',reasonCode:4}"),
     reason_codes={
         "0": "success CONFIRMED",
-        "4": "lobby no longer exists CONFIRMED (official-live 2026-08-24)",
-        "1,2,3,5,6": "provisional community mapping (missing id / invalid id / bad password / locked / full)",
+        "4": "'Join Lobby Failed, Lobby no longer exists' CONFIRMED (official-live 2026-08-24)",
+        "5": "'Join Lobby Failed, Trying to join a lobby you're already in' CONFIRMED "
+             "(official-live 2026-08-25); upstream evaluates already-in BEFORE lock/full",
+        "1,2": "provisional: missing id / invalid id",
+        "3,6,7": "provisional: bad password / locked / full. NOTE: upstream did NOT enforce a "
+                 "password supplied via CreateGame nor SetLobbyData(key=password) - wrong-password "
+                 "joins succeeded twice (2026-08-25). Community enforcement is a conservative superset.",
     },
     nested_payload_note=(
         "RESOLVED: raw paired stock pcaps (2026-03-21) plus live observation show the success "
@@ -309,7 +329,8 @@ rec(
 
 rec(
     message="OnLobbyCreated", direction="server->client",
-    content_shape={"success": "bool", "id": "lobbyId", "reason?": "str"},
+    content_shape={"type": "dup", "time": "str", "success": "bool", "id": "lobbyId"},
+    official_live="{type,time,success:true,id} exactly; no reason field observed",
     lobby_monitor="flat success/id/reason; triggers metadata seeding",
     dedicated_server="emitted to creator before OnLobbyChanged/full list",
     flags={"lobby_monitor": True, "dedicated_server": True}, confidence="MEDIUM",
@@ -441,8 +462,12 @@ rec(
     message="DoKickUser", direction="client->server",
     content_shape="target userId scalar",
     stock_binary="builder inferred (Inferred evidence level in shim registry)",
+    official_live=("owner DoKickUser against a lobby member silently NO-OPs upstream across three "
+                   "content shapes (scalar id / {'id'} / {'player'}; kicked client receives no event; "
+                   "2026-08-25). Likely gated on admin/BB status."),
     lobby_monitor="manual kick + auto-ban path",
-    dedicated_server="owner-only; removes target; exit ack + stdout warn",
+    dedicated_server="functional owner-only kick (documented moderation superset): removes target, "
+                     "exit ack + warn", 
     flags={"lobby_monitor": True, "dedicated_server": True}, confidence="MEDIUM",
 )
 

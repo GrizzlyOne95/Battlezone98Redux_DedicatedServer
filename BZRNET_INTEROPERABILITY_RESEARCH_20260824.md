@@ -13,16 +13,17 @@ This work order produced a live-verified, evidence-ranked understanding of the c
 Headline results:
 
 1. **The official service was re-verified live on 2026-08-24** (WebSocket TCP 1337 + UDP 1338 at `battlezone98mp.webdev.rebellion.co.uk` → `68.183.35.188`). The admin page and `scripts/bzadmin.js` are still served unchanged in shape.
-2. **Several prior protocol beliefs were corrected with hard evidence:**
+2. **A second authorized live-probe round (2026-08-25)** using two self-owned synthetic sessions inside own-created lobbies confirmed a second official reasonCode (5 = already-in), captured the exact `OnP2PRoute` allocation payload, proved upstream does not enforce lobby passwords on the tested path, and showed owner `DoKickUser` silently no-ops upstream.
+3. **Several prior protocol beliefs were corrected with hard evidence:**
    - Stock `DoEnterLounge` sends **boolean `true`** (raw pcap), not a numeric payload.
    - `OnLobbyJoined` success acks are **flat**; nested lobby/user structures are *not* sent upstream.
    - Official `DoJoinLobby` requires exactly `{"id": <number>, "password": <string>}`; anything else yields `OnFailure "DoJoinLobby failure bad content data type"`.
    - `reasonCode` **4 = "Join Lobby Failed, Lobby no longer exists"** — the first officially confirmed failure code.
    - `OnLobbyMemberListChanged.member` carries the affected user's **server-assigned ID**, not a display name.
    - UDP 1338 replies to **every** datagram (even empty ones) with echo + 7-byte endpoint trailer.
-3. **The community server was brought measurably closer to stock parity** (join ordering, member semantics, reason codes, id assignment, seeded default chat lobby, UDP trailer rule).
-4. **An auditable protocol contract** (`protocol_contract.json`, 42 records), a rendered disagreement matrix, a drift harness against sanitized live baselines, a 42-check multi-profile interoperability suite, and a convergence-asserting soak harness were added.
-5. **UDP 1339 relay remains the one large unknown**; this work narrowed its context (stock state machine, `/iprelay`, `OnP2PRoute` consumer) but did not recover the allocation envelope.
+4. **The community server was brought measurably closer to stock parity** (join ordering, member semantics, reason codes, id assignment, seeded default chat lobby, UDP trailer rule).
+5. **An auditable protocol contract** (`protocol_contract.json`, 42 records), a rendered disagreement matrix, a drift harness against sanitized live baselines, a 42-check multi-profile interoperability suite, and a convergence-asserting soak harness were added.
+6. **UDP 1339 relay remains the one large unknown**; this work narrowed its context (stock state machine, `/iprelay`, `OnP2PRoute` consumer) but did not recover the allocation envelope.
 
 ---
 
@@ -59,6 +60,7 @@ Headline results:
 | Source | What it provided | Trust |
 |---|---|---|
 | Live official service (read-only oracle sessions, 2026-08-24) | Envelope shapes, auth flow, join/exit flows, failure wording, silence behavior, 1338 edge cases | CONFIRMED (as of date) |
+| Live official service (authorized self-contained probes, 2026-08-25) | reasonCode 5 + evaluation order, exact OnP2PRoute payload, password non-enforcement, kick no-op, 1339 same-NAT silence | CONFIRMED (as of date) |
 | Raw paired pcaps `game1.pcapng` / `Kat_PC.pcapng` (SHA-256 verified against recorded hashes) | Real stock-client send shapes and event ordering for a full host+join+launch session | CONFIRMED |
 | Static decomp of GOG 2.2.301 (`BZRNET_WS_SCHEMA_BINARY_CONFIRMED_20260716.md`, OpenShim corpus) | Builder addresses, exact JSON keys incl. non-literal key `id` at `DAT_00897b9c`, setter types (number vs string vs bool) | CONFIRMED |
 | Official web assets `scripts/bzadmin.js`, `bzdatagrids.js` (fetched 2026-08-24) | Complete admin-client contract | CONFIRMED |
@@ -95,8 +97,11 @@ Reason-code registry:
 | Code | Meaning | Status |
 |---|---|---|
 | 0 | success | CONFIRMED (live + pcap) |
-| 4 | lobby no longer exists (`"Join Lobby Failed, Lobby no longer exists"`) | CONFIRMED (live 2026-08-24) |
-| 1,2,3,5,6 | community-provisional: missing id / invalid id / bad password / locked / full | PROVISIONAL — renumber only with new official evidence |
+| 4 | `"Join Lobby Failed, Lobby no longer exists"` | CONFIRMED (live 2026-08-24) |
+| 5 | `"Join Lobby Failed, Trying to join a lobby you're already in"` (evaluated BEFORE lock/full) | CONFIRMED (live 2026-08-25) |
+| 1,2 | missing id / invalid id | PROVISIONAL |
+| 3 | bad password | PROVISIONAL — upstream did NOT enforce passwords via CreateGame/SetLobbyData (wrong-password joins succeeded twice, 2026-08-25); community enforcement is a conservative superset |
+| 6,7 | locked / full | PROVISIONAL |
 
 ## 5. Official admin-client findings (live assets, 2026-08-24)
 
@@ -116,7 +121,8 @@ Synthesis of decomp + raw paired captures (GOG 2.2.301; Steam build treated as m
 - Full observed stock sequence (host): `Authorization → OnAuthorization+OnWhitelistUpdated → DoEnterLounge(true) → OnLobbyListChanged → DoJoinLobby(default chat) → [OnLobbyChanged, OnLobbyMemberListChanged, OnLobbyJoined] → SetPlayerData×n → DoExitLobby(chat) → CreateGame(minimal) → OnLobbyCreated → SetLobbyData(name/gameSettings/...) ×n each acked by OnLobbyChanged+OnLobbyDataChanged → DoP2PConnect(peer)` … later `LockLobby(true/false)`, `SetLobbyMemberLimit(n)`, exit → `OnLobbyRemoved + OnLobbyListChanged`.
 - Joiner mirrors: lounge → join default chat → exit → join game lobby → identity SetPlayerData → DoP2PConnect.
 - The engine keeps probing 1338 (~10 s, then ~30 s cadence) and refreshes WAN via `DoUpdateWAN`.
-- In-match transport rides behind the confirmed 18-byte common header (flags/kind/8-byte BE ms/reliable seq/peer ack); gameplay payloads are legacy `Net`/`NetPlayer` bytes and stay opaque for our purposes.
+- In-match peer transport: the **18-byte header boundary is CONFIRMED** and the sequence field at **bytes 16..17 is a big-endian u16, CONFIRMED** by PR #1's independent instrumentation (`BZRNET_TRANSPORT_HEADER_20260812.md`, `server._decode_bzr_transport_header`). Byte 0 behaves as a flags byte (`0x40` unreliable / `0xC0` reliable) and byte 1 as a kind nibble carrier in captures; **bytes 2..15 remain deliberately OPAQUE** - the earlier March-capture interpretation of those bytes as an 8-byte BE unix-ms timestamp plus separate u32 seq/ack fields was NOT independently proven for the peer transport and is superseded by PR #1's conservative hierarchy. Gameplay payloads start at byte 18 and are legacy `Net`/`NetPlayer` bytes; they stay opaque for our purposes.
+- The UDP **1338 discovery probe** is a distinct protocol surface: an 18-byte packet beginning `40 02 ...` whose internal field meanings are likewise not independently proven (the relay/probe interop only requires the echo+trailer rule below). Do not transfer semantics between the two surfaces.
 - Route selection state machine (decomp): LAN/WAN attempts with retry budgets; forced-relay global `0x00946708` (`/iprelay`) jumps to state 5 → `DoP2PRoute`; `OnP2PRoute` success stores an endpoint pair and enters state 6 ("Starting RELAY Connect"); failures log `FAILED WAN Connect ... ATTEMPTING RELAY` / `FAILED RELAY Connect`.
 
 ## 7. LobbyMonitor findings (independent implementation)
@@ -138,18 +144,27 @@ Synthesis of decomp + raw paired captures (GOG 2.2.301; Steam build treated as m
 ## 9. UDP 1338 findings
 
 - **Reply rule (upgraded to unconditional):** response = `echo(request) || 0x04 || observedIPv4(network order) || observedPort(BE u16)`. Verified for empty (7-byte reply!), 1-byte, 7-byte ASCII, 17-byte, kind-0x02 18-byte, and other 18-byte inputs. Community shim previously replied only to `0x40`-prefixed ≥18-byte probes and never to empties — fixed.
-- Canonical request remains `40 02 <8-byte BE unix-ms> <seq u32 BE> <ack u32 BE>`.
+- Canonical request shape: 18 bytes beginning `40 02`; per PR #1's tightened evidence hierarchy the only named fields anywhere in a BZRNet UDP wrapper are byte 0 (flags), byte 1 (kind) and bytes 16..17 (u16-BE sequence). Any timestamp/seq/ack layout inside the *discovery probe* specifically remains UNPROVEN and irrelevant to interop: the server's reply rule operates on raw bytes.
 - Stock cadence ~10 s then ~30 s; the client validates the echoed timestamp (~60 s skew tolerance per decomp) and emits `DoUpdateLAN`/`DoUpdateWAN`.
 - Platform caveat: Windows ProactorEventLoop never delivers zero-length datagrams to Python, so the empty case is observable only on Linux/Docker deployments (documented in tests as INFO, not failure).
 
 ## 10. UDP 1339 findings
 
-Nothing in any repository contains a confirmed 1339 frame. What this work established/narrowed:
+**Live allocation-signaling capture (2026-08-25, authorized self-contained probe):** with two synthetic Web sessions inside one own-created game lobby on the official service, `DoP2PRoute{player}` succeeded both ways and delivered the EXACT payload:
 
-- Signaling context is fully mapped: `/iprelay` sets global `0x00946708`; connection attempt path checks it before choosing direct; forced-relay enters state 5 and emits `DoP2PRoute {player}`; the `OnP2PRoute` consumer (`FUN_0075f370`, strings "Starting/Failed RELAY Connect ... - P2P Relay Response") stores an endpoint pair from a dedicated parser and moves to state 6; retry counter 0x1E.
-- Relayed traffic shares the seq/ack packet format ("BZRNet P2P REL Sent Packet (%u,%u)" alongside TRY/UNR variants), suggesting the 1339 envelope is likely a small routing prefix around the same framed datagrams — hypothesis only.
-- Neither paired capture contains 1339 traffic (direct path succeeded both times), consistent with the Phase-2 guide's open item.
-- Association candidates ranked by evidence: (a) WS-associated peer mapping keyed by source endpoint at the relay (how our opaque relay already routes), (b) allocation token delivered inside `OnP2PRoute`'s currently-unparsed fields, (c) lobby-scoped channel ids. Nothing disproven yet because no forced-relay capture exists; the recovery plan below stands.
+```json
+{"type":"OnP2PRoute","time":"...","success":true,"player":"<OTHER userId>","port":1339}
+```
+
+delivered to each party with `player` set to the other's id. There is **no allocation token, route id, nonce, or host address** anywhere in the message. Combined with `FUN_0075f370` storing an endpoint pair on success, the only consistent association model is **endpoint-based learning at the relay** (the relay observes datagram source endpoints within WS-known peer context) — precisely the community implementation's `ws-route-endpoint-pair` design.
+
+Same-NAT stress test: after route registration, two sockets sharing one public IP sent header-framed and raw datagrams to 1339 and received **no echo, relay, or acknowledgement** — consistent with ip-level ambiguity rejection rather than echo behavior. Forwarding between genuinely distinct network paths remains unverified pending the paired `/iprelay` capture.
+
+Also established/narrowed:
+
+- Signaling context fully mapped from decomp: `/iprelay` sets global `0x00946708`; forced-relay enters state 5 → `DoP2PRoute`; `OnP2PRoute` success stores the endpoint pair and enters state 6 ("Starting RELAY Connect"); failures log "FAILED WAN Connect ..., ATTEMPTING RELAY" / "Failed RELAY Connect".
+- Relayed traffic shares the framed packet format ("BZRNet P2P REL Sent Packet (%u,%u)"), suggesting any per-datagram prefix is small around the same wrapper — hypothesis only.
+- Remaining unknowns: allocation envelope (if any beyond signaling), keepalive, timeout, per-datagram prefix bytes, cross-NAT forwarding.
 
 ## 11. Direct-vs-relay decision path (current understanding)
 
@@ -191,6 +206,8 @@ Verified against the community server by the compat suite and soak:
 5. `~AT~` chat protocol strings and remaining `userPack` conventions.
 6. Whether joining without prior `SetPlayerData` identity is what caused the observed "no longer exists" rejection for a freshly-authorized web user, or whether that lobby/state was special (single observation; flagged MEDIUM confidence in fixtures).
 7. Steam-vs-GOG client deltas beyond auth material.
+
+Resolved since the first draft of this report: reasonCode 5 semantics (confirmed), upstream password non-enforcement via the CreateGame/SetLobbyData path (observed), owner `DoKickUser` silently no-ops upstream across scalar/`{'id'}`/`{'player'}` content shapes (kicked client receives no event; likely gated on admin/BB status — our functional owner-kick is a documented moderation superset), and `DoExitLounge` silence.
 
 ## 15. Bugs discovered
 
