@@ -101,7 +101,7 @@ def main() -> None:
         lines.append(f"- confidence: **{r.get('confidence', 'UNKNOWN')}**")
         lines.append("")
 
-    OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    OUT.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
     print(f"wrote {OUT}")
 
 

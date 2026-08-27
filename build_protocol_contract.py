@@ -483,7 +483,7 @@ rec(
                    "2026-08-25). Likely gated on admin/BB status."),
     lobby_monitor="manual kick + auto-ban path",
     dedicated_server="functional owner-only kick (documented moderation superset): removes target, "
-                     "exit ack + warn", 
+                     "exit ack + warn",
     flags={"lobby_monitor": True, "dedicated_server": True}, confidence="MEDIUM",
 )
 
