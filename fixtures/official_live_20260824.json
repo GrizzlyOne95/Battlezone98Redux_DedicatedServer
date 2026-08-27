@@ -1,0 +1,55 @@
+{
+  "$note": "Sanitized structural snapshot of the LIVE official Rebellion BZRNet service, captured 2026-08-24 via read-only observation (synthetic Web identity). All real addresses, tickets, and stable identifiers removed; documentation ranges and placeholder ids only. This file is the drift-detection baseline for oracle_drift_check.py.",
+  "captured": "2026-08-24",
+  "host": "battlezone98mp.webdev.rebellion.co.uk",
+  "ws_port": 1337,
+  "udp_port": 1338,
+  "flows": {
+    "authorization": {
+      "send": {"type": "Authorization", "content": {"authtype": "web", "key": "", "id": "0", "apiVer": "0.0"}},
+      "responses": [
+        {"type": "OnAuthorization", "data": {"type": "OnAuthorization", "time": "<YYYY-MM-DD HH:MM:SS>", "success": true, "isAdmin": false, "id": "B100xxxx", "isBB": false}},
+        {"type": "OnWhitelistUpdated", "data": {"type": "OnWhitelistUpdated", "time": "<ts>", "success": true, "whitelist": {"list": ["*.wav", "*.ogg", "*.ini", "*.inf", "*.jpg", "*.txt", "*.stb", "*.des", "*.dds", "*.png", "*.sta", "*mod.material"], "major": 8, "minor": 0}}}
+      ],
+      "ordering_strict": true,
+      "notes": [
+        "Server assigns B-prefixed web userId; requested id '0' is ignored.",
+        "No other message may precede OnAuthorization for stock clients."
+      ]
+    },
+    "enter_lounge": {
+      "send": {"type": "DoEnterLounge", "content": true},
+      "responses": [
+        {"type": "OnLobbyListChanged", "data": {"type": "dup", "time": "<ts>", "success": true, "lobbies": {"<lobbyIdStr>": {"id": "int", "userCount": "int", "memberLimit": "int", "isPrivate": "bool", "isLocked": "bool", "isChat": "bool", "owner": "userId|-1", "metadata": {"name": "~chat~pub~~default", "gameType": "1", "gameSettings": "*", "GameVersion": "2.2.301", "userCount": "str", "userPack?": "padded str"}, "clientVersion": "str (empty for bridge chat lobbies)", "createdTime": "ISO-8601Z-ms", "users": {"<userId>": {"isInLounge": "bool", "lanAddresses": "[str]", "wanAddress": "<addr>", "metadata": {}, "ipAddress": "<addr>", "isBB": "bool", "isAdmin": "bool", "isAuth": "bool", "lobby": "int", "name": "str", "clientVersion": "str", "authType": "steam|gog|web", "id": "userId", "isTest": "bool"}}}}, "totalUsers": "int-can-be-negative-upstream"}}
+      ],
+      "ordering_strict": true,
+      "notes": [
+        "NO OnDoEnterLounge ack exists upstream.",
+        "Persistent bridge lobbies ~chat~pub~~default and ~chat~pub~~discord owned by !BRIDGE web users were present in every observation."
+      ]
+    },
+    "join_lobby": {
+      "send": {"type": "DoJoinLobby", "content": {"id": 2848, "password": ""}},
+      "precondition": "SetPlayerData name/playerName/clientVersion/authType identity was set first; joins WITHOUT prior SetPlayerData identity returned 'Join Lobby Failed, Lobby no longer exists' (reasonCode 4) even though the lobby existed - cause unconfirmed",
+      "responses_success_ordering": ["OnLobbyChanged(full snapshot incl. joiner)", "OnLobbyMemberListChanged {member:<joinerUserId>, lobbyId, removed:false}", "OnLobbyJoined {type,time,success:true,id,reason:'',reasonCode:0}", "OnLobbyChanged", "OnLobbyDataChanged {type,time,success,changedLobby}"],
+      "responses_failure": {
+        "missing_lobby": {"type": "OnLobbyJoined", "data": {"success": false, "id": "<lobbyId>", "reason": "Join Lobby Failed, Lobby no longer exists", "reasonCode": 4}},
+        "bad_content_type": {"type": "OnFailure", "data": {"type": "OnFailure", "time": "<ts>", "success": false, "reason": "DoJoinLobby failure bad content data type"}, "has_reasonCode": false}
+      },
+      "rejected_shapes": ["scalar numeric id (admin-JS joinLobby shape is broken upstream)", "object missing password"],
+      "notes": ["Exit accepts scalar numeric id; no explicit exit ack observed."]
+    },
+    "silences": {
+      "no_response_for_non_admin_web": ["GetStatLog", "GetUserList", "Ping", "DoPing", "SetPlayerData"],
+      "no_periodic_broadcasts_when_idle_seconds": 300,
+      "notes": ["Official service is push-only while idle; keepalive is WS-frame level."]
+    }
+  },
+  "udp_1338": {
+    "request_example_len": 18,
+    "response_rule": "echo(payload) + 04 + observedIPv4(network order) + observedPort(BE u16)",
+    "empty_datagram_reply_bytes": 7,
+    "observed_response_len_for_18b_probe": 25,
+    "confidence": "CONFIRMED"
+  }
+}

@@ -107,15 +107,22 @@ DEFAULT_WHITELIST = {
 }
 
 # reasonCode values returned on OnLobbyJoined / OnFailure. The client dispatcher
-# (0x006BF2A0) reads a numeric "reasonCode"; the stock enum is not yet recovered
-# (needs a live capture), so these are provisional-but-stable: 0 == success.
+# (0x006BF2A0) reads a numeric "reasonCode"; 0 == success.
+#
+# Live-confirmed against the official service:
+#   2026-08-24  4 = "Join Lobby Failed, Lobby no longer exists"
+#   2026-08-25  5 = "Join Lobby Failed, Trying to join a lobby you're already in"
+#                   (checked BEFORE lock/full when a member rejoins)
+# Remaining values are provisional and numbered to avoid the confirmed slots;
+# renumber only with fresh official evidence.
 REASON_OK = 0
 JOIN_FAIL_MISSING_ID = 1
 JOIN_FAIL_INVALID_ID = 2
-JOIN_FAIL_NOT_FOUND = 3
-JOIN_FAIL_LOCKED = 4
-JOIN_FAIL_BAD_PASSWORD = 5
-JOIN_FAIL_FULL = 6
+JOIN_FAIL_BAD_PASSWORD = 3
+JOIN_FAIL_NOT_FOUND = 4
+JOIN_FAIL_ALREADY_IN = 5
+JOIN_FAIL_LOCKED = 6
+JOIN_FAIL_FULL = 7
 
 SUPPORTED_CLIENT_MESSAGES = [
     "Authorization",
@@ -3010,6 +3017,9 @@ class LobbyState:
     password: str = ""
     created_time: str = field(default_factory=utc_now_str)
     users: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Persistent lobbies (e.g. the seeded ~chat~pub~~default room) survive even
+    # when empty. The official service keeps such bridge-owned rooms forever.
+    persistent: bool = False
 
 
 class ServerState:
@@ -3080,7 +3090,10 @@ class ServerState:
             "lobbyId": lobby.lobby_id,
             "name": name,
             "isChat": name.startswith("~chat~"),
-            "owner": lobby.owner,
+            # Official admin page (scripts/bzdatagrids.js) renders owner == -1 as
+            # "none"; an ownerless/restored lobby must therefore serialize -1,
+            # not "".
+            "owner": lobby.owner if lobby.owner else -1,
             "createdTime": lobby.created_time,
             "metadata": lobby.metadata,
             "memberLimit": lobby.member_limit,
@@ -3187,7 +3200,7 @@ class ServerState:
                 # Users are not restored; sessions are runtime-only.
                 lobby = LobbyState(
                     lobby_id=lid,
-                    owner="",
+                    owner=str(raw_lobby.get("owner", "") or ""),
                     metadata=dict(raw_lobby.get("metadata", {})),
                     member_limit=int(raw_lobby.get("memberLimit", 20000)),
                     is_private=bool(raw_lobby.get("isPrivate", False)),
@@ -3195,6 +3208,7 @@ class ServerState:
                     password=str(raw_lobby.get("password", "")),
                     created_time=str(raw_lobby.get("createdTime", utc_now_str())),
                     users={},
+                    persistent=bool(raw_lobby.get("persistent", False)),
                 )
                 self.lobbies[lid] = lobby
 
@@ -3207,6 +3221,50 @@ class ServerState:
             )
         except Exception:
             self.log.exception("Failed to load state file: %s", self.state_file)
+
+    DEFAULT_LOBBY_NAME = "~chat~pub~~default"
+
+    @classmethod
+    def _is_default_lobby(cls, lobby: LobbyState) -> bool:
+        """Exact, normalized identification of the canonical default room.
+
+        Substring matching would wrongly promote user-created rooms such as
+        '~chat~pub~~Default Maps Discussion' to undeletable persistent status.
+        """
+        return str(lobby.metadata.get("name", "")).strip().lower() == cls.DEFAULT_LOBBY_NAME
+
+    def ensure_default_lobby(self) -> None:
+        """Seed the persistent ~chat~pub~~default chat lobby.
+
+        Raw paired stock-client captures (2026-03-21) show every stock client
+        joins ~chat~pub~~default immediately after entering the lounge and
+        before creating/joining any game lobby; the official service keeps this
+        bridge-owned room in existence at all times. Mirror that so the stock
+        first-join flow works against this server. Only an EXACT canonical name
+        match qualifies (see _is_default_lobby).
+        """
+        for lobby in self.lobbies.values():
+            if self._is_default_lobby(lobby):
+                lobby.persistent = True
+                return
+        lid = self.allocate_lobby_id()
+        lobby = LobbyState(
+            lobby_id=lid,
+            owner="B1000001",
+            member_limit=20000,
+            metadata={
+                "name": self.DEFAULT_LOBBY_NAME,
+                "gameType": "1",
+                "gameSettings": "*",
+                "GameVersion": "2.2.301",
+                "userCount": "0",
+                "userPack": "!BRIDGE                         ",
+            },
+            persistent=True,
+        )
+        self.lobbies[lid] = lobby
+        self.mark_dirty()
+        self.log.info("Seeded persistent default chat lobby %d (~chat~pub~~default)", lid)
 
     def _state_payload(self) -> dict[str, Any]:
         persisted_lobbies = []
@@ -3221,6 +3279,7 @@ class ServerState:
                     "isLocked": lobby.is_locked,
                     "password": lobby.password,
                     "createdTime": lobby.created_time,
+                    "persistent": lobby.persistent,
                 }
             )
         return {
@@ -3294,21 +3353,16 @@ class BZRUDPProtocol(asyncio.DatagramProtocol):
 
     @staticmethod
     def _build_reply(data: bytes, addr: tuple[str, int]) -> bytes:
-        if not data:
-            return b""
-
-        # Official 1338 replies echo the probe and append a 7-byte trailer:
-        # 0x04 + observed IPv4 + observed UDP port (big-endian).
-        if data[0] == 0x40 and len(data) >= 18:
-            try:
-                ip_bytes = socket.inet_aton(addr[0])
-                port_bytes = int(addr[1]).to_bytes(2, "big")
-                return data + b"\x04" + ip_bytes + port_bytes
-            except (OSError, OverflowError):
-                return data
-
-        # For unknown packet types, echo to keep local probes iterative.
-        return data
+        # Live-verified against the official service (2026-08-24): UDP 1338 echoes
+        # ANY received datagram verbatim and appends a 7-byte trailer:
+        # 0x04 + observed IPv4 (network order) + observed UDP port (big-endian).
+        # Empty datagrams get a trailer-only 7-byte reply.
+        try:
+            ip_bytes = socket.inet_aton(addr[0])
+            port_bytes = int(addr[1]).to_bytes(2, "big")
+            return data + b"\x04" + ip_bytes + port_bytes
+        except (OSError, OverflowError):
+            return data
 
     def error_received(self, exc: Exception) -> None:
         self.logger.warning("UDP error: %s", exc)
@@ -3342,6 +3396,184 @@ class RelayRoute:
     last_activity_monotonic: float = field(default_factory=time.monotonic)
 
 
+def _is_reliable_nonfinal_fragment(data: bytes) -> bool:
+    """True when a datagram is a reliable BZRNet fragment that is not the final one.
+
+    PROVEN-native flag semantics (BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md §4.1):
+    bit 0x80 marks reliable traffic; bit 0x40 is added only on the final
+    fragment (or on single-packet unreliable sends).  A bare 0x80 therefore
+    identifies a middle reliable fragment.  This predicate is the ONLY packet
+    interpretation performed by fault injection.
+    """
+    return (
+        len(data) >= BZR_TRANSPORT_HEADER_BYTES
+        and bool(data[0] & 0x80)
+        and not bool(data[0] & 0x40)
+    )
+
+
+class RelayFaultInjector:
+    """Opt-in Phase-2 impairment hook for the UDP relay (default OFF).
+
+    Contract: BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md §4.  The single
+    supported mode drops the k-th bare-0x80 (reliable, non-final) datagram per
+    directed peer stream.  It never rewrites, reorders, reassembles, or
+    retransmits anything; when inactive it is not consulted at all so the hot
+    path stays byte-transparent.
+    """
+
+    MODES = ("drop_reliable_midfrag",)
+
+    def __init__(self, spec: str) -> None:
+        spec = (spec or "").strip()
+        if not spec:
+            raise ValueError("empty fault-injection spec")
+        mode_part, _, param_part = spec.partition(":")
+        mode = mode_part.strip()
+        if mode not in self.MODES:
+            raise ValueError(f"unsupported fault-injection mode {mode!r}; known: {self.MODES}")
+        params: dict[str, str] = {}
+        for chunk in param_part.split(","):
+            if not chunk:
+                continue
+            key, sep, value = chunk.partition("=")
+            if not sep:
+                raise ValueError(f"fault-injection parameter {chunk!r} must be key=value")
+            params[key.strip()] = value.strip()
+        if "k" not in params:
+            raise ValueError("fault-injection requires k=<ordinal>")
+        k = int(params["k"])
+        if k <= 0:
+            raise ValueError("fault-injection k must be >= 1")
+        self.mode = mode
+        self.k = k
+        self.observed_count = 0
+        self.forwarded_count = 0
+        self.dropped_count = 0
+        self._stream_match_ordinals: dict[tuple[str, int, str, int], int] = {}
+        self.last_dropped: dict[str, Any] | None = None
+
+    @property
+    def active(self) -> bool:
+        return True
+
+    def decide_drop(self, data: bytes, stream_key: tuple[str, int, str, int]) -> bool:
+        """Return True exactly once per stream, on the k-th matching fragment.
+
+        Sole accounting point: every offered datagram increments ``observed``;
+        passing datagrams increment ``forwarded``, a selected one ``dropped``.
+        """
+        self.observed_count += 1
+        if not _is_reliable_nonfinal_fragment(data):
+            self.forwarded_count += 1
+            return False
+        ordinal = self._stream_match_ordinals.get(stream_key, 0) + 1
+        self._stream_match_ordinals[stream_key] = ordinal
+        if ordinal == self.k:
+            self.dropped_count += 1
+            self.last_dropped = {
+                "streamKey": stream_key,
+                "matchOrdinal": ordinal,
+                "seqA": int.from_bytes(data[10:14], "big"),
+                "seqB": int.from_bytes(data[14:18], "big"),
+                "payloadBytes": max(0, len(data) - BZR_TRANSPORT_HEADER_BYTES),
+            }
+            return True
+        self.forwarded_count += 1
+        return False
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "k": self.k,
+            "active": True,
+            "observed": self.observed_count,
+            "forwarded": self.forwarded_count,
+            "dropped": self.dropped_count,
+            "lastDropped": self.last_dropped,
+        }
+
+
+class RelayTraceWriter:
+    """Forensic JSONL trace of relayed datagrams (opt-in; local-only output).
+
+    One line per routed datagram with transport-envelope fields only.  Payload
+    bytes are deliberately never written: decoding beyond the header is not
+    needed for later comparison (work order §4 forensic minimum).  Traces may
+    contain real endpoints; they live beside runtime state and must never be
+    committed raw.
+    """
+
+    FORMAT_NAME = "bzr-relay-trace"
+    FORMAT_VERSION = 1
+
+    def __init__(self, path: str, run_id: str) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.lines_written = 0
+        self._fh = open(path, "a", encoding="utf-8", newline="\n")
+        self._write_line(
+            {
+                "format": self.FORMAT_NAME,
+                "version": self.FORMAT_VERSION,
+                "runId": run_id,
+            }
+        )
+
+    def _write_line(self, record: dict[str, Any]) -> None:
+        self._fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._fh.flush()
+        self.lines_written += 1
+
+    def log(
+        self,
+        *,
+        direction: str,
+        source: tuple[str, int],
+        target: tuple[str, int],
+        data: bytes,
+        disposition: str,
+        match_ordinal: int | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "runId": self.run_id,
+            "tsMonotonic": round(time.monotonic(), 6),
+            "tsUnixMs": int(time.time() * 1000),
+            "direction": direction,
+            "source": f"{source[0]}:{source[1]}",
+            "target": f"{target[0]}:{target[1]}",
+            "disposition": disposition,
+        }
+        header_hex = data[:18].hex() if len(data) >= 18 else ""
+        record["transport"] = {
+            "flagsByte": f"0x{data[0]:02x}" if data else None,
+            "kindNibble": (data[1] & 0x0F) if len(data) >= 2 else None,
+            "headerTimestampUnixMs": int.from_bytes(data[2:10], "big") if len(data) >= 10 else None,
+            "seqA": int.from_bytes(data[10:14], "big") if len(data) >= 14 else None,
+            "seqB": int.from_bytes(data[14:18], "big") if len(data) >= 18 else None,
+            "headerBytes": len(header_hex) // 2,
+            "payloadBytes": max(0, len(data) - BZR_TRANSPORT_HEADER_BYTES),
+            "wireBytes": len(data),
+        }
+        if match_ordinal is not None:
+            record["matchOrdinal"] = match_ordinal
+        self._write_line(record)
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "path": self.path,
+            "linesWritten": self.lines_written,
+            "runId": self.run_id,
+        }
+
+    def close(self) -> None:
+        try:
+            self._fh.flush()
+        finally:
+            self._fh.close()
+
+
 class BZRRelayProtocol(asyncio.DatagramProtocol):
     """Transparent datagram relay for WS-associated peer pairs.
 
@@ -3358,6 +3590,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         state: ServerState,
         *,
         route_ttl_seconds: int = DEFAULT_RELAY_ROUTE_TTL_SECONDS,
+        fault_injector: RelayFaultInjector | None = None,
+        trace_writer: RelayTraceWriter | None = None,
     ) -> None:
         self.logger = logger
         self.state = state
@@ -3372,6 +3606,10 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         self.ambiguous_drop_count = 0
         self.unmapped_drop_count = 0
         self.expired_route_count = 0
+        # Phase-2 instrumentation. Both default to None: when absent the hot
+        # path below is unchanged byte-transparent forwarding.
+        self.fault_injector = fault_injector
+        self.trace_writer = trace_writer
 
     @property
     def enabled(self) -> bool:
@@ -3407,6 +3645,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             "routeTtlSeconds": self.route_ttl_seconds,
             "associationMode": "ws-route-endpoint-pair",
             "officialAssociationParity": False,
+            "faultInjector": self.fault_injector.metrics() if self.fault_injector else {"mode": "", "active": False},
+            "trace": self.trace_writer.metrics() if self.trace_writer else {"enabled": False},
         }
 
     def _expire_routes(self) -> None:
@@ -3569,6 +3809,46 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
 
         # Preserve the complete datagram and packet boundary exactly. The relay
         # never rewrites sequence numbers or interprets the payload after byte 18.
+        #
+        # Phase-2 instrumentation hook (work order §4): optional forensic trace
+        # plus an optional single-shot reliable-midfragment drop. Both are OFF
+        # unless explicitly enabled; with both off this path is identical to
+        # previous behavior. The injector performs no interpretation beyond the
+        # bare-0x80 predicate and never rewrites or reorders anything; the
+        # sendto below always transmits `data` unmodified.
+        instrumented = self.fault_injector is not None or self.trace_writer is not None
+        if instrumented:
+            stream_key = (addr[0], addr[1], target[0], target[1])
+            direction = f"{addr[0]}:{addr[1]}->{target[0]}:{target[1]}"
+            match_ordinal: int | None = None
+            drop_for_faultinject = False
+            if self.fault_injector is not None:
+                drop_for_faultinject = self.fault_injector.decide_drop(data, stream_key)
+                match_ordinal = self.fault_injector._stream_match_ordinals.get(stream_key)
+            disposition = "dropped_faultinject" if drop_for_faultinject else "forwarded"
+            if self.trace_writer is not None:
+                self.trace_writer.log(
+                    direction=direction,
+                    source=addr,
+                    target=target,
+                    data=data,
+                    disposition=disposition,
+                    match_ordinal=match_ordinal,
+                )
+            if drop_for_faultinject:
+                assert self.fault_injector is not None
+                info = self.fault_injector.last_dropped or {}
+                self.drop_count += 1
+                self.logger.warning(
+                    "FAULT-INJECT dropped reliable midfragment stream=%s ordinal=%s seqA=%s seqB=%s payload=%s",
+                    stream_key,
+                    info.get("matchOrdinal"),
+                    info.get("seqA"),
+                    info.get("seqB"),
+                    info.get("payloadBytes"),
+                )
+                return
+
         self.transport.sendto(data, target)
         self.tx_count += 1
         if sampled:
@@ -3852,15 +4132,28 @@ class BZRWebSocketServer:
             await asyncio.gather(*targets, return_exceptions=True)
 
     async def push_lobby_list(self, ws: Any, msg_type: str = "OnGetLobbyList") -> None:
-        await self.send(ws, msg_type, {"lobbies": self.state.serialize_lobbies()})
+        await self.send(ws, msg_type, self._lobby_list_payload())
+
+    def _lobby_list_payload(self) -> dict[str, Any]:
+        # The official service includes a "totalUsers" counter in list/changed
+        # envelopes (observed live 2026-08-24; the official value can even go
+        # negative via an internal wrap -- we always report the true count).
+        return {
+            "lobbies": self.state.serialize_lobbies(),
+            "totalUsers": len(self.state.sessions_by_user_id),
+        }
 
     async def push_lobby_changed(self, lobby: LobbyState) -> None:
         await self.broadcast_all(
-            "OnLobbyChanged", {"lobbies": {str(lobby.lobby_id): self.state.serialize_lobby(lobby)}}
+            "OnLobbyChanged",
+            {
+                "lobbies": {str(lobby.lobby_id): self.state.serialize_lobby(lobby)},
+                "totalUsers": len(self.state.sessions_by_user_id),
+            },
         )
 
     async def push_full_lobby_list(self) -> None:
-        await self.broadcast_all("OnLobbyListChanged", {"lobbies": self.state.serialize_lobbies()})
+        await self.broadcast_all("OnLobbyListChanged", self._lobby_list_payload())
 
     def _apply_player_data(self, session: UserSession, key: str, value: Any) -> None:
         if key == "name":
@@ -3920,13 +4213,16 @@ class BZRWebSocketServer:
             del lobby.users[session.user_id]
             self.state.mark_dirty()
             self.state.record_stdout_entry("info", f"{session.name} left lobby {lid}")
+            # "member" carries the affected user's server-assigned ID upstream
+            # (official behavior confirmed live 2026-08-24); memberName is our
+            # human-readable addition.
             await self.broadcast_all(
                 "OnLobbyMemberListChanged",
                 {
                     "lobbyId": lid,
                     "id": session.user_id,
-                    "member": session.name,
-                    "memberId": session.user_id,
+                    "member": session.user_id,
+                    "memberName": session.name,
                     "removed": True,
                     "user": self.state.build_user_snapshot(session),
                     "users": {session.user_id: self.state.build_user_snapshot(session)},
@@ -3939,7 +4235,7 @@ class BZRWebSocketServer:
             self.state.mark_dirty()
 
         if not lobby.users:
-            if self.retain_empty_lobbies:
+            if self.retain_empty_lobbies or lobby.persistent:
                 await self.push_lobby_changed(lobby)
             else:
                 del self.state.lobbies[lid]
@@ -3954,7 +4250,14 @@ class BZRWebSocketServer:
 
     async def handle_authorization(self, ws: Any, content: dict[str, Any]) -> None:
         requested_id = str(content.get("id", "")).strip()
-        user_id = requested_id or f"U{uuid.uuid4().hex[:12]}"
+        # Official behavior (live 2026-08-24): web clients send id "0" and the
+        # service ASSIGNS a unique identity (B100xxxx), ignoring the request.
+        # Honor explicit non-placeholder ids from community tooling, but treat
+        # "0"/empty as "assign me an id" so multiple such clients never collide.
+        if requested_id in {"", "0"}:
+            user_id = f"U{uuid.uuid4().hex[:12]}"
+        else:
+            user_id = requested_id
         name = str(content.get("name") or content.get("playerName") or user_id)
 
         if user_id in self.state.sessions_by_user_id:
@@ -4131,13 +4434,57 @@ class BZRWebSocketServer:
         self.state.mark_dirty()
         await self.push_lobby_changed(lobby)
 
-    async def handle_join_lobby(self, session: UserSession, content: dict[str, Any]) -> None:
-        # Client reads reasonCode (numeric) off OnLobbyJoined/OnFailure, not the
-        # human "reason" string. Exact stock enum is not yet known (needs a live
-        # capture), so these codes are provisional but stable and non-zero.
-        requested_lid = content.get("id")
+    async def handle_join_lobby(self, session: UserSession, content: Any) -> None:
+        # Client reads reasonCode (numeric) off OnLobbyJoined/OnFailure.
+        # Live-confirmed official behavior (2026-08-24):
+        #   - content must be an object; scalar content yields
+        #     OnFailure "DoJoinLobby failure bad content data type";
+        #   - stock clients send {"id": <number>, "password": <string>}.
+        # We accept the exact stock shape plus liberal variants (missing or
+        # numeric-typed fields) because community tooling relies on them, but a
+        # non-object/non-scalar content is rejected with the official wording.
+        password = ""
+        if isinstance(content, dict):
+            requested_lid = content.get("id")
+            raw_password = content.get("password", "")
+            password = "" if raw_password is None else str(raw_password)
+        elif isinstance(content, bool):
+            await self.send(
+                session.ws,
+                "OnFailure",
+                {
+                    "type": "OnFailure",
+                    "time": utc_now_str(),
+                    "success": False,
+                    "reason": "DoJoinLobby failure bad content data type",
+                },
+            )
+            return
+        elif isinstance(content, (int, str)):
+            # Official admin page (scripts/bzadmin.js joinLobby) sends a bare id.
+            # The current official service rejects it, but we stay liberal on input.
+            requested_lid = content
+        else:
+            requested_lid = None
+
         if requested_lid is None:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_MISSING_ID, "reason": "Missing lobby id"})
+            if not isinstance(content, dict) or "id" not in content:
+                await self.send(
+                    session.ws,
+                    "OnFailure",
+                    {
+                        "type": "OnFailure",
+                        "time": utc_now_str(),
+                        "success": False,
+                        "reason": "DoJoinLobby failure bad content data type",
+                    },
+                )
+                return
+            await self.send(
+                session.ws,
+                "OnLobbyJoined",
+                {"success": False, "reasonCode": JOIN_FAIL_MISSING_ID, "reason": "Missing lobby id"},
+            )
             return
 
         try:
@@ -4148,15 +4495,37 @@ class BZRWebSocketServer:
 
         lobby = self.state.lobbies.get(lid)
         if not lobby:
-            await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_NOT_FOUND, "reason": "Lobby not found"})
+            # Official wording + confirmed reasonCode 4 (2026-08-24).
+            await self.send(
+                session.ws,
+                "OnLobbyJoined",
+                {
+                    "success": False,
+                    "reasonCode": JOIN_FAIL_NOT_FOUND,
+                    "reason": "Join Lobby Failed, Lobby no longer exists",
+                },
+            )
+            return
+
+        # Live-confirmed upstream (2026-08-25): a member rejoining their current
+        # lobby gets a FAILURE with reasonCode 5, checked BEFORE lock/full.
+        if session.current_lobby_id == lid:
+            await self.send(
+                session.ws,
+                "OnLobbyJoined",
+                {
+                    "success": False,
+                    "reasonCode": JOIN_FAIL_ALREADY_IN,
+                    "reason": "Join Lobby Failed, Trying to join a lobby you're already in",
+                },
+            )
             return
 
         if lobby.is_locked:
             await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_LOCKED, "reason": "Lobby is locked"})
             return
 
-        supplied_password = str(content.get("password", ""))
-        if lobby.password and supplied_password != lobby.password:
+        if lobby.password and password != lobby.password:
             await self.send(session.ws, "OnLobbyJoined", {"success": False, "reasonCode": JOIN_FAIL_BAD_PASSWORD, "reason": "Invalid password"})
             return
 
@@ -4175,13 +4544,21 @@ class BZRWebSocketServer:
             self.state.mark_dirty()
             self.state.record_stdout_entry("info", f"{session.user_id} joined lobby {lid}")
 
+            # Official join sequence observed live 2026-08-24 (for the joiner):
+            #   OnLobbyChanged(full snapshot incl. joiner)
+            #   -> OnLobbyMemberListChanged {member: <userId>, lobbyId, removed:false}
+            #   -> OnLobbyJoined {success:true, reasonCode:0}
+            #   -> OnLobbyChanged + OnLobbyDataChanged metadata sync pair.
+            # "member" carries the affected user's server-assigned ID upstream;
+            # memberName is our human-readable addition for community tooling.
+            await self.push_lobby_changed(lobby)
             await self.broadcast_all(
                 "OnLobbyMemberListChanged",
                 {
                     "lobbyId": lid,
                     "id": session.user_id,
-                    "member": session.name,
-                    "memberId": session.user_id,
+                    "member": session.user_id,
+                    "memberName": session.name,
                     "removed": False,
                     "user": self.state.build_user_snapshot(session),
                     "users": {session.user_id: self.state.build_user_snapshot(session)},
@@ -4195,6 +4572,10 @@ class BZRWebSocketServer:
             {
                 "success": True,
                 "reasonCode": REASON_OK,
+                # Upstream acks are FLAT (raw paired pcaps 2026-03-21 + live
+                # 2026-08-24). The nested lobby/lobbies snapshots below are a
+                # community superset; the stock dispatcher tolerates extras.
+                "reason": "",
                 "id": lid,
                 "lobbyId": lid,
                 "time": utc_now_str(),
@@ -4202,7 +4583,17 @@ class BZRWebSocketServer:
                 "lobbies": {str(lid): lobby_blob},
             },
         )
-        await self.push_lobby_changed(lobby)
+        if session.current_lobby_id == lid and lobby:
+            await self.push_lobby_changed(lobby)
+            await self.broadcast_all(
+                "OnLobbyDataChanged",
+                {
+                    "type": "OnLobbyDataChanged",
+                    "time": utc_now_str(),
+                    "success": True,
+                    "changedLobby": lid,
+                },
+            )
         await self.push_full_lobby_list()
 
     async def handle_update_wan(self, session: UserSession, content: Any) -> None:
@@ -4437,7 +4828,19 @@ class BZRWebSocketServer:
         try:
             envelope = json.loads(raw_message)
         except json.JSONDecodeError:
-            await self.send_error(ws, "Invalid JSON")
+            # Live-verified upstream (2026-08-25): malformed JSON yields
+            # OnFailure 'Invalid Message Data : <raw>' and the connection
+            # stays usable. Mirror the wording; cap echoed length for safety.
+            await self.send(
+                ws,
+                "OnFailure",
+                {
+                    "type": "OnFailure",
+                    "time": utc_now_str(),
+                    "success": False,
+                    "reason": f"Invalid Message Data : {raw_message[:1000]}",
+                },
+            )
             return
 
         if not isinstance(envelope, dict):
@@ -4492,7 +4895,7 @@ class BZRWebSocketServer:
             return
 
         if msg_type == "DoJoinLobby":
-            await self.handle_join_lobby(session, content if isinstance(content, dict) else {})
+            await self.handle_join_lobby(session, content)
             return
 
         if msg_type == "DoExitLobby":
@@ -4501,8 +4904,9 @@ class BZRWebSocketServer:
             return
 
         if msg_type == "DoExitLounge":
+            # Upstream parity (2026-08-25 evidence): the lounge exit is a
+            # SILENT state transition - no response frame is sent.
             session.in_lounge = False
-            await self.send(ws, "OnDoExitLounge", {"success": True, "time": utc_now_str()})
             return
 
         if msg_type == "DoSendChat":
@@ -4533,13 +4937,17 @@ class BZRWebSocketServer:
                 key = str(content.get("key", "")).strip()
                 if key:
                     lobby = self.state.lobbies[lid]
-                    lobby.metadata.pop(key, None)
-                    self.state.mark_dirty()
-                    await self.broadcast_all(
-                        "OnLobbyDataChanged",
-                        self._build_lobby_data_payload(lobby, key=key, deleted=True),
-                    )
-                    await self.push_lobby_changed(lobby)
+                    # Upstream parity (2026-08-25 evidence): deleting a
+                    # key that does not exist is silently ignored - no
+                    # state mutation, no dirty flag, no broadcast.
+                    if key in lobby.metadata:
+                        lobby.metadata.pop(key, None)
+                        self.state.mark_dirty()
+                        await self.broadcast_all(
+                            "OnLobbyDataChanged",
+                            self._build_lobby_data_payload(lobby, key=key, deleted=True),
+                        )
+                        await self.push_lobby_changed(lobby)
             return
 
         if msg_type == "LockLobby":
@@ -4756,8 +5164,11 @@ class BZRWebSocketServer:
             )
             return
 
-        # Keep unknown messages non-fatal for compatibility.
-        await self.send_stdout(ws, "info", f"Unhandled message type: {msg_type}")
+        # Upstream parity (2026-08-25 evidence): unknown verbs are silently
+        # ignored. Keep them non-fatal and server-side only - the previous
+        # OnStdoutLogEntry reply was a client-visible protocol message the
+        # real server never emits.
+        self.log.info("Unhandled message type: %s", msg_type)
 
     async def unregister(self, ws: Any) -> None:
         session = self.state.sessions_by_ws.pop(ws, None)
@@ -4984,13 +5395,27 @@ async def run_server(args: argparse.Namespace) -> None:
         admin_ids=admin_ids,
     )
     state.load_state()
+    state.ensure_default_lobby()
 
     relay_protocol: BZRRelayProtocol | None = None
     if not args.disable_relay and args.relay_port > 0:
+        fault_injector: RelayFaultInjector | None = None
+        trace_writer: RelayTraceWriter | None = None
+        if args.fault_inject:
+            fault_injector = RelayFaultInjector(args.fault_inject)
+            logger.warning(
+                "FAULT-INJECTION ENABLED (%s) -- diagnostics only; never run in normal service",
+                args.fault_inject,
+            )
+        if args.relay_trace:
+            trace_writer = RelayTraceWriter(args.relay_trace, run_id=uuid.uuid4().hex[:12])
+            logger.info("Relay forensic trace writing to %s", args.relay_trace)
         relay_protocol = BZRRelayProtocol(
             logger.getChild("relay"),
             state,
             route_ttl_seconds=args.relay_route_ttl_seconds,
+            fault_injector=fault_injector,
+            trace_writer=trace_writer,
         )
         state.relay_requested = True
     else:
@@ -5098,6 +5523,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP relay port, 0 to disable (default: {DEFAULT_RELAY_PORT})")
     parser.add_argument("--relay-route-ttl-seconds", type=int, default=DEFAULT_RELAY_ROUTE_TTL_SECONDS, help="Inactive relay route expiration interval")
     parser.add_argument("--disable-relay", action="store_true", help="Disable the community UDP relay transport")
+    parser.add_argument(
+        "--fault-inject",
+        default=os.getenv("BZRNET_FAULT_INJECT", ""),
+        help=(
+            "Phase-2 relay impairment, DEFAULT OFF. Format: drop_reliable_midfrag:k=N "
+            "(drops the Nth bare-0x80 reliable non-final fragment per directed peer stream). "
+            "Instrumentation only; never enable in normal service."
+        ),
+    )
+    parser.add_argument(
+        "--relay-trace",
+        default=os.getenv("BZRNET_RELAY_TRACE", ""),
+        help="Optional JSONL forensic trace of routed relay datagrams (transport envelope fields only; local-only output)",
+    )
     parser.add_argument("--health-host", default=DEFAULT_HEALTH_HOST, help=f"Health HTTP bind host (default: {DEFAULT_HEALTH_HOST})")
     parser.add_argument("--health-port", type=int, default=DEFAULT_HEALTH_PORT, help=f"Health HTTP bind port, 0 to disable (default: {DEFAULT_HEALTH_PORT})")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"Path to persistent state JSON (default: {DEFAULT_STATE_FILE})")
