@@ -4098,6 +4098,12 @@ class BZRWebSocketServer:
     async def send_error(self, ws: Any, message: str) -> None:
         await self.send_stdout(ws, "error", message)
 
+    async def _close_quietly(self, ws: Any, code: int) -> None:
+        try:
+            await ws.close(code=code)
+        except Exception:
+            pass
+
     async def broadcast_all(self, msg_type: str, data: Any) -> None:
         if not self.state.sessions_by_ws:
             return
@@ -4249,12 +4255,46 @@ class BZRWebSocketServer:
         await self.push_full_lobby_list()
 
     async def handle_authorization(self, ws: Any, content: dict[str, Any]) -> None:
+        authtype = str(content.get("authtype", "") or "").strip()
+        if not authtype:
+            # Upstream parity (2026-08-25 evidence): missing authtype closes
+            # the socket (4002) with no message frame.
+            await self._close_quietly(ws, 4002)
+            return
+        if authtype.lower() == "steam" and not any(
+            str(content.get(key, "") or "").strip()
+            for key in ("steamAppTicket", "authTicket", "platformTicket")
+        ):
+            # Upstream parity (2026-08-25 evidence): steam without a ticket
+            # yields OnAuthorization success:false, then close 4002. Only the
+            # success+id shape is captured upstream; no reason string is
+            # asserted here.
+            requested = str(content.get("id", "") or "")
+            await self.send(
+                ws,
+                "OnAuthorization",
+                {
+                    "type": "OnAuthorization",
+                    "time": utc_now_str(),
+                    "success": False,
+                    "id": requested,
+                },
+            )
+            await self._close_quietly(ws, 4002)
+            return
         requested_id = str(content.get("id", "")).strip()
+        if authtype.lower() == "gog":
+            # Upstream parity (2026-08-25 evidence): gog without a ticket is
+            # ACCEPTED and the client-supplied id is echoed back unassigned.
+            # Honor it verbatim instead of minting a replacement. (On a
+            # verbatim-id collision the pre-existing uniqueness suffix below
+            # still applies; that case has no upstream evidence.)
+            user_id = requested_id
         # Official behavior (live 2026-08-24): web clients send id "0" and the
         # service ASSIGNS a unique identity (B100xxxx), ignoring the request.
         # Honor explicit non-placeholder ids from community tooling, but treat
         # "0"/empty as "assign me an id" so multiple such clients never collide.
-        if requested_id in {"", "0"}:
+        elif requested_id in {"", "0"}:
             user_id = f"U{uuid.uuid4().hex[:12]}"
         else:
             user_id = requested_id
@@ -4268,7 +4308,7 @@ class BZRWebSocketServer:
             user_id=user_id,
             name=name,
             player_name=str(content.get("playerName") or name),
-            authtype=str(content.get("authtype", "web")),
+            authtype=authtype,
             client_version=str(content.get("clientVersion", "2.2.301")),
             key=str(content.get("key", "")),
             lan_addresses=[str(x) for x in content.get("lanAddresses", []) if isinstance(x, str)],
@@ -4867,12 +4907,19 @@ class BZRWebSocketServer:
         )
 
         if msg_type == "Authorization":
+            # Upstream parity (2026-08-25 evidence): a second Authorization
+            # on an already-bound socket is silently ignored; re-auth does
+            # not rebind identity.
+            if ws in self.state.sessions_by_ws:
+                return
             await self.handle_authorization(ws, content if isinstance(content, dict) else {})
             return
 
         session = self.state.sessions_by_ws.get(ws)
         if not session:
-            await self.send_error(ws, "Authorization required")
+            # Upstream parity (2026-08-25 evidence): pre-auth verbs are
+            # silently ignored - no error frame is sent. (Older community
+            # behavior replied "Authorization required"; removed for parity.)
             return
 
         if msg_type == "DoEnterLounge":
@@ -5194,7 +5241,11 @@ class BZRWebSocketServer:
                         msg_type="binary",
                         payload=message,
                     )
-                    await self.send_error(ws, "Binary messages are not supported")
+                    # NOTE: upstream rejects binary frames with the
+                    # 'Binary Payload not supported' wording (2026-08-25
+                    # evidence); the OnStdoutLogEntry envelope is the community
+                    # transport for that rejection and is unchanged here.
+                    await self.send_error(ws, "Binary Payload not supported")
                     continue
                 await self.route_message(ws, message)
         except ConnectionClosed:
