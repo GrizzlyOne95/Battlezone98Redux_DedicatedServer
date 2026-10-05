@@ -3074,9 +3074,10 @@ class ServerState:
             snapshot["ipAddress"] = s.wan_address.split(":")[0]
         if s.lan_addresses:
             snapshot["lanAddresses"] = list(s.lan_addresses)
-        if s.extra_data:
-            snapshot["metadata"] = dict(s.extra_data)
-            snapshot.update(s.extra_data)
+        # Per-player game values (ready, team, miniid, vehicle, launched, ...)
+        # live only under "metadata" as strings; the official server does not
+        # flatten them onto the user record.
+        snapshot["metadata"] = {k: "" if v is None else str(v) for k, v in s.extra_data.items()}
         return snapshot
 
     def serialize_lobby(self, lobby: LobbyState) -> dict[str, Any]:
@@ -4002,21 +4003,16 @@ class BZRWebSocketServer:
                     return str(value).strip()
         return ""
 
-    def _build_user_change_payload(self, session: UserSession, key: str, value: Any) -> dict[str, Any]:
-        snapshot = self.state.build_user_snapshot(session)
+    def _build_user_change_payload(self, session: UserSession) -> dict[str, Any]:
+        # Official OnUserDataChanged carries only member (the user id) and
+        # lobbyId; the client then re-reads member data from the lobby's
+        # users[id].metadata. A display name here misses the member lookup.
         return {
             "type": "OnUserDataChanged",
             "time": utc_now_str(),
             "success": True,
-            "id": session.user_id,
-            "userId": session.user_id,
-            "member": session.name,
-            "memberName": session.name,
-            "key": key,
-            "value": value,
-            "changedLobby": session.current_lobby_id,
-            "user": snapshot,
-            "users": {session.user_id: snapshot},
+            "member": session.user_id,
+            "lobbyId": -1 if session.current_lobby_id is None else session.current_lobby_id,
         }
 
     def _build_lobby_data_payload(
@@ -4454,9 +4450,14 @@ class BZRWebSocketServer:
         self.state.mark_dirty()
         self.state.record_stdout_entry("info", f"Created lobby {lid} owner={session.user_id} name={name}")
 
-        await self.send(session.ws, "OnLobbyCreated", {"success": True, "id": lid, "time": utc_now_str()})
+        # The stock client populates its lobby view from its cached lobby data
+        # as soon as OnLobbyCreated arrives (CNetGameLobby::PopulateLobbyFromData,
+        # GOG 0x00743F40). Without a cached "name" it shows "Loading Room..." and
+        # the host's staging screen never finishes loading, so the snapshot must
+        # reach the creator first.
         await self.push_lobby_changed(lobby)
         await self.push_full_lobby_list()
+        await self.send(session.ws, "OnLobbyCreated", {"success": True, "id": lid, "time": utc_now_str()})
 
     async def handle_create_game(self, session: UserSession, content: dict[str, Any]) -> None:
         payload = dict(content)
@@ -4966,12 +4967,23 @@ class BZRWebSocketServer:
                 if key:
                     self._apply_player_data(session, key, content.get("value"))
                     self.state.mark_dirty()
-                    await self.broadcast_all(
-                        "OnUserDataChanged",
-                        self._build_user_change_payload(session, key, content.get("value")),
-                    )
-                    if session.current_lobby_id and session.current_lobby_id in self.state.lobbies:
-                        await self.push_lobby_changed(self.state.lobbies[session.current_lobby_id])
+                    # Official order: OnLobbyChanged, OnUserDataChanged,
+                    # OnLobbyChanged, OnLobbyDataChanged{changedLobby}.
+                    lobby = self.state.lobbies.get(session.current_lobby_id) if session.current_lobby_id else None
+                    if lobby:
+                        await self.push_lobby_changed(lobby)
+                    await self.broadcast_all("OnUserDataChanged", self._build_user_change_payload(session))
+                    if lobby:
+                        await self.push_lobby_changed(lobby)
+                        await self.broadcast_all(
+                            "OnLobbyDataChanged",
+                            {
+                                "type": "OnLobbyDataChanged",
+                                "time": utc_now_str(),
+                                "success": True,
+                                "changedLobby": lobby.lobby_id,
+                            },
+                        )
             return
 
         if msg_type == "SetLobbyData":
