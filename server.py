@@ -3162,7 +3162,7 @@ class ServerState:
     def mark_dirty(self) -> None:
         self._dirty = True
 
-    def load_state(self) -> None:
+    def load_state(self, retain_empty_lobbies: bool = False) -> None:
         if not self.state_file:
             return
         if not self.state_file.exists():
@@ -3192,6 +3192,7 @@ class ServerState:
             self.relay_requested = bool(payload.get("relayRequested", self.relay_requested))
             self.test_mode = bool(payload.get("testMode", self.test_mode))
             self.lobbies = {}
+            dropped = 0
             for raw_lobby in payload.get("lobbies", []):
                 try:
                     lid = int(raw_lobby.get("id"))
@@ -3211,12 +3212,22 @@ class ServerState:
                     users={},
                     persistent=bool(raw_lobby.get("persistent", False)),
                 )
+                # Members are never restored, and empty-lobby removal only runs
+                # when a member leaves, so a restored game lobby would linger
+                # forever (e.g. a stale full "2/2" game shadowing a new one of
+                # the same name). Drop it unless empty lobbies are retained.
+                if not (lobby.persistent or retain_empty_lobbies):
+                    dropped += 1
+                    continue
                 self.lobbies[lid] = lobby
 
             self._dirty = False
+            if dropped:
+                self.mark_dirty()
             self.log.info(
-                "Loaded state: %d lobbies, nextLobbyId=%d from %s",
+                "Loaded state: %d lobbies (%d memberless non-persistent dropped), nextLobbyId=%d from %s",
                 len(self.lobbies),
+                dropped,
                 self.next_lobby_id,
                 self.state_file,
             )
@@ -5457,7 +5468,7 @@ async def run_server(args: argparse.Namespace) -> None:
         admin_key=admin_key,
         admin_ids=admin_ids,
     )
-    state.load_state()
+    state.load_state(retain_empty_lobbies=args.retain_empty_lobbies)
     state.ensure_default_lobby()
 
     relay_protocol: BZRRelayProtocol | None = None
