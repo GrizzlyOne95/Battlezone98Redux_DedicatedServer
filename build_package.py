@@ -37,7 +37,11 @@ Battlezone 98 Redux Dedicated Server
 Double-click BZRServerGUI.exe, check the settings, and press Start.
 Keep BZRServerGUI.exe and BZRServer.exe in the same folder.
 
-Players connect to the address shown under "Players connect to".
+Players point their game at this PC with the launch option shown in the
+window (Copy option), for example:
+    /bzrserver=ws://192.168.0.44:1337/
+Type it in full (ws://, port and trailing /); a bare IP does not work.
+Remove it to go back to the official servers.
 Ports: TCP 1337 (lobby), UDP 1338 (handshake), UDP 1339 (relay).
 Windows will ask to allow BZRServer.exe through the firewall the first
 time; allow it on Private networks. See LAN_COOP.md for setting up the
