@@ -35,20 +35,35 @@ this server.
 
 ## Every PC (the server PC too, if someone plays on it)
 
-1. Install OpenShim **v1.0.0.9 or newer**.
-2. In the game folder, edit `net.ini`. Under `[OpenShimSocket]`, set:
+1. Point the game at the server. Pick one:
 
-   ```
-   MatchmakingRedirectAddress=192.168.0.44
-   ```
+   - **Launch option (stock game, no mods needed).** Add this to the game's launch options, using
+     the server's LAN IP:
 
-   Enter the IP only. Ports are fixed, and any value containing `/` is ignored. Use the LAN IP on
-   the server PC as well, not `127.0.0.1`.
-3. Every PC must run the **same build** of each mod in use. For CR, copy the server PC's
+     ```
+     /bzrserver=ws://192.168.0.44:1337/
+     ```
+
+     Steam: right-click the game > Properties > Launch Options. GOG Galaxy: game > Manage
+     installation > Configure > Additional executables, or a desktop shortcut whose target ends
+     with the option. Type it exactly, including `ws://`, the port, and the closing `/`: a bare
+     `/bzrserver=192.168.0.44` connects to nothing. The server launcher shows the line ready to copy.
+     The game sends its UDP handshake to the same IP on the lobby port + 1 (1338), so keep the
+     server's default ports.
+   - **OpenShim v1.0.0.9 or newer.** In the game folder, edit `net.ini`. Under `[OpenShimSocket]`, set:
+
+     ```
+     MatchmakingRedirectAddress=192.168.0.44
+     ```
+
+     Enter the IP only. Ports are fixed, and any value containing `/` is ignored.
+
+   Use the LAN IP on the server PC as well, not `127.0.0.1`.
+2. Every PC must run the **same build** of each mod in use. For CR, copy the server PC's
    `mods\3686673790` folder to each PC: `<game>\mods\3686673790` on GOG, or
    `steamapps\workshop\content\301650\3686673790` on Steam. If the files differ, you get map or mod
    mismatches or desyncs.
-4. Launch the game normally. GOG copies work with or without Galaxy. Steam copies need Steam running,
+3. Launch the game. GOG copies work with or without Galaxy. Steam copies need Steam running,
    because a Steam login without a ticket is rejected.
 
 ## Playing
@@ -59,13 +74,14 @@ this server.
 3. The host clicks **Launch** once everyone is in. CR co-op missions need everyone to start
    together: a player who joins late means restarting the mission.
 
-To go back to official online play, clear the value: `MatchmakingRedirectAddress=`.
+To go back to official online play, remove the `/bzrserver=` launch option, or clear
+`MatchmakingRedirectAddress=` in `net.ini`.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
-| Lobby list empty or "connection failed" | The server is running; the IP in `net.ini` is right; the network is Private; `Test-NetConnection 192.168.0.44 -Port 1337` from the client PC succeeds |
+| Lobby list empty or "connection failed" | The server is running; the IP in the launch option or `net.ini` is right (launch option needs the full `ws://IP:1337/`); the network is Private; `Test-NetConnection 192.168.0.44 -Port 1337` from the client PC succeeds |
 | Old full game with the same name listed | Restart the server (memberless game lobbies are dropped on load) |
 | Stuck in the lobby after Launch, or desync | UDP 1338-1339 is blocked, or mod files differ between PCs |
-| Disconnected right at login | The client is still pointed at the official servers (`net.ini` not saved, or an old OpenShim) |
+| Disconnected right at login | The client is still pointed at the official servers (launch option missing, `net.ini` not saved, or an old OpenShim) |

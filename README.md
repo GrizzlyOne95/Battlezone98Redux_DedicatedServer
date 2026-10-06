@@ -181,12 +181,12 @@ admin surface as well.
 Use these launch flags:
 
 ```bash
-battlezone98redux.exe /netpktlog /netlog=3 /bzrnetlog=3 /bzrserver=127.0.0.1 /bzrnetport=1338
+battlezone98redux.exe /netpktlog /netlog=3 /bzrnetlog=3 /bzrserver=ws://127.0.0.1:1337/
 ```
 
 Notes:
 
-*   The game binary also contains a hardcoded WebSocket URL for BZRNet (`...:1337`), so DNS/hosts override may be needed for full end-to-end local redirection.
+*   `/bzrserver=` replaces the stock lobby URL verbatim, so it must be a full `ws://host:port/` URL; a bare IP fails to connect. The client sends its UDP probe to the same host on the lobby port + 1 and uses the relay port the server advertises. Verified end to end on the GOG exe (2026-10-05).
 *   UDP `1338` performs the capture-confirmed public endpoint probe.
 *   UDP `1339` now forwards WS-associated peer-pair datagrams byte-for-byte; it does not deserialize `7a75`, `0x5f`, or other gameplay payloads.
 *   The official `1339` association/allocation envelope is still unrecovered. The community relay intentionally drops ambiguous multi-target mappings, so strict/symmetric-NAT parity remains a live validation target.

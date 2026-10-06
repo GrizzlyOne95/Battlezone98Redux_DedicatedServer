@@ -111,6 +111,8 @@ class ServerGUI:
         self.cfg.update(self.load_config())
         self.vars: dict[str, tk.Variable] = {}
         self.build_ui()
+        for key in ("ws_port", "udp_port", "bind"):
+            self.vars[key].trace_add("write", lambda *_: self.update_switch())
         self.refresh_buttons()
 
         threading.Thread(target=self.poll_loop, name="poll", daemon=True).start()
@@ -262,7 +264,13 @@ class ServerGUI:
         lan.pack(fill="x", pady=(8, 0))
         self.lan_var = tk.StringVar()
         ttk.Label(lan, textvariable=self.lan_var, justify="left").pack(anchor="w")
-        ttk.Button(lan, text="Copy", command=self.copy_lan).pack(anchor="w", pady=(4, 0))
+        ttk.Button(lan, text="Copy IP", command=self.copy_lan).pack(anchor="w", pady=(4, 0))
+        ttk.Label(lan, text="Game launch option:").pack(anchor="w", pady=(8, 0))
+        self.switch_var = tk.StringVar()
+        ttk.Entry(lan, textvariable=self.switch_var, state="readonly", width=34).pack(anchor="w", fill="x")
+        ttk.Button(lan, text="Copy option", command=self.copy_switch).pack(anchor="w", pady=(4, 0))
+        self.port_warn = ttk.Label(lan, foreground="#b80", wraplength=260, justify="left")
+        self.port_warn.pack(anchor="w")
         self.update_lan()
 
         # Bottom: tabs.
@@ -477,12 +485,35 @@ class ServerGUI:
         else:
             addrs = lan_addresses()
             self.lan_var.set("\n".join(addrs) if addrs else "no LAN address found")
+        self.update_switch()
         self.root.after(15000, self.update_lan)
 
+    def update_switch(self) -> None:
+        # Stock clients take the full lobby URL via /bzrserver= and send the UDP
+        # handshake to the same host on lobby port + 1, so those two must line up.
+        ip = self.first_lan()
+        try:
+            ws, udp = int(self.vars["ws_port"].get()), int(self.vars["udp_port"].get())
+        except (tk.TclError, ValueError):
+            return
+        self.switch_var.set(f"/bzrserver=ws://{ip or '<server-ip>'}:{ws}/")
+        self.port_warn.configure(
+            text="" if udp == ws + 1 else f"Handshake UDP must be lobby port + 1 ({ws + 1}) for game clients."
+        )
+
+    def first_lan(self) -> str:
+        text = self.lan_var.get()
+        first = text.splitlines()[0].split()[0] if text else ""
+        return first if first[:1].isdigit() else ""
+
     def copy_lan(self) -> None:
-        first = self.lan_var.get().splitlines()[0].split()[0] if self.lan_var.get() else ""
         self.root.clipboard_clear()
-        self.root.clipboard_append(first)
+        self.root.clipboard_append(self.first_lan())
+
+    def copy_switch(self) -> None:
+        self.update_switch()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.switch_var.get())
 
     def clear_log(self) -> None:
         self.log_text.configure(state="normal")
