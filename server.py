@@ -3022,6 +3022,195 @@ class LobbyState:
     persistent: bool = False
 
 
+ACCESS_MODES = ("open", "approve", "allowlist")
+
+
+class AccessControl:
+    """Operator admission control for stock clients (layer 1, not cryptographic).
+
+    Stock clients only present a claimed id (Steam tickets cannot be validated
+    without Rebellion's publisher key; GOG sends none), so this keys on that id
+    plus the connecting IP. It keeps strangers out of a friends server; it does
+    not stop someone who knows an approved player's public Steam id, which is
+    what IP pinning narrows.
+    """
+
+    PENDING_TTL_SECONDS = 600
+
+    def __init__(self, logger: logging.Logger, on_change: Any) -> None:
+        self.log = logger
+        self._on_change = on_change
+        self.mode = "open"
+        self.pin_ips = False
+        self.approval_wait_seconds = 30
+        self.rate_limit_per_minute = 20
+        self.approved: dict[str, dict[str, Any]] = {}
+        self.banned_ids: dict[str, dict[str, Any]] = {}
+        self.banned_ips: dict[str, dict[str, Any]] = {}
+        # Runtime only: players waiting for a decision.
+        self.pending: dict[str, dict[str, Any]] = {}
+        self._attempts: dict[str, list[float]] = {}
+        self.denied_total = 0
+
+    # ---- persistence ----
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "pinIps": self.pin_ips,
+            "approved": self.approved,
+            "bannedIds": self.banned_ids,
+            "bannedIps": self.banned_ips,
+        }
+
+    def load_payload(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        mode = str(payload.get("mode", self.mode))
+        self.mode = mode if mode in ACCESS_MODES else "open"
+        self.pin_ips = bool(payload.get("pinIps", self.pin_ips))
+        for attr, key in (("approved", "approved"), ("banned_ids", "bannedIds"), ("banned_ips", "bannedIps")):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                setattr(self, attr, {str(k): dict(v) if isinstance(v, dict) else {} for k, v in value.items()})
+
+    def _changed(self) -> None:
+        self._on_change()
+
+    # ---- decisions ----
+    def rate_limited(self, ip: str) -> bool:
+        if self.rate_limit_per_minute <= 0 or not ip:
+            return False
+        now = time.monotonic()
+        window = [t for t in self._attempts.get(ip, []) if now - t < 60]
+        window.append(now)
+        self._attempts[ip] = window
+        return len(window) > self.rate_limit_per_minute
+
+    def decide(self, user_id: str, ip: str) -> tuple[str, str]:
+        """Return ("allow" | "pending" | "deny", reason)."""
+        if user_id in self.banned_ids:
+            return "deny", "banned id"
+        if ip and ip in self.banned_ips:
+            return "deny", "banned ip"
+        if self.mode == "open":
+            return "allow", "open"
+        entry = self.approved.get(user_id)
+        if entry is not None:
+            known_ips = entry.get("ips") or []
+            if not (self.pin_ips and known_ips and ip not in known_ips):
+                return "allow", "approved"
+            reason = "approved id from a new ip"
+        else:
+            reason = "not approved"
+        if self.mode == "approve":
+            return "pending", reason
+        return "deny", reason
+
+    def note_seen(self, user_id: str, ip: str, name: str) -> None:
+        entry = self.approved.get(user_id)
+        if entry is None:
+            return
+        entry["lastSeen"] = utc_now_str()
+        if name:
+            entry["name"] = name
+        ips = entry.setdefault("ips", [])
+        if ip and ip not in ips and not self.pin_ips:
+            ips.append(ip)
+            del ips[:-8]
+        self._changed()
+
+    # ---- pending ----
+    def add_pending(self, user_id: str, name: str, ip: str, reason: str) -> asyncio.Future:
+        self._expire_pending()
+        old = self.pending.get(user_id)
+        if old and not old["future"].done():
+            old["future"].set_result(False)
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.pending[user_id] = {
+            "id": user_id, "name": name, "ip": ip, "reason": reason,
+            "since": utc_now_str(), "monotonic": time.monotonic(), "future": fut,
+        }
+        self.log.info("Access: %s (%s) from %s waiting for approval (%s)", user_id, name, ip, reason)
+        return fut
+
+    def _expire_pending(self) -> None:
+        now = time.monotonic()
+        for uid in [u for u, p in self.pending.items() if now - p["monotonic"] > self.PENDING_TTL_SECONDS]:
+            self.pending.pop(uid, None)
+
+    # ---- operator actions ----
+    def approve(self, user_id: str, name: str = "", ip: str = "") -> None:
+        pend = self.pending.pop(user_id, None)
+        if pend:
+            name = name or pend["name"]
+            ip = ip or pend["ip"]
+        entry = self.approved.setdefault(user_id, {"name": name, "ips": [], "approvedAt": utc_now_str()})
+        if name:
+            entry["name"] = name
+        if ip and ip not in entry.setdefault("ips", []):
+            entry["ips"].append(ip)
+        if pend and not pend["future"].done():
+            pend["future"].set_result(True)
+        self.log.info("Access: approved %s (%s)", user_id, entry.get("name", ""))
+        self._changed()
+
+    def deny(self, user_id: str) -> None:
+        pend = self.pending.pop(user_id, None)
+        if pend and not pend["future"].done():
+            pend["future"].set_result(False)
+
+    def remove_approved(self, user_id: str) -> None:
+        if self.approved.pop(user_id, None) is not None:
+            self._changed()
+
+    def ban(self, user_id: str = "", ip: str = "", name: str = "", reason: str = "") -> None:
+        stamp = {"name": name, "reason": reason, "at": utc_now_str()}
+        if user_id:
+            self.banned_ids[user_id] = dict(stamp)
+            self.approved.pop(user_id, None)
+            self.deny(user_id)
+        if ip:
+            self.banned_ips[ip] = dict(stamp)
+        self.log.info("Access: banned id=%s ip=%s", user_id or "-", ip or "-")
+        self._changed()
+
+    def unban(self, user_id: str = "", ip: str = "") -> None:
+        if user_id:
+            self.banned_ids.pop(user_id, None)
+        if ip:
+            self.banned_ips.pop(ip, None)
+        self._changed()
+
+    def set_mode(self, mode: str | None = None, pin_ips: bool | None = None) -> None:
+        if mode is not None:
+            if mode not in ACCESS_MODES:
+                raise ValueError(f"mode must be one of {', '.join(ACCESS_MODES)}")
+            self.mode = mode
+            if mode == "open":
+                for uid in list(self.pending):
+                    self.approve(uid)  # going open admits whoever was waiting
+        if pin_ips is not None:
+            self.pin_ips = bool(pin_ips)
+        self._changed()
+
+    def snapshot(self) -> dict[str, Any]:
+        self._expire_pending()
+        return {
+            "mode": self.mode,
+            "pinIps": self.pin_ips,
+            "approvalWaitSeconds": self.approval_wait_seconds,
+            "pending": [
+                {k: v for k, v in p.items() if k not in ("future", "monotonic")}
+                | {"waiting": not p["future"].done()}
+                for p in self.pending.values()
+            ],
+            "approved": [{"id": k, **v} for k, v in sorted(self.approved.items())],
+            "bannedIds": [{"id": k, **v} for k, v in sorted(self.banned_ids.items())],
+            "bannedIps": [{"ip": k, **v} for k, v in sorted(self.banned_ips.items())],
+            "deniedTotal": self.denied_total,
+        }
+
+
 class ServerState:
     def __init__(
         self,
@@ -3043,6 +3232,7 @@ class ServerState:
         self.log_level_setting = 1
         self.relay_requested = False
         self.test_mode = False
+        self.access = AccessControl(logger.getChild("access"), self.mark_dirty)
         self.stdout_history: list[str] = []
         self.protocol_history: list[dict[str, Any]] = []
         self._dirty = False
@@ -3125,6 +3315,8 @@ class ServerState:
             "testMode": self.test_mode,
             "logLevelSetting": self.log_level_setting,
             "stateDirty": self._dirty,
+            "accessMode": self.access.mode,
+            "accessPending": sum(1 for p in self.access.pending.values() if not p["future"].done()),
         }
 
     def record_stdout_entry(self, level: str, message: str) -> str:
@@ -3191,6 +3383,7 @@ class ServerState:
             self.log_level_setting = int(payload.get("logLevelSetting", self.log_level_setting))
             self.relay_requested = bool(payload.get("relayRequested", self.relay_requested))
             self.test_mode = bool(payload.get("testMode", self.test_mode))
+            self.access.load_payload(payload.get("access"))
             self.lobbies = {}
             dropped = 0
             for raw_lobby in payload.get("lobbies", []):
@@ -3302,6 +3495,7 @@ class ServerState:
             "logLevelSetting": self.log_level_setting,
             "relayRequested": self.relay_requested,
             "testMode": self.test_mode,
+            "access": self.access.to_payload(),
             "lobbies": persisted_lobbies,
         }
 
@@ -4105,6 +4299,96 @@ class BZRWebSocketServer:
     async def send_error(self, ws: Any, message: str) -> None:
         await self.send_stdout(ws, "error", message)
 
+    @staticmethod
+    def _ws_ip(ws: Any) -> str:
+        peer = getattr(ws, "remote_address", None)
+        return str(peer[0]) if isinstance(peer, tuple) and peer else ""
+
+    async def _refuse_auth(self, ws: Any, user_id: str, reason: str) -> None:
+        # Same shape as the upstream steam-without-ticket refusal: the client
+        # shows a failed login and retries the websocket on its own timer.
+        self.state.access.denied_total += 1
+        self.state.record_stdout_entry("warn", f"Access refused {user_id} from {self._ws_ip(ws)}: {reason}")
+        await self.send(ws, "OnAuthorization", {"type": "OnAuthorization", "time": utc_now_str(), "success": False, "id": user_id})
+        await self._close_quietly(ws, 4002)
+
+    async def _admit(self, ws: Any, user_id: str, name: str, key: str) -> bool:
+        access = self.state.access
+        ip = self._ws_ip(ws)
+        if access.rate_limited(ip):
+            await self._refuse_auth(ws, user_id, "too many login attempts")
+            return False
+        if self.state.admin_key and key == self.state.admin_key:
+            return True
+        verdict, reason = access.decide(user_id, ip)
+        if verdict == "pending":
+            fut = access.add_pending(user_id, name, ip, reason)
+            self.state.record_stdout_entry("info", f"Access pending {user_id} ({name}) from {ip}: {reason}")
+            try:
+                approved = await asyncio.wait_for(asyncio.shield(fut), timeout=access.approval_wait_seconds)
+            except asyncio.TimeoutError:
+                # Stays in the pending list; approving later lets the client's
+                # next automatic retry straight in.
+                await self._refuse_auth(ws, user_id, "approval timed out")
+                return False
+            if not approved:
+                await self._refuse_auth(ws, user_id, "denied")
+                return False
+            verdict = "allow"
+        if verdict != "allow":
+            await self._refuse_auth(ws, user_id, reason)
+            return False
+        access.note_seen(user_id, ip, name)
+        return True
+
+    async def kick_user(self, user_id: str) -> bool:
+        session = self.state.sessions_by_user_id.get(user_id)
+        if session is None or session.ws is None:
+            return False
+        self.state.record_stdout_entry("warn", f"Kicked {user_id} ({session.name})")
+        # Do not hold the operator's request on the client's close handshake.
+        asyncio.create_task(self._close_quietly(session.ws, 4002))
+        return True
+
+    async def handle_access_action(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Operator actions from the local launcher (POST /access)."""
+        access = self.state.access
+        action = str(body.get("action", ""))
+        uid = str(body.get("id", "") or "").strip()
+        ip = str(body.get("ip", "") or "").strip()
+        name = str(body.get("name", "") or "")
+        if action == "set":
+            access.set_mode(body.get("mode"), body.get("pinIps"))
+        elif action == "approve" and uid:
+            session = self.state.sessions_by_user_id.get(uid)
+            if session and not ip:
+                ip = self._ws_ip(session.ws)
+                name = name or session.name
+            access.approve(uid, name, ip)
+        elif action == "deny" and uid:
+            access.deny(uid)
+        elif action == "remove" and uid:
+            access.remove_approved(uid)
+        elif action == "kick" and uid:
+            await self.kick_user(uid)
+        elif action == "ban" and (uid or ip):
+            session = self.state.sessions_by_user_id.get(uid) if uid else None
+            if session and body.get("withIp") and not ip:
+                ip = self._ws_ip(session.ws)
+            access.ban(uid, ip, name or (session.name if session else ""), str(body.get("reason", "")))
+            if uid:
+                await self.kick_user(uid)
+            if ip:
+                for s in list(self.state.sessions_by_user_id.values()):
+                    if self._ws_ip(s.ws) == ip:
+                        await self.kick_user(s.user_id)
+        elif action == "unban" and (uid or ip):
+            access.unban(uid, ip)
+        else:
+            return {"ok": False, "error": f"bad action {action!r}"}
+        self.state.save_state()
+        return {"ok": True, "access": access.snapshot()}
+
     async def _close_quietly(self, ws: Any, code: int) -> None:
         try:
             await ws.close(code=code)
@@ -4306,6 +4590,9 @@ class BZRWebSocketServer:
         else:
             user_id = requested_id
         name = str(content.get("name") or content.get("playerName") or user_id)
+
+        if not await self._admit(ws, user_id, name, str(content.get("key", ""))):
+            return
 
         if user_id in self.state.sessions_by_user_id:
             # Ensure uniqueness if duplicate ID reconnects.
@@ -5280,7 +5567,7 @@ class BZRWebSocketServer:
 
 
 def _http_json(status_code: int, payload: dict[str, Any]) -> bytes:
-    reason = {200: "OK", 404: "Not Found", 405: "Method Not Allowed"}.get(status_code, "OK")
+    reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed"}.get(status_code, "OK")
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = [
         f"HTTP/1.1 {status_code} {reason}",
@@ -5339,6 +5626,67 @@ def build_status_payload(
     }
 
 
+def build_lobbies_payload(state: ServerState) -> dict[str, Any]:
+    """Operator view of live lobbies and connected users (local health port only)."""
+
+    def _user_name(user_id: str) -> str:
+        session = state.sessions_by_user_id.get(user_id)
+        return session.player_name if session and session.player_name != "Unknown" else (session.name if session else "")
+
+    lobbies = []
+    for lid, lobby in sorted(state.lobbies.items()):
+        lobbies.append(
+            {
+                "id": lid,
+                "name": str(lobby.metadata.get("name", "")),
+                "owner": lobby.owner,
+                "ownerName": _user_name(lobby.owner),
+                "users": [{"id": uid, "name": _user_name(uid)} for uid in lobby.users],
+                "memberLimit": lobby.member_limit,
+                "isLocked": lobby.is_locked,
+                "isPrivate": lobby.is_private,
+                "persistent": lobby.persistent,
+                "created": lobby.created_time,
+            }
+        )
+    users = [
+        {
+            "id": s.user_id,
+            "name": s.name,
+            "playerName": s.player_name,
+            "authtype": s.authtype,
+            "wanAddress": s.wan_address,
+            "lobbyId": s.current_lobby_id,
+            "inLounge": s.in_lounge,
+            "isAdmin": s.is_admin,
+        }
+        for s in state.sessions_by_user_id.values()
+    ]
+    return {"ok": True, "time": utc_now_str(), "lobbies": lobbies, "users": users}
+
+
+def start_stdin_control(loop: asyncio.AbstractEventLoop, request_stop: Any, logger: logging.Logger) -> None:
+    """Stop cleanly when the parent (e.g. server_gui.py) writes "stop" or closes stdin.
+
+    Windows has no SIGTERM for console children, so a launcher that terminated the
+    process would skip the final state save. This gives it a graceful path.
+    """
+    import sys
+    import threading
+
+    def _reader() -> None:
+        try:
+            for line in sys.stdin:
+                if line.strip().lower() in ("stop", "quit", "exit"):
+                    break
+        except Exception:
+            pass
+        logger.info("Stop requested over stdin.")
+        loop.call_soon_threadsafe(request_stop)
+
+    threading.Thread(target=_reader, name="stdin-control", daemon=True).start()
+
+
 async def serve_health_http(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -5359,23 +5707,49 @@ async def serve_health_http(
             return
         method, path = parts[0], parts[1]
 
-        # Drain remaining headers.
+        content_length = 0
         while True:
             h = await asyncio.wait_for(reader.readline(), timeout=2.0)
             if not h or h in (b"\r\n", b"\n"):
                 break
+            hname, _, hvalue = h.decode("latin-1").partition(":")
+            if hname.strip().lower() == "content-length":
+                with contextlib.suppress(ValueError):
+                    content_length = max(0, min(int(hvalue.strip()), 65536))
+
+        if method == "POST" and path == "/access":
+            # Operator control: only from this machine, whatever --health-host is.
+            peer = writer.get_extra_info("peername")
+            peer_ip = str(peer[0]) if isinstance(peer, tuple) and peer else ""
+            if not (peer_ip.startswith("127.") or peer_ip in ("::1", "::ffff:127.0.0.1")):
+                writer.write(_http_json(403, {"ok": False, "error": "access control is local-only"}))
+                await writer.drain()
+                return
+            raw = await asyncio.wait_for(reader.readexactly(content_length), timeout=2.0) if content_length else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+                result = await ws_server.handle_access_action(body if isinstance(body, dict) else {})
+                writer.write(_http_json(200 if result.get("ok") else 400, result))
+            except ValueError as exc:
+                writer.write(_http_json(400, {"ok": False, "error": str(exc)}))
+            await writer.drain()
+            return
 
         if method != "GET":
             writer.write(_http_json(405, {"ok": False, "error": "Only GET supported"}))
             await writer.drain()
             return
 
-        if path not in ("/health", "/status", "/captures", "/protocol"):
+        if path not in ("/health", "/status", "/captures", "/protocol", "/lobbies", "/access"):
             writer.write(_http_json(404, {"ok": False, "error": "Unknown path"}))
             await writer.drain()
             return
 
-        if path in ("/health", "/status"):
+        if path == "/access":
+            payload = {"ok": True, "time": utc_now_str(), "access": state.access.snapshot()}
+        elif path == "/lobbies":
+            payload = build_lobbies_payload(state)
+        elif path in ("/health", "/status"):
             payload = build_status_payload(
                 state=state,
                 ws_server=ws_server,
@@ -5469,6 +5843,11 @@ async def run_server(args: argparse.Namespace) -> None:
         admin_ids=admin_ids,
     )
     state.load_state(retain_empty_lobbies=args.retain_empty_lobbies)
+    state.access.approval_wait_seconds = max(1, args.approval_wait_seconds)
+    state.access.rate_limit_per_minute = max(0, args.auth_rate_limit)
+    if args.access_mode is not None or args.pin_ips is not None:
+        state.access.set_mode(args.access_mode, args.pin_ips)
+    logger.info("Access mode: %s%s", state.access.mode, " (IP pinning)" if state.access.pin_ips else "")
     state.ensure_default_lobby()
 
     relay_protocol: BZRRelayProtocol | None = None
@@ -5522,6 +5901,8 @@ async def run_server(args: argparse.Namespace) -> None:
         except (NotImplementedError, RuntimeError):
             # Windows or non-main thread.
             pass
+    if args.stdin_control:
+        start_stdin_control(loop, _request_stop, logger)
 
     udp_transport, udp_protocol = await loop.create_datagram_endpoint(
         lambda: BZRUDPProtocol(logger.getChild("udp"), state),
@@ -5623,6 +6004,20 @@ def parse_args() -> argparse.Namespace:
         "--retain-empty-lobbies",
         action="store_true",
         help="Do not delete lobbies when last user leaves (useful with persistence)",
+    )
+    parser.add_argument("--access-mode", choices=list(ACCESS_MODES), default=None,
+                        help="Who may log in: open (default), approve (unknown players wait for operator approval), "
+                             "allowlist (approved players only). Overrides the mode saved in the state file.")
+    parser.add_argument("--pin-ips", action=argparse.BooleanOptionalAction, default=None,
+                        help="Re-ask approval when an approved player connects from a new IP")
+    parser.add_argument("--approval-wait-seconds", type=int, default=30,
+                        help="How long an unknown player's login is held waiting for approval")
+    parser.add_argument("--auth-rate-limit", type=int, default=20,
+                        help="Max login attempts per IP per minute, 0 to disable")
+    parser.add_argument(
+        "--stdin-control",
+        action="store_true",
+        help='Stop gracefully (saving state) when stdin reads "stop" or closes; used by server_gui.py',
     )
     parser.add_argument(
         "--log-level",

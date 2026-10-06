@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .env
 data/
+server_gui.json
+build/
+dist/
