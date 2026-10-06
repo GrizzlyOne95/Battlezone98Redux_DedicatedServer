@@ -124,8 +124,8 @@ async def ws_smoke(host: str, port: int, timeout: float) -> tuple[bool, str]:
         for _ in range(6):
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
             if msg.get("type") == "OnUserDataChanged":
-                users = msg.get("data", {}).get("users", {})
-                player_seen = "U_SMOKE" in users
+                # Official shape: {member: <user id>, lobbyId}.
+                player_seen = msg.get("data", {}).get("member") == "U_SMOKE"
                 break
         if not player_seen:
             return False, "Did not receive compatible OnUserDataChanged payload"

@@ -4,6 +4,7 @@ This repository contains tools and documentation for reverse engineering the Bat
 
 For operations and cutover notes, see `NOTES.md`.
 For the ANet-to-BZR comparison and the recommended community failover architecture, see `COMMUNITY_FAILOVER_PLAN.md`.
+For the full multiplayer picture (ports, traffic, connection flow, auth rules, setup, gaps), see `BZRNET_MULTIPLAYER_SERVER_GUIDE.md`.
 
 ## New: MVP Dedicated Server (`server.py`)
 
