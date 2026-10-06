@@ -67,6 +67,41 @@ The server currently handles:
     python smoke_test.py
     ```
 
+#### Desktop launcher (`server_gui.py`)
+
+`python server_gui.py` (or double-click `ServerGUI.bat`) opens a small tkinter window that starts and
+stops `server.py`, edits the common options, streams the log, and lists connected players and
+lobbies from the local health port. It needs no extra packages. Stop sends `stop` over stdin
+(`--stdin-control`) so the server saves state before exiting. Settings, including the admin key,
+are saved to `server_gui.json` (gitignored). The players/lobbies view comes from
+`GET http://127.0.0.1:8080/lobbies`, which is also usable on its own.
+
+#### Access control (who may join)
+
+Stock clients only present a claimed id: Steam's `steamAppTicket` cannot be validated without
+Rebellion's publisher key and GOG sends no ticket. So admission control keys on that id plus the
+connecting IP. It keeps strangers out of a friends server; it cannot stop someone who copies an
+approved player's public Steam id (IP pinning narrows that). For a real gate, put the server behind
+Tailscale.
+
+*   `--access-mode open|approve|allowlist` (default `open`, also saved in the state file).
+    `approve` holds an unknown player's login for `--approval-wait-seconds` (default 30) while the
+    operator decides, then refuses it; approving afterwards admits the client's next automatic retry.
+    `allowlist` refuses unknown ids at once.
+*   `--pin-ips` re-asks approval when an approved id connects from a new IP.
+*   Bans by id and/or IP; `--auth-rate-limit` login attempts per IP per minute (default 20).
+*   `GET /access` shows the mode, pending, approved and banned lists; `POST /access` with
+    `{"action": "set|approve|deny|remove|kick|ban|unban", ...}` changes them. POST is accepted only
+    from loopback even if `--health-host` is widened. The launcher's Access tab and the Players tab's
+    Approve/Kick/Ban buttons use these.
+
+#### Standalone Windows package
+
+`python build_package.py` builds `dist/BZRDedicatedServer-<version>.zip` for PCs without Python.
+It holds `BZRServerGUI.exe` (the launcher), `BZRServer.exe` (the server, also usable headless with
+the same options as `server.py`), a README and the LAN guide. The build uses its own venv under
+`build/` with PyInstaller; `build/` and `dist/` are gitignored.
+
 Useful runtime options:
 
 ```bash
@@ -87,6 +122,7 @@ Default bind addresses:
 *   Health: `http://127.0.0.1:8080/health`
 *   Protocol: `http://127.0.0.1:8080/protocol`
 *   Captures: `http://127.0.0.1:8080/captures`
+*   Lobbies/players: `http://127.0.0.1:8080/lobbies`
 
 ### Docker / Compose Deployment
 
@@ -164,12 +200,12 @@ admin surface as well.
 Use these launch flags:
 
 ```bash
-battlezone98redux.exe /netpktlog /netlog=3 /bzrnetlog=3 /bzrserver=127.0.0.1 /bzrnetport=1338
+battlezone98redux.exe /netpktlog /netlog=3 /bzrnetlog=3 /bzrserver=ws://127.0.0.1:1337/
 ```
 
 Notes:
 
-*   The game binary also contains a hardcoded WebSocket URL for BZRNet (`...:1337`), so DNS/hosts override may be needed for full end-to-end local redirection.
+*   `/bzrserver=` replaces the stock lobby URL verbatim, so it must be a full `ws://host:port/` URL; a bare IP fails to connect. The client sends its UDP probe to the same host on the lobby port + 1 and uses the relay port the server advertises. Verified end to end on the GOG exe (2026-10-05).
 *   UDP `1338` performs the capture-confirmed public endpoint probe.
 *   UDP `1339` now forwards WS-associated peer-pair datagrams byte-for-byte; it does not deserialize `7a75`, `0x5f`, or other gameplay payloads.
 *   The official `1339` association/allocation envelope is still unrecovered. The community relay intentionally drops ambiguous multi-target mappings, so strict/symmetric-NAT parity remains a live validation target.

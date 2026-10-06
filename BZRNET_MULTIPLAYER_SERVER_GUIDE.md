@@ -138,8 +138,8 @@ classifies discovery traffic (`DISCOVERY_KIND=0x2`).
 3. Validate with a real client: `Battlezone_LobbyMonitor` against
    `127.0.0.1:1337`, or the game with `net.ini [OpenShimSocket]
    MatchmakingRedirectAddress=<host>` (hostname/IP only, stock ports
-   kept) or launch flags `/bzrserver=127.0.0.1 /bzrnetport=1338` plus a
-   DNS/hosts override for the hardcoded `:1337` URL.
+   kept), or the stock launch flag `/bzrserver=ws://<host>:1337/` (full URL;
+   verified 2026-10-05 on the GOG exe, see docs/LAN_COOP.md).
 4. Operate: never commit live `data/server_state.json`, `.env`, keys, or
    raw captures (see `AGENTS.md`); use RFC 5737/3849 blocks in fixtures.
 

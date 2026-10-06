@@ -89,7 +89,7 @@ Cutover options:
 
 * preferred: DNS failover for `battlezone98mp.webdev.rebellion.co.uk`
 * fallback: hosts-file override
-* emergency local testing: `/bzrserver=<ip>` and `/bzrnetport=1338`
+* per-client override: `/bzrserver=ws://<ip>:1337/` (full URL; `/bzrnetport` is the client's local UDP port, not the server's)
 
 Expected outcome:
 
