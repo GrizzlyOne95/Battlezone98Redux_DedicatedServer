@@ -77,6 +77,29 @@ this server.
 To go back to official online play, remove the `/bzrserver=` launch option, or clear
 `MatchmakingRedirectAddress=` in `net.ini`.
 
+## Over the internet (untested)
+
+Not yet tested end to end over the internet. The steps are the LAN ones plus:
+
+1. Check you can receive inbound traffic: the WAN IP on the router's status page must match
+   what whatismyip.com shows. If they differ you are behind carrier-grade NAT and port forwarding
+   cannot work; use Tailscale instead (below).
+2. On the router, forward TCP 1337 and UDP 1338-1339 to the server PC's LAN IP. Never forward 8080.
+3. In the launcher's **Internet (WAN)** box, press **Detect** (asks api.ipify.org for your public IP)
+   or type a dynamic-DNS name, then send players the **Copy option** line, for example
+   `/bzrserver=ws://203.0.113.25:1337/`. Players inside your house keep the LAN line.
+4. Check: from outside, `Test-NetConnection <public-ip> -Port 1337` succeeds; the launcher log shows
+   `UDP RX` from the player's public IP; relay packet counts rise once a game is joined. If players
+   stall at connecting, look at `ambiguousDropsTotal` / `unmappedDropsTotal` on
+   http://127.0.0.1:8080/status.
+
+The server does not validate Steam/GOG tickets, so anyone who finds the open port can join under
+any ID. Open the forwards for test sessions and close them afterwards.
+
+**Tailscale (simplest):** everyone joins your tailnet and uses the server's Tailscale address
+(the launcher labels it `Tailscale/VPN`) in the launch option. No port forwarding, works behind
+CGNAT, and the game sees it as a LAN.
+
 ## Troubleshooting
 
 | Symptom | Check |

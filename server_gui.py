@@ -66,11 +66,14 @@ DEFAULTS = {
     "retain_empty_lobbies": False,
     "log_level": "INFO",
     "extra_args": "",
+    "public_host": "",
 }
+PUBLIC_IP_URL = "https://api.ipify.org"
 
 
 def lan_addresses() -> list[str]:
     addrs: set[str] = set()
+    primary = ""
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             addrs.add(info[4][0])
@@ -80,10 +83,31 @@ def lan_addresses() -> list[str]:
         # No packets are sent; this just asks the OS which interface routes outward.
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("192.0.2.1", 9))
-            addrs.add(s.getsockname()[0])
+            primary = s.getsockname()[0]
+            addrs.add(primary)
     except OSError:
         pass
-    return sorted(a for a in addrs if not a.startswith("127.") and not a.startswith("169.254."))
+    import ipaddress
+
+    def rank(a: str) -> tuple[int, str]:
+        # The default-route address first; VM/WSL switches are private too.
+        if a == primary and not a.startswith("100."):
+            return (-1, a)
+        ip = ipaddress.ip_address(a)
+        if ip in ipaddress.ip_network("100.64.0.0/10"):
+            return (1, a)  # CGNAT range: Tailscale and similar VPNs
+        return (0 if ip.is_private else 2, a)
+
+    keep = [a for a in addrs if not a.startswith("127.") and not a.startswith("169.254.")]
+    return sorted(keep, key=rank)
+
+
+def describe_address(a: str) -> str:
+    import ipaddress
+
+    if ipaddress.ip_address(a) in ipaddress.ip_network("100.64.0.0/10"):
+        return f"{a}  (Tailscale/VPN)"
+    return a
 
 
 def fmt_duration(seconds: int) -> str:
@@ -103,15 +127,19 @@ class ServerGUI:
         self.started_at = 0.0
 
         root.title("BZR Dedicated Server")
-        root.geometry("980x680")
-        root.minsize(820, 560)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.cfg = dict(DEFAULTS)
         self.cfg.update(self.load_config())
         self.vars: dict[str, tk.Variable] = {}
         self.build_ui()
-        for key in ("ws_port", "udp_port", "bind"):
+        # Size from content so Windows display scaling never pushes the tabs off-screen.
+        root.update_idletasks()
+        w = min(root.winfo_reqwidth() + 16, root.winfo_screenwidth() - 40)
+        h = min(root.winfo_reqheight() + 16, root.winfo_screenheight() - 80)
+        root.geometry(f"{w}x{h}")
+        root.minsize(min(w, root.winfo_reqwidth()), min(h, root.winfo_reqheight()))
+        for key in ("ws_port", "udp_port", "relay_port", "bind", "public_host"):
             self.vars[key].trace_add("write", lambda *_: self.update_switch())
         self.refresh_buttons()
 
@@ -146,8 +174,10 @@ class ServerGUI:
         top = ttk.Frame(outer)
         top.pack(fill="x")
 
-        settings = ttk.LabelFrame(top, text="Settings", padding=8)
-        settings.pack(side="left", fill="both", expand=True)
+        left = ttk.Frame(top)
+        left.pack(side="left", fill="both", expand=True)
+        settings = ttk.LabelFrame(left, text="Settings", padding=8)
+        settings.pack(fill="x")
         self.settings_frame = settings
 
         def var(key: str, kind=tk.StringVar):
@@ -260,17 +290,31 @@ class ServerGUI:
             self.stat_vars[key] = v
             ttk.Label(stats, textvariable=v).grid(row=i, column=1, sticky="w")
 
-        lan = ttk.LabelFrame(right, text="Players connect to", padding=8)
-        lan.pack(fill="x", pady=(8, 0))
+        # Under the settings: what players put in their launch options.
+        conn = ttk.LabelFrame(left, text="Players connect with", padding=8)
+        conn.pack(fill="x", pady=(8, 0))
+        conn.columnconfigure(1, weight=1)
         self.lan_var = tk.StringVar()
-        ttk.Label(lan, textvariable=self.lan_var, justify="left").pack(anchor="w")
-        ttk.Button(lan, text="Copy IP", command=self.copy_lan).pack(anchor="w", pady=(4, 0))
-        ttk.Label(lan, text="Game launch option:").pack(anchor="w", pady=(8, 0))
         self.switch_var = tk.StringVar()
-        ttk.Entry(lan, textvariable=self.switch_var, state="readonly", width=34).pack(anchor="w", fill="x")
-        ttk.Button(lan, text="Copy option", command=self.copy_switch).pack(anchor="w", pady=(4, 0))
-        self.port_warn = ttk.Label(lan, foreground="#b80", wraplength=260, justify="left")
-        self.port_warn.pack(anchor="w")
+        self.public_var = tk.StringVar(value=self.cfg.get("public_host", ""))
+        self.vars["public_host"] = self.public_var
+        self.wan_switch_var = tk.StringVar()
+
+        ttk.Label(conn, text="LAN").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(conn, textvariable=self.switch_var, state="readonly").grid(row=0, column=1, columnspan=2, sticky="we")
+        ttk.Button(conn, text="Copy", width=6, command=self.copy_switch).grid(row=0, column=3, padx=(4, 0))
+        ttk.Label(conn, textvariable=self.lan_var, foreground="#666").grid(row=1, column=1, columnspan=3, sticky="w")
+        self.port_warn = ttk.Label(conn, foreground="#b80")
+        self.port_warn.grid(row=2, column=1, columnspan=3, sticky="w")
+
+        ttk.Label(conn, text="Internet").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        ttk.Entry(conn, textvariable=self.public_var, width=18).grid(row=3, column=1, sticky="we", pady=(6, 0))
+        self.detect_btn = ttk.Button(conn, text="Detect", width=7, command=self.detect_public_ip)
+        self.detect_btn.grid(row=3, column=2, padx=(4, 0), pady=(6, 0))
+        ttk.Entry(conn, textvariable=self.wan_switch_var, state="readonly").grid(row=4, column=1, columnspan=2, sticky="we", pady=(2, 0))
+        ttk.Button(conn, text="Copy", width=6, command=self.copy_wan_switch).grid(row=4, column=3, padx=(4, 0), pady=(2, 0))
+        self.wan_note = ttk.Label(conn, foreground="#666")
+        self.wan_note.grid(row=5, column=1, columnspan=3, sticky="w")
         self.update_lan()
 
         # Bottom: tabs.
@@ -278,7 +322,7 @@ class ServerGUI:
         nb.pack(fill="both", expand=True, pady=(8, 0))
 
         log_frame = ttk.Frame(nb)
-        self.log_text = tk.Text(log_frame, wrap="none", font=("Consolas", 9), state="disabled", background="#111", foreground="#ddd", insertbackground="#ddd")
+        self.log_text = tk.Text(log_frame, wrap="none", height=12, font=("Consolas", 9), state="disabled", background="#111", foreground="#ddd", insertbackground="#ddd")
         ys = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         xs = ttk.Scrollbar(log_frame, orient="horizontal", command=self.log_text.xview)
         self.log_text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -308,7 +352,7 @@ class ServerGUI:
 
     def make_tree(self, nb: ttk.Notebook, title: str, cols: list[tuple[str, str, int]]) -> ttk.Treeview:
         frame = ttk.Frame(nb)
-        tree = ttk.Treeview(frame, columns=[c[0] for c in cols], show="headings")
+        tree = ttk.Treeview(frame, columns=[c[0] for c in cols], show="headings", height=8)
         for key, text, width in cols:
             tree.heading(key, text=text)
             tree.column(key, width=width, anchor="w")
@@ -481,10 +525,10 @@ class ServerGUI:
     def update_lan(self) -> None:
         bind = BIND_CHOICES.get(self.vars["bind"].get(), self.vars["bind"].get())
         if bind.startswith("127."):
-            self.lan_var.set("127.0.0.1 (this PC only)")
+            self.lan_var.set("Addresses: 127.0.0.1 (this PC only)")
         else:
             addrs = lan_addresses()
-            self.lan_var.set("\n".join(addrs) if addrs else "no LAN address found")
+            self.lan_var.set(("Addresses: " + ", ".join(map(describe_address, addrs))) if addrs else "no LAN address found")
         self.update_switch()
         self.root.after(15000, self.update_lan)
 
@@ -500,20 +544,59 @@ class ServerGUI:
         self.port_warn.configure(
             text="" if udp == ws + 1 else f"Handshake UDP must be lobby port + 1 ({ws + 1}) for game clients."
         )
+        host = self.public_var.get().strip()
+        for prefix in ("ws://", "http://", "https://"):
+            if host.lower().startswith(prefix):
+                host = host[len(prefix):]
+        host = host.split("/")[0].split(":")[0]
+        self.wan_switch_var.set(f"/bzrserver=ws://{host}:{ws}/" if host else "enter or detect the public address")
+        try:
+            relay = int(self.vars["relay_port"].get())
+        except (tk.TclError, ValueError):
+            relay = ws + 2
+        self.wan_note.configure(
+            text=f"Public IP or DDNS name. Forward TCP {ws} + UDP {udp}, {relay} to this PC."
+        )
 
     def first_lan(self) -> str:
-        text = self.lan_var.get()
-        first = text.splitlines()[0].split()[0] if text else ""
+        text = self.lan_var.get().removeprefix("Addresses: ")
+        first = text.split(",")[0].split()[0] if text.strip() else ""
         return first if first[:1].isdigit() else ""
-
-    def copy_lan(self) -> None:
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.first_lan())
 
     def copy_switch(self) -> None:
         self.update_switch()
         self.root.clipboard_clear()
         self.root.clipboard_append(self.switch_var.get())
+
+    def copy_wan_switch(self) -> None:
+        self.update_switch()
+        if self.wan_switch_var.get().startswith("/bzrserver="):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.wan_switch_var.get())
+
+    def detect_public_ip(self) -> None:
+        # Only on request: this asks an outside service which address we appear from.
+        self.detect_btn.state(["disabled"])
+
+        def _fetch() -> None:
+            try:
+                with urllib.request.urlopen(PUBLIC_IP_URL, timeout=5) as resp:
+                    ip = resp.read().decode("ascii", "replace").strip()
+                socket.inet_aton(ip)
+                result = ("ok", ip)
+            except Exception as exc:
+                result = ("err", str(exc))
+            self.root.after(0, lambda: self._detected(*result))
+
+        threading.Thread(target=_fetch, name="public-ip", daemon=True).start()
+
+    def _detected(self, status: str, value: str) -> None:
+        self.detect_btn.state(["!disabled"])
+        if status == "ok":
+            self.public_var.set(value)
+            self.append_log(f"[gui] public IP detected: {value}\n", "gui")
+        else:
+            messagebox.showerror("Detect public IP", f"Could not reach {PUBLIC_IP_URL}:\n{value}")
 
     def clear_log(self) -> None:
         self.log_text.configure(state="normal")
