@@ -26,8 +26,10 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-HERE = Path(__file__).resolve().parent
-SERVER_SCRIPT = HERE / "server.py"
+FROZEN = getattr(sys, "frozen", False)
+# Packaged build (build_package.py): BZRServerGUI.exe runs BZRServer.exe beside it.
+HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+SERVER_SCRIPT = HERE / ("BZRServer.exe" if FROZEN else "server.py")
 CONFIG_FILE = HERE / "server_gui.json"
 POLL_SECONDS = 2.0
 MAX_LOG_LINES = 5000
@@ -204,12 +206,14 @@ class ServerGUI:
         ttk.Checkbutton(settings, text="Keep empty lobbies", variable=var("retain_empty_lobbies", tk.BooleanVar)).grid(row=row, column=2, columnspan=2, sticky="w")
         row += 1
 
-        label("Python", row)
-        pf = ttk.Frame(settings)
-        pf.grid(row=row, column=1, columnspan=3, sticky="we")
-        ttk.Entry(pf, textvariable=var("python")).pack(side="left", fill="x", expand=True)
-        ttk.Button(pf, text="…", width=3, command=self.browse_python).pack(side="left", padx=(4, 0))
-        row += 1
+        python_var = var("python")
+        if not FROZEN:
+            label("Python", row)
+            pf = ttk.Frame(settings)
+            pf.grid(row=row, column=1, columnspan=3, sticky="we")
+            ttk.Entry(pf, textvariable=python_var).pack(side="left", fill="x", expand=True)
+            ttk.Button(pf, text="…", width=3, command=self.browse_python).pack(side="left", padx=(4, 0))
+            row += 1
 
         label("Extra args", row)
         ttk.Entry(settings, textvariable=var("extra_args")).grid(row=row, column=1, columnspan=3, sticky="we", pady=2)
@@ -326,8 +330,8 @@ class ServerGUI:
     def build_command(self) -> list[str]:
         v = {k: var.get() for k, var in self.vars.items()}
         bind = BIND_CHOICES.get(v["bind"], v["bind"]).strip() or "0.0.0.0"
-        cmd = [
-            v["python"], "-u", str(SERVER_SCRIPT),
+        launcher = [str(SERVER_SCRIPT)] if FROZEN else [v["python"], "-u", str(SERVER_SCRIPT)]
+        cmd = launcher + [
             "--ws-host", bind, "--ws-port", str(v["ws_port"]),
             "--udp-host", bind, "--udp-port", str(v["udp_port"]),
             "--relay-host", bind, "--relay-port", str(v["relay_port"]),
@@ -364,7 +368,7 @@ class ServerGUI:
             messagebox.showerror("Invalid setting", str(exc))
             return
         self.save_config()
-        if not self.check_python(cmd[0]):
+        if not FROZEN and not self.check_python(cmd[0]):
             return
         state_dir =Path(self.vars["state_file"].get()).expanduser().parent
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -623,7 +627,11 @@ class ServerGUI:
 
 def main() -> None:
     if not SERVER_SCRIPT.exists():
-        raise SystemExit(f"server.py not found next to {__file__}")
+        msg = f"{SERVER_SCRIPT.name} not found in {HERE}"
+        if FROZEN:
+            tk.Tk().withdraw()
+            messagebox.showerror("BZR Dedicated Server", msg + "\n\nKeep both exe files in the same folder.")
+        raise SystemExit(msg)
     try:
         if os.name == "nt":
             import ctypes

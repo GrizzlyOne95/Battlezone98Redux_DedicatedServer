@@ -76,6 +76,13 @@ lobbies from the local health port. It needs no extra packages. Stop sends `stop
 are saved to `server_gui.json` (gitignored). The players/lobbies view comes from
 `GET http://127.0.0.1:8080/lobbies`, which is also usable on its own.
 
+#### Standalone Windows package
+
+`python build_package.py` builds `dist/BZRDedicatedServer-<version>.zip` for PCs without Python.
+It holds `BZRServerGUI.exe` (the launcher), `BZRServer.exe` (the server, also usable headless with
+the same options as `server.py`), a README and the LAN guide. The build uses its own venv under
+`build/` with PyInstaller; `build/` and `dist/` are gitignored.
+
 Useful runtime options:
 
 ```bash
