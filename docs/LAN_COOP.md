@@ -15,6 +15,10 @@ this server.
    Ports: TCP 1337 (lobby), UDP 1338 (handshake), UDP 1339 (relay). The 8080 status page stays
    local-only (http://127.0.0.1:8080/status) and clients never use it.
 
+   Or double-click `ServerGUI.bat` (same as `pythonw server_gui.py`) for a window with
+   Start/Stop/Restart, the live log, connected players, open lobbies, and the LAN address players
+   should use. Set the state file there once; settings are remembered in `server_gui.json`.
+
 2. Find the PC's LAN address with `ipconfig` (the `Ethernet` or `Wi-Fi` IPv4 address, for example
    `192.168.0.44`). Give this PC a DHCP reservation in the router so the address never changes.
 

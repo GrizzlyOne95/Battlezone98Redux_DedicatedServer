@@ -5339,6 +5339,67 @@ def build_status_payload(
     }
 
 
+def build_lobbies_payload(state: ServerState) -> dict[str, Any]:
+    """Operator view of live lobbies and connected users (local health port only)."""
+
+    def _user_name(user_id: str) -> str:
+        session = state.sessions_by_user_id.get(user_id)
+        return session.player_name if session and session.player_name != "Unknown" else (session.name if session else "")
+
+    lobbies = []
+    for lid, lobby in sorted(state.lobbies.items()):
+        lobbies.append(
+            {
+                "id": lid,
+                "name": str(lobby.metadata.get("name", "")),
+                "owner": lobby.owner,
+                "ownerName": _user_name(lobby.owner),
+                "users": [{"id": uid, "name": _user_name(uid)} for uid in lobby.users],
+                "memberLimit": lobby.member_limit,
+                "isLocked": lobby.is_locked,
+                "isPrivate": lobby.is_private,
+                "persistent": lobby.persistent,
+                "created": lobby.created_time,
+            }
+        )
+    users = [
+        {
+            "id": s.user_id,
+            "name": s.name,
+            "playerName": s.player_name,
+            "authtype": s.authtype,
+            "wanAddress": s.wan_address,
+            "lobbyId": s.current_lobby_id,
+            "inLounge": s.in_lounge,
+            "isAdmin": s.is_admin,
+        }
+        for s in state.sessions_by_user_id.values()
+    ]
+    return {"ok": True, "time": utc_now_str(), "lobbies": lobbies, "users": users}
+
+
+def start_stdin_control(loop: asyncio.AbstractEventLoop, request_stop: Any, logger: logging.Logger) -> None:
+    """Stop cleanly when the parent (e.g. server_gui.py) writes "stop" or closes stdin.
+
+    Windows has no SIGTERM for console children, so a launcher that terminated the
+    process would skip the final state save. This gives it a graceful path.
+    """
+    import sys
+    import threading
+
+    def _reader() -> None:
+        try:
+            for line in sys.stdin:
+                if line.strip().lower() in ("stop", "quit", "exit"):
+                    break
+        except Exception:
+            pass
+        logger.info("Stop requested over stdin.")
+        loop.call_soon_threadsafe(request_stop)
+
+    threading.Thread(target=_reader, name="stdin-control", daemon=True).start()
+
+
 async def serve_health_http(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -5370,12 +5431,14 @@ async def serve_health_http(
             await writer.drain()
             return
 
-        if path not in ("/health", "/status", "/captures", "/protocol"):
+        if path not in ("/health", "/status", "/captures", "/protocol", "/lobbies"):
             writer.write(_http_json(404, {"ok": False, "error": "Unknown path"}))
             await writer.drain()
             return
 
-        if path in ("/health", "/status"):
+        if path == "/lobbies":
+            payload = build_lobbies_payload(state)
+        elif path in ("/health", "/status"):
             payload = build_status_payload(
                 state=state,
                 ws_server=ws_server,
@@ -5522,6 +5585,8 @@ async def run_server(args: argparse.Namespace) -> None:
         except (NotImplementedError, RuntimeError):
             # Windows or non-main thread.
             pass
+    if args.stdin_control:
+        start_stdin_control(loop, _request_stop, logger)
 
     udp_transport, udp_protocol = await loop.create_datagram_endpoint(
         lambda: BZRUDPProtocol(logger.getChild("udp"), state),
@@ -5623,6 +5688,11 @@ def parse_args() -> argparse.Namespace:
         "--retain-empty-lobbies",
         action="store_true",
         help="Do not delete lobbies when last user leaves (useful with persistence)",
+    )
+    parser.add_argument(
+        "--stdin-control",
+        action="store_true",
+        help='Stop gracefully (saving state) when stdin reads "stop" or closes; used by server_gui.py',
     )
     parser.add_argument(
         "--log-level",

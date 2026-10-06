@@ -67,6 +67,15 @@ The server currently handles:
     python smoke_test.py
     ```
 
+#### Desktop launcher (`server_gui.py`)
+
+`python server_gui.py` (or double-click `ServerGUI.bat`) opens a small tkinter window that starts and
+stops `server.py`, edits the common options, streams the log, and lists connected players and
+lobbies from the local health port. It needs no extra packages. Stop sends `stop` over stdin
+(`--stdin-control`) so the server saves state before exiting. Settings, including the admin key,
+are saved to `server_gui.json` (gitignored). The players/lobbies view comes from
+`GET http://127.0.0.1:8080/lobbies`, which is also usable on its own.
+
 Useful runtime options:
 
 ```bash
@@ -87,6 +96,7 @@ Default bind addresses:
 *   Health: `http://127.0.0.1:8080/health`
 *   Protocol: `http://127.0.0.1:8080/protocol`
 *   Captures: `http://127.0.0.1:8080/captures`
+*   Lobbies/players: `http://127.0.0.1:8080/lobbies`
 
 ### Docker / Compose Deployment
 
