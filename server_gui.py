@@ -65,10 +65,17 @@ DEFAULTS = {
     "max_lobbies": 500,
     "retain_empty_lobbies": False,
     "log_level": "INFO",
+    "access_mode": "open",
+    "pin_ips": False,
     "extra_args": "",
     "public_host": "",
 }
 PUBLIC_IP_URL = "https://api.ipify.org"
+ACCESS_CHOICES = {
+    "Open (anyone)": "open",
+    "Approve new players": "approve",
+    "Allowlist only": "allowlist",
+}
 
 
 def lan_addresses() -> list[str]:
@@ -159,6 +166,8 @@ class ServerGUI:
             value = var.get()
             if key == "bind":
                 value = BIND_CHOICES.get(value, value)
+            elif key == "access_mode":
+                value = ACCESS_CHOICES.get(value, value)
             data[key] = value
         self.cfg.update(data)
         try:
@@ -348,20 +357,173 @@ class ServerGUI:
         self.user_tree = self.make_tree(
             nb, "Players",
             [("id", "User ID", 160), ("name", "Name", 180), ("auth", "Auth", 70), ("lobby", "Lobby", 70), ("where", "Where", 90), ("wan", "Address", 180), ("admin", "Admin", 60)],
+            buttons=[
+                ("Approve", lambda: self.act_selected(self.user_tree, "approve")),
+                ("Kick", lambda: self.act_selected(self.user_tree, "kick")),
+                ("Ban", lambda: self.act_selected(self.user_tree, "ban", confirm="Ban {n}?")),
+                ("Ban + IP", lambda: self.act_selected(self.user_tree, "ban", withIp=True, confirm="Ban {n} and their IP?")),
+            ],
         )
+        self.build_access_tab(nb)
 
-    def make_tree(self, nb: ttk.Notebook, title: str, cols: list[tuple[str, str, int]]) -> ttk.Treeview:
-        frame = ttk.Frame(nb)
-        tree = ttk.Treeview(frame, columns=[c[0] for c in cols], show="headings", height=8)
+    def make_tree(self, parent: tk.Widget, title: str, cols: list[tuple[str, str, int]], *,
+                  buttons: list | None = None, height: int = 8) -> ttk.Treeview:
+        if isinstance(parent, ttk.Notebook):
+            frame = ttk.Frame(parent)
+            parent.add(frame, text=title)
+        else:
+            frame = ttk.LabelFrame(parent, text=title, padding=4)
+            frame.pack(fill="both", expand=True, pady=(0, 4))
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True)
+        tree = ttk.Treeview(body, columns=[c[0] for c in cols], show="headings", height=height)
         for key, text, width in cols:
             tree.heading(key, text=text)
             tree.column(key, width=width, anchor="w")
-        ys = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        ys = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=ys.set)
         tree.pack(side="left", fill="both", expand=True)
         ys.pack(side="left", fill="y")
-        nb.add(frame, text=title)
+        if buttons:
+            bar = ttk.Frame(frame)
+            bar.pack(fill="x", pady=(4, 0))
+            for text, cmd in buttons:
+                ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 4))
         return tree
+
+    def build_access_tab(self, nb: ttk.Notebook) -> None:
+        frame = ttk.Frame(nb, padding=4)
+        nb.add(frame, text="Access")
+        self.notebook = nb
+        self.access_frame = frame
+        top = ttk.Frame(frame)
+        top.pack(fill="x", pady=(0, 4))
+        ttk.Label(top, text="Who can join").pack(side="left")
+        mode_label = next((k for k, v in ACCESS_CHOICES.items() if v == self.cfg.get("access_mode")), "Open (anyone)")
+        self.access_mode_var = tk.StringVar(value=mode_label)
+        self.vars["access_mode"] = self.access_mode_var
+        box = ttk.Combobox(top, textvariable=self.access_mode_var, values=list(ACCESS_CHOICES), state="readonly", width=22)
+        box.pack(side="left", padx=(6, 12))
+        box.bind("<<ComboboxSelected>>", lambda _e: self.apply_access_settings())
+        self.pin_var = tk.BooleanVar(value=bool(self.cfg.get("pin_ips", False)))
+        self.vars["pin_ips"] = self.pin_var
+        ttk.Checkbutton(top, text="Re-approve players who connect from a new IP", variable=self.pin_var,
+                        command=self.apply_access_settings).pack(side="left")
+        ttk.Label(frame, foreground="#666", wraplength=900, justify="left", text=(
+            "Players are recognised by the ID their game reports. Steam/GOG logins cannot be verified without "
+            "the publisher's keys, so this keeps strangers out but cannot stop someone copying a friend's public "
+            "Steam ID. In Approve mode an unknown player's login waits here for 30 s; approve later and their "
+            "game gets in on its next automatic retry."
+        )).pack(fill="x", pady=(0, 4))
+        self.pending_tree = self.make_tree(
+            frame, "Waiting for approval",
+            [("id", "User ID", 170), ("name", "Name", 170), ("ip", "IP", 130), ("reason", "Why", 200), ("since", "Since", 190)],
+            height=3,
+            buttons=[
+                ("Approve", lambda: self.act_selected(self.pending_tree, "approve")),
+                ("Deny", lambda: self.act_selected(self.pending_tree, "deny")),
+                ("Ban", lambda: self.act_selected(self.pending_tree, "ban", confirm="Ban {n}?")),
+            ],
+        )
+        self.approved_tree = self.make_tree(
+            frame, "Approved players",
+            [("id", "User ID", 170), ("name", "Name", 170), ("ips", "Known IPs", 200), ("seen", "Last seen", 150), ("since", "Approved", 150)],
+            height=4,
+            buttons=[
+                ("Remove", lambda: self.act_selected(self.approved_tree, "remove", confirm="Remove {n} from approved players?")),
+                ("Ban", lambda: self.act_selected(self.approved_tree, "ban", confirm="Ban {n}?")),
+            ],
+        )
+        self.bans_tree = self.make_tree(
+            frame, "Bans",
+            [("what", "Banned", 200), ("kind", "Type", 60), ("name", "Name", 170), ("reason", "Reason", 200), ("at", "When", 150)],
+            height=3,
+            buttons=[("Unban", self.unban_selected)],
+        )
+        self.last_pending_count = 0
+
+    # ---------- access actions ----------
+    def apply_access_settings(self) -> None:
+        mode = ACCESS_CHOICES.get(self.access_mode_var.get(), "open")
+        self.cfg["access_mode"], self.cfg["pin_ips"] = mode, bool(self.pin_var.get())
+        self.save_config()
+        if self.running():
+            self.post_access({"action": "set", "mode": mode, "pinIps": bool(self.pin_var.get())})
+
+    def act_selected(self, tree: ttk.Treeview, action: str, confirm: str = "", **extra) -> None:
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("Access", "Select a player first.")
+            return
+        if not self.running():
+            messagebox.showinfo("Access", "Start the server to manage players.")
+            return
+        for iid in sel:
+            name = str(tree.set(iid, "name")) if "name" in tree["columns"] else ""
+            if confirm and not messagebox.askyesno("Access", confirm.format(n=name or iid)):
+                continue
+            self.post_access({"action": action, "id": iid, "name": name, **extra})
+
+    def unban_selected(self) -> None:
+        if not self.running():
+            messagebox.showinfo("Access", "Start the server to manage bans.")
+            return
+        for iid in self.bans_tree.selection():
+            kind, _, value = iid.partition(":")
+            self.post_access({"action": "unban", ("ip" if kind == "ip" else "id"): value})
+
+    def post_access(self, body: dict) -> None:
+        port = self.cfg.get("health_port", 8080)
+
+        def _send() -> None:
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/access", data=json.dumps(body).encode("utf-8"),
+                    method="POST", headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                self.root.after(0, lambda: self.show_access(data.get("access") or {}))
+            except Exception as exc:
+                self.log_queue.put(f"[gui] access action {body.get('action')} failed: {exc}\n")
+
+        threading.Thread(target=_send, name="access-post", daemon=True).start()
+
+    @staticmethod
+    def fill_tree(tree: ttk.Treeview, rows: list[tuple[str, tuple]]) -> None:
+        """Replace rows keyed by iid, keeping the operator's selection."""
+        selected = set(tree.selection())
+        tree.delete(*tree.get_children())
+        for iid, values in rows:
+            if not tree.exists(iid):
+                tree.insert("", "end", iid=iid, values=values)
+        keep = [i for i in selected if tree.exists(i)]
+        if keep:
+            tree.selection_set(keep)
+
+    def show_access(self, access: dict) -> None:
+        self.fill_tree(self.pending_tree, [
+            (p["id"], (p["id"], p.get("name", ""), p.get("ip", ""), p.get("reason", ""),
+                       p.get("since", "") + ("" if p.get("waiting") else "  (refused, will retry)")))
+            for p in access.get("pending", [])
+        ])
+        self.fill_tree(self.approved_tree, [
+            (a["id"], (a["id"], a.get("name", ""), ", ".join(a.get("ips", [])), a.get("lastSeen", ""), a.get("approvedAt", "")))
+            for a in access.get("approved", [])
+        ])
+        self.fill_tree(self.bans_tree, [
+            (f"id:{b['id']}", (b["id"], "ID", b.get("name", ""), b.get("reason", ""), b.get("at", "")))
+            for b in access.get("bannedIds", [])
+        ] + [
+            (f"ip:{b['ip']}", (b["ip"], "IP", b.get("name", ""), b.get("reason", ""), b.get("at", "")))
+            for b in access.get("bannedIps", [])
+        ])
+        waiting = sum(1 for p in access.get("pending", []) if p.get("waiting"))
+        self.notebook.tab(self.access_frame, text=f"Access ({waiting} waiting)" if waiting else "Access")
+        if waiting > self.last_pending_count:
+            self.root.bell()
+            self.append_log(f"[gui] {waiting} player(s) waiting for approval (Access tab)\n", "gui")
+        self.last_pending_count = waiting
 
     # ---------- actions ----------
     def browse_state(self) -> None:
@@ -395,6 +557,8 @@ class ServerGUI:
         ]
         if not v["relay_enabled"]:
             cmd.append("--disable-relay")
+        cmd += ["--access-mode", ACCESS_CHOICES.get(v["access_mode"], v["access_mode"]),
+                "--pin-ips" if v["pin_ips"] else "--no-pin-ips"]
         if v["retain_empty_lobbies"]:
             cmd.append("--retain-empty-lobbies")
         if v["motd"].strip():
@@ -653,6 +817,7 @@ class ServerGUI:
                     result = {
                         "status": self.fetch(port, "/status"),
                         "lobbies": self.fetch(port, "/lobbies"),
+                        "access": self.fetch(port, "/access"),
                     }
                 except Exception:
                     result = None
@@ -691,6 +856,10 @@ class ServerGUI:
             v.set("–")
         self.lobby_tree.delete(*self.lobby_tree.get_children())
         self.user_tree.delete(*self.user_tree.get_children())
+        for tree in (self.pending_tree, self.approved_tree, self.bans_tree):
+            tree.delete(*tree.get_children())
+        self.notebook.tab(self.access_frame, text="Access")
+        self.last_pending_count = 0
 
     def show_live(self, result: dict) -> None:
         status = result.get("status") or {}
@@ -717,14 +886,17 @@ class ServerGUI:
                 lob.get("id"), lob.get("name") or "(unnamed)", lob.get("ownerName") or lob.get("owner", ""),
                 count, " ".join(flags), members,
             ))
-        self.user_tree.delete(*self.user_tree.get_children())
+        rows = []
         for u in data.get("users", []):
             name = u.get("playerName") if u.get("playerName") not in (None, "", "Unknown") else u.get("name", "")
-            self.user_tree.insert("", "end", values=(
+            rows.append((str(u.get("id")), (
                 u.get("id"), name, u.get("authtype", ""), u.get("lobbyId") or "",
                 "lounge" if u.get("inLounge") else ("in lobby" if u.get("lobbyId") else ""),
                 u.get("wanAddress", ""), "yes" if u.get("isAdmin") else "",
-            ))
+            )))
+        self.fill_tree(self.user_tree, rows)
+        if result.get("access"):
+            self.show_access(result["access"].get("access") or {})
 
     def on_close(self) -> None:
         try:

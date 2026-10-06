@@ -93,8 +93,11 @@ Not yet tested end to end over the internet. The steps are the LAN ones plus:
    stall at connecting, look at `ambiguousDropsTotal` / `unmappedDropsTotal` on
    http://127.0.0.1:8080/status.
 
-The server does not validate Steam/GOG tickets, so anyone who finds the open port can join under
-any ID. Open the forwards for test sessions and close them afterwards.
+The server cannot validate Steam/GOG tickets, so anyone who finds the open port can claim any ID.
+In the launcher's **Access** tab set *Who can join* to **Approve new players** (each newcomer waits
+for you to press Approve) or **Allowlist only**, and tick IP re-approval if your friends' IPs are
+stable. That keeps strangers out, not a determined impersonator. Open the forwards for test
+sessions and close them afterwards.
 
 **Tailscale (simplest):** everyone joins your tailnet and uses the server's Tailscale address
 (the launcher labels it `Tailscale/VPN`) in the launch option. No port forwarding, works behind

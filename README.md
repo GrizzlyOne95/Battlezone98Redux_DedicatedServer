@@ -76,6 +76,25 @@ lobbies from the local health port. It needs no extra packages. Stop sends `stop
 are saved to `server_gui.json` (gitignored). The players/lobbies view comes from
 `GET http://127.0.0.1:8080/lobbies`, which is also usable on its own.
 
+#### Access control (who may join)
+
+Stock clients only present a claimed id: Steam's `steamAppTicket` cannot be validated without
+Rebellion's publisher key and GOG sends no ticket. So admission control keys on that id plus the
+connecting IP. It keeps strangers out of a friends server; it cannot stop someone who copies an
+approved player's public Steam id (IP pinning narrows that). For a real gate, put the server behind
+Tailscale.
+
+*   `--access-mode open|approve|allowlist` (default `open`, also saved in the state file).
+    `approve` holds an unknown player's login for `--approval-wait-seconds` (default 30) while the
+    operator decides, then refuses it; approving afterwards admits the client's next automatic retry.
+    `allowlist` refuses unknown ids at once.
+*   `--pin-ips` re-asks approval when an approved id connects from a new IP.
+*   Bans by id and/or IP; `--auth-rate-limit` login attempts per IP per minute (default 20).
+*   `GET /access` shows the mode, pending, approved and banned lists; `POST /access` with
+    `{"action": "set|approve|deny|remove|kick|ban|unban", ...}` changes them. POST is accepted only
+    from loopback even if `--health-host` is widened. The launcher's Access tab and the Players tab's
+    Approve/Kick/Ban buttons use these.
+
 #### Standalone Windows package
 
 `python build_package.py` builds `dist/BZRDedicatedServer-<version>.zip` for PCs without Python.
