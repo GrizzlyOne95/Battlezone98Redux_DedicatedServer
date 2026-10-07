@@ -60,6 +60,18 @@ tell its two members apart. Operators would forward the range instead of a
 single port. This hits only games where one player needs relay to two or
 more others, and has not been seen live.
 
+**Implemented (branch `agent/relay-per-route-ports`):** `server.py` now allocates
+one UDP port per relayed pair from `--relay-route-port-start/end` (default
+1340-1369; `1339` stays as the shared/fallback socket and as the only port when
+the start is 0). Both peers get the same port in `OnP2PRoute`; each side's
+endpoint is learned from its first datagram (source IP must match the expected
+player); the port is released when either player leaves the lobby or
+disconnects, on idle TTL, or when the relay is disabled. Range exhaustion logs
+a warning and falls back to the shared `1339` socket. Operators must forward the
+whole range. Not yet validated live with a stock client; the stock client
+accepting a non-1339 `OnP2PRoute.port` is read from the decompile (the port is
+taken as is) but untested end to end. Tests: `relay_route_ports_test.py`.
+
 ## 3. Transport header, settled
 
 | Field | Meaning |

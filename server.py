@@ -41,6 +41,10 @@ DEFAULT_UDP_PORT = 1338
 DEFAULT_RELAY_HOST = "0.0.0.0"
 DEFAULT_RELAY_PORT = 1339
 DEFAULT_RELAY_ROUTE_TTL_SECONDS = 180
+# Per-route relay ports (one UDP port per relayed player pair). 0/0 disables
+# and every route shares DEFAULT_RELAY_PORT. Operators must open this range.
+DEFAULT_RELAY_ROUTE_PORT_START = 1340
+DEFAULT_RELAY_ROUTE_PORT_END = 1369
 BZR_TRANSPORT_HEADER_BYTES = 18
 DEFAULT_HEALTH_HOST = "127.0.0.1"
 DEFAULT_HEALTH_PORT = 8080
@@ -3600,6 +3604,72 @@ class RelayRoute:
     observed_b: tuple[str, int] | None = None
     created_monotonic: float = field(default_factory=time.monotonic)
     last_activity_monotonic: float = field(default_factory=time.monotonic)
+    # Dedicated relay port for this pair (None = shared listen socket).
+    port: int | None = None
+    socket: Any = field(default=None, repr=False)
+
+
+class _RouteSocket:
+    """One bound UDP socket serving a single relay route.
+
+    The socket is bound synchronously (so the port is reserved immediately);
+    the asyncio transport attaches a moment later on the running loop.
+    """
+
+    def __init__(self, relay: "BZRRelayProtocol", port: int, bind_host: str) -> None:
+        self.port = port
+        self.route: RelayRoute | None = None
+        self.transport: asyncio.DatagramTransport | None = None
+        self.closed = False
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setblocking(False)
+            sock.bind((bind_host, port))
+        except OSError:
+            sock.close()
+            raise
+        self._sock = sock
+        outer = self
+
+        class _Proto(asyncio.DatagramProtocol):
+            def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+                if outer.route is not None:
+                    relay._handle_datagram(data, addr, outer.route, outer)
+
+            def error_received(self, exc: Exception) -> None:
+                relay.logger.warning("UDP relay route port %d error: %s", outer.port, exc)
+
+        self._task = loop.create_task(self._attach(loop, _Proto, sock))
+
+    async def _attach(self, loop: asyncio.AbstractEventLoop, proto_cls: Any, sock: socket.socket) -> None:
+        try:
+            transport, _ = await loop.create_datagram_endpoint(proto_cls, sock=sock)
+        except Exception:
+            sock.close()
+            return
+        if self.closed:
+            transport.close()
+        else:
+            self.transport = transport  # type: ignore[assignment]
+
+    def sendto(self, data: bytes, addr: tuple[str, int]) -> None:
+        if self.closed:
+            return
+        if self.transport is not None:
+            self.transport.sendto(data, addr)
+        else:
+            self._sock.sendto(data, addr)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.transport is not None:
+            self.transport.close()
+        else:
+            self._task.cancel()
+            self._sock.close()
 
 
 def _is_reliable_nonfinal_fragment(data: bytes) -> bool:
@@ -3788,6 +3858,15 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
     fallback associates routes from DoP2PRoute plus each user's known WAN
     endpoint.  If an endpoint maps to more than one candidate peer, forwarding
     stops rather than guessing and risking cross-session delivery.
+
+    Per-route ports: the stock client files relayed peers by source endpoint
+    (BZRNET_CLIENT_DECOMP_VALIDATION_20261006.md section 2), so when a route
+    range is configured every routed pair gets its own UDP socket and
+    ``OnP2PRoute.port`` names it.  A route socket serves exactly two peers;
+    each side's endpoint is learned from its first datagram (source IP must
+    match the expected player).  Without a range (or when the range is
+    exhausted) routes share the single listen socket and keep the legacy
+    endpoint-pair matching.
     """
 
     def __init__(
@@ -3798,9 +3877,22 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         route_ttl_seconds: int = DEFAULT_RELAY_ROUTE_TTL_SECONDS,
         fault_injector: RelayFaultInjector | None = None,
         trace_writer: RelayTraceWriter | None = None,
+        route_port_start: int = 0,
+        route_port_end: int = 0,
+        bind_host: str = DEFAULT_RELAY_HOST,
+        reserved_ports: set[int] | None = None,
+        route_socket_factory: Any = None,
     ) -> None:
         self.logger = logger
         self.state = state
+        # Inclusive per-route port range; 0/0 (or start > end) disables it.
+        self.route_port_start = int(route_port_start)
+        self.route_port_end = int(route_port_end)
+        self.bind_host = bind_host
+        self.reserved_ports = set(reserved_ports or ())
+        self.route_socket_factory = route_socket_factory or self._default_route_socket
+        self._port_cursor = self.route_port_start
+        self.port_exhausted_fallback_count = 0
         self.route_ttl_seconds = max(15, int(route_ttl_seconds))
         self.transport: asyncio.DatagramTransport | None = None
         self.listen_port = DEFAULT_RELAY_PORT
@@ -3821,6 +3913,49 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
     def enabled(self) -> bool:
         return self.routing_enabled and self.transport is not None
 
+    @property
+    def per_route_ports_enabled(self) -> bool:
+        return 0 < self.route_port_start <= self.route_port_end <= 65535
+
+    def _default_route_socket(self, port: int) -> _RouteSocket:
+        return _RouteSocket(self, port, self.bind_host)
+
+    def _allocate_route_socket(self) -> Any | None:
+        """Bind the next free port in the range, or None when none is available."""
+        if not self.per_route_ports_enabled:
+            return None
+        span = self.route_port_end - self.route_port_start + 1
+        for i in range(span):
+            port = self.route_port_start + (self._port_cursor - self.route_port_start + i) % span
+            if port in self.reserved_ports or port == self.listen_port:
+                continue
+            if any(r.port == port for r in self.routes.values()):
+                continue
+            try:
+                handle = self.route_socket_factory(port)
+            except (OSError, RuntimeError) as exc:
+                self.logger.debug("relay route port %d unavailable: %s", port, exc)
+                continue
+            self._port_cursor = port + 1 if port < self.route_port_end else self.route_port_start
+            return handle
+        return None
+
+    def _release_route(self, route: RelayRoute) -> None:
+        handle, route.socket = route.socket, None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                self.logger.exception("closing relay route socket failed")
+            if route.port is not None:
+                self.logger.info("Relay route port %d released (%s<->%s)", route.port, route.user_a, route.user_b)
+
+    def close(self) -> None:
+        """Release every route (and its port); used at shutdown."""
+        for route in list(self.routes.values()):
+            self._release_route(route)
+        self.routes.clear()
+
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
         sockname = transport.get_extra_info("sockname")
@@ -3834,7 +3969,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
     def set_enabled(self, enabled: bool) -> None:
         self.routing_enabled = bool(enabled)
         if not self.routing_enabled:
-            self.routes.clear()
+            self.close()
 
     def metrics(self) -> dict[str, Any]:
         self._expire_routes()
@@ -3842,6 +3977,10 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             "enabled": self.enabled,
             "listenPort": self.listen_port if self.transport is not None else None,
             "activeRoutes": len(self.routes),
+            "perRoutePortsEnabled": self.per_route_ports_enabled,
+            "routePortRange": [self.route_port_start, self.route_port_end] if self.per_route_ports_enabled else None,
+            "activeRoutePorts": sorted(r.port for r in self.routes.values() if r.port is not None),
+            "portExhaustedFallbacksTotal": self.port_exhausted_fallback_count,
             "packetsRxTotal": self.rx_count,
             "packetsTxTotal": self.tx_count,
             "packetsDroppedTotal": self.drop_count,
@@ -3863,7 +4002,9 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             if now - route.last_activity_monotonic > self.route_ttl_seconds
         ]
         for key in expired:
-            self.routes.pop(key, None)
+            route = self.routes.pop(key, None)
+            if route is not None:
+                self._release_route(route)
             self.expired_route_count += 1
 
     def remove_user(self, user_id: str, *, lobby_id: int | None = None) -> None:
@@ -3875,21 +4016,32 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 continue
             removed.append(key)
         for key in removed:
-            self.routes.pop(key, None)
+            route = self.routes.pop(key, None)
+            if route is not None:
+                self._release_route(route)
 
     def register_route(self, source: UserSession, target: UserSession) -> tuple[bool, str]:
+        ok, reason, _port = self.register_route_port(source, target)
+        return ok, reason
+
+    def register_route_port(self, source: UserSession, target: UserSession) -> tuple[bool, str, int | None]:
+        """Register (or refresh) a route and return ``(ok, reason, port)``.
+
+        ``port`` is the UDP port both peers must be told in ``OnP2PRoute``: a
+        dedicated per-route port when available, else the shared listen port.
+        """
         self._expire_routes()
         if not self.enabled:
-            return False, "relay transport is disabled"
+            return False, "relay transport is disabled", None
         if source.user_id == target.user_id:
-            return False, "relay target must be another player"
+            return False, "relay target must be another player", None
         if source.current_lobby_id is None or source.current_lobby_id != target.current_lobby_id:
-            return False, "relay peers must be in the same lobby"
+            return False, "relay peers must be in the same lobby", None
 
         source_endpoint = _parse_ipv4_endpoint(source.wan_address)
         target_endpoint = _parse_ipv4_endpoint(target.wan_address)
         if source_endpoint is None or target_endpoint is None:
-            return False, "both relay peers need a WAN ip:port endpoint"
+            return False, "both relay peers need a WAN ip:port endpoint", None
 
         key = tuple(sorted((source.user_id, target.user_id)))
         previous = self.routes.get(key)
@@ -3911,17 +4063,66 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             if previous.endpoint_b == endpoint_b:
                 route.observed_b = previous.observed_b
             route.created_monotonic = previous.created_monotonic
+            # Re-registering a pair (the other peer's DoP2PRoute, a retry) keeps
+            # its port so both sides keep seeing the same relay:port.
+            route.port, route.socket = previous.port, previous.socket
+            if route.socket is not None:
+                route.socket.route = route
+        if route.port is None and self.per_route_ports_enabled:
+            handle = self._allocate_route_socket()
+            if handle is None:
+                self.port_exhausted_fallback_count += 1
+                self.logger.warning(
+                    "Relay route port range %d-%d exhausted; %s<->%s falls back to shared port %d "
+                    "(fine for one relayed peer per client, ambiguous beyond that)",
+                    self.route_port_start, self.route_port_end, route.user_a, route.user_b, self.listen_port,
+                )
+                self.state.record_stdout_entry(
+                    "warn",
+                    f"Relay route port range exhausted; {route.user_a}<->{route.user_b} uses shared port {self.listen_port}",
+                )
+            else:
+                route.port, route.socket = handle.port, handle
+                handle.route = route
         self.routes[key] = route
+        advertised = route.port if route.port is not None else self.listen_port
+        shared_note = "" if route.port is not None else " (shared)"
         self.state.record_stdout_entry(
             "info",
             f"Relay route registered lobby={route.lobby_id} {route.user_a}<->{route.user_b} "
-            f"endpoints={route.endpoint_a[0]}:{route.endpoint_a[1]}<->{route.endpoint_b[0]}:{route.endpoint_b[1]}",
+            f"endpoints={route.endpoint_a[0]}:{route.endpoint_a[1]}<->{route.endpoint_b[0]}:{route.endpoint_b[1]} "
+            f"port={advertised}{shared_note}",
         )
-        return True, "ok"
+        return True, "ok", advertised
+
+    def _match_route_sender(self, route: RelayRoute, addr: tuple[str, int]) -> str | None:
+        """Pick side 'a'/'b' for a datagram on a dedicated route socket."""
+        a_hit = addr == route.endpoint_a or addr == route.observed_a
+        b_hit = addr == route.endpoint_b or addr == route.observed_b
+        if a_hit != b_hit:
+            return "a" if a_hit else "b"
+        if a_hit and b_hit:
+            self.ambiguous_drop_count += 1
+            return None
+        # Unknown source port (first packet / NAT rebinding): learn by source IP.
+        a_ip = addr[0] in {route.endpoint_a[0], route.observed_a[0] if route.observed_a else None}
+        b_ip = addr[0] in {route.endpoint_b[0], route.observed_b[0] if route.observed_b else None}
+        if a_ip != b_ip:
+            return "a" if a_ip else "b"
+        if a_ip and b_ip:
+            # Both peers behind one IP: unambiguous only while one side is unlearned.
+            if route.observed_a is None and route.observed_b is not None:
+                return "a"
+            if route.observed_b is None and route.observed_a is not None:
+                return "b"
+            self.ambiguous_drop_count += 1
+        return None
 
     def _match_sender(self, addr: tuple[str, int]) -> tuple[RelayRoute, str] | None:
         exact: dict[tuple[str, str], tuple[RelayRoute, str]] = {}
         for key, route in self.routes.items():
+            if route.port is not None:
+                continue
             if addr == route.endpoint_a or addr == route.observed_a:
                 exact[("|".join(key), "a")] = (route, "a")
             if addr == route.endpoint_b or addr == route.observed_b:
@@ -3937,6 +4138,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         # guessed because the unrecovered stock relay may carry an association id.
         ip_matches: dict[tuple[str, str], tuple[RelayRoute, str]] = {}
         for key, route in self.routes.items():
+            if route.port is not None:
+                continue
             a_ips = {route.endpoint_a[0]}
             b_ips = {route.endpoint_b[0]}
             if route.observed_a:
@@ -3954,6 +4157,16 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         return None
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        self._handle_datagram(data, addr, None, None)
+
+    def _handle_datagram(
+        self,
+        data: bytes,
+        addr: tuple[str, int],
+        route_hint: RelayRoute | None,
+        via: Any,
+    ) -> None:
+        """Shared ingest path. ``route_hint``/``via`` are set for per-route sockets."""
         self.rx_count += 1
         self._expire_routes()
 
@@ -3981,7 +4194,12 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             return
 
         ambiguous_before = self.ambiguous_drop_count
-        matched = self._match_sender(addr)
+        if route_hint is not None:
+            live = self.routes.get((route_hint.user_a, route_hint.user_b)) is route_hint
+            side_hint = self._match_route_sender(route_hint, addr) if live else None
+            matched = (route_hint, side_hint) if side_hint else None
+        else:
+            matched = self._match_sender(addr)
         if matched is None:
             self.drop_count += 1
             if self.ambiguous_drop_count == ambiguous_before:
@@ -4009,7 +4227,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             target = route.observed_a or route.endpoint_a
         route.last_activity_monotonic = time.monotonic()
 
-        if target == addr or self.transport is None:
+        out = via if via is not None else self.transport
+        if target == addr or out is None:
             self.drop_count += 1
             return
 
@@ -4055,7 +4274,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 )
                 return
 
-        self.transport.sendto(data, target)
+        out.sendto(data, target)
         self.tx_count += 1
         if sampled:
             self.state.record_protocol_event(
@@ -4989,9 +5208,9 @@ class BZRWebSocketServer:
             elif self.relay_protocol is None:
                 relay_reason = "relay transport is unavailable"
             else:
-                relay_route_ok, relay_reason = self.relay_protocol.register_route(session, target_session)
-                if relay_route_ok:
-                    relay_port = self.relay_protocol.listen_port
+                relay_route_ok, relay_reason, relay_port = self.relay_protocol.register_route_port(
+                    session, target_session
+                )
 
         success = target_session is not None and (not route or relay_route_ok)
         base_payload = {
@@ -5869,7 +6088,16 @@ async def run_server(args: argparse.Namespace) -> None:
             route_ttl_seconds=args.relay_route_ttl_seconds,
             fault_injector=fault_injector,
             trace_writer=trace_writer,
+            route_port_start=args.relay_route_port_start,
+            route_port_end=args.relay_route_port_end,
+            bind_host=args.relay_host,
+            reserved_ports={args.ws_port, args.udp_port, args.relay_port, args.health_port},
         )
+        if relay_protocol.per_route_ports_enabled:
+            logger.info(
+                "Relay per-route UDP ports %d-%d on %s (open this range, not just %d)",
+                args.relay_route_port_start, args.relay_route_port_end, args.relay_host, args.relay_port,
+            )
         state.relay_requested = True
     else:
         state.relay_requested = False
@@ -5963,6 +6191,8 @@ async def run_server(args: argparse.Namespace) -> None:
         await health_server.wait_closed()
 
     udp_transport.close()
+    if relay_protocol is not None:
+        relay_protocol.close()
     if relay_transport is not None:
         relay_transport.close()
     await asyncio.sleep(0.05)
@@ -5976,6 +6206,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help=f"UDP bind port (default: {DEFAULT_UDP_PORT})")
     parser.add_argument("--relay-host", default=DEFAULT_RELAY_HOST, help=f"UDP relay bind host (default: {DEFAULT_RELAY_HOST})")
     parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP relay port, 0 to disable (default: {DEFAULT_RELAY_PORT})")
+    parser.add_argument(
+        "--relay-route-port-start", type=int,
+        default=int(os.getenv("BZR_RELAY_ROUTE_PORT_START", DEFAULT_RELAY_ROUTE_PORT_START)),
+        help=f"First per-route UDP relay port (default: {DEFAULT_RELAY_ROUTE_PORT_START}); 0 = all routes share --relay-port",
+    )
+    parser.add_argument(
+        "--relay-route-port-end", type=int,
+        default=int(os.getenv("BZR_RELAY_ROUTE_PORT_END", DEFAULT_RELAY_ROUTE_PORT_END)),
+        help=f"Last per-route UDP relay port, inclusive (default: {DEFAULT_RELAY_ROUTE_PORT_END}). One port per relayed player pair; operators must open the whole range",
+    )
     parser.add_argument("--relay-route-ttl-seconds", type=int, default=DEFAULT_RELAY_ROUTE_TTL_SECONDS, help="Inactive relay route expiration interval")
     parser.add_argument("--disable-relay", action="store_true", help="Disable the community UDP relay transport")
     parser.add_argument(

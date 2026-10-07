@@ -118,7 +118,7 @@ Default bind addresses:
 
 *   WebSocket: `ws://0.0.0.0:1337`
 *   UDP endpoint probe: `0.0.0.0:1338`
-*   UDP relay: `0.0.0.0:1339`
+*   UDP relay: `0.0.0.0:1339` (shared/fallback) plus per-route ports `0.0.0.0:1340-1369`
 *   Health: `http://127.0.0.1:8080/health`
 *   Protocol: `http://127.0.0.1:8080/protocol`
 *   Captures: `http://127.0.0.1:8080/captures`
@@ -208,6 +208,7 @@ Notes:
 *   `/bzrserver=` replaces the stock lobby URL verbatim, so it must be a full `ws://host:port/` URL; a bare IP fails to connect. The client sends its UDP probe to the same host on the lobby port + 1 and uses the relay port the server advertises. Verified end to end on the GOG exe (2026-10-05).
 *   UDP `1338` performs the capture-confirmed public endpoint probe.
 *   UDP `1339` now forwards WS-associated peer-pair datagrams byte-for-byte; it does not deserialize `7a75`, `0x5f`, or other gameplay payloads.
+*   **Per-route relay ports.** The stock client files relayed peers by source endpoint, so one shared relay port cannot serve a client with two or more relayed peers. By default the server now binds one UDP port per relayed player pair from `--relay-route-port-start`/`--relay-route-port-end` (env `BZR_RELAY_ROUTE_PORT_START`/`_END`, default `1340`-`1369`, 30 concurrent routes) and tells both peers that port in `OnP2PRoute.port`. Each side's endpoint is learned from its first datagram (source IP must match the player). Ports are released when either player leaves the lobby or disconnects, on idle timeout (`--relay-route-ttl-seconds`), or when the relay is disabled. If the range is exhausted the route falls back to the shared `1339` socket (logged; works while each client has one relayed peer). Set `--relay-route-port-start 0` to restore the old shared-port-only behaviour. **Firewall/port forwarding: open the whole UDP range, not just `1339`.**
 *   The official `1339` association/allocation envelope is still unrecovered. The community relay intentionally drops ambiguous multi-target mappings, so strict/symmetric-NAT parity remains a live validation target.
 *   Run `python stock_client_compat_test.py` for in-process checks built around the executable-confirmed client message shapes.
 
@@ -216,7 +217,8 @@ Notes:
 *   Open/forward ports:
     *   TCP `1337` (WebSocket lobby)
     *   UDP `1338` (public endpoint probe)
-    *   UDP `1339` (opaque relay fallback)
+    *   UDP `1339` (opaque relay fallback / shared route port)
+    *   UDP `1340-1369` (per-route relay ports; one per relayed player pair; match `--relay-route-port-start/end`)
     *   TCP `8080` (health endpoint; can be LAN-only)
 *   Set DNS/hosts failover for `battlezone98mp.webdev.rebellion.co.uk` to your server IP if official host is unavailable.
 *   Run periodic health checks against `http://<server>:8080/health`.
