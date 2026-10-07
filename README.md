@@ -209,7 +209,41 @@ Notes:
 *   UDP `1338` performs the capture-confirmed public endpoint probe.
 *   UDP `1339` now forwards WS-associated peer-pair datagrams byte-for-byte; it does not deserialize `7a75`, `0x5f`, or other gameplay payloads.
 *   The official `1339` association/allocation envelope is still unrecovered. The community relay intentionally drops ambiguous multi-target mappings, so strict/symmetric-NAT parity remains a live validation target.
+*   Private tests with three or more clients can use the opt-in pair-port relay described below.
 *   Run `python stock_client_compat_test.py` for in-process checks built around the executable-confirmed client message shapes.
+
+### Private Multi-Client Relay
+
+Start the isolated server with `--relay-host 127.0.0.1 --relay-pair-ports` for
+multiple clients on one computer. Each negotiated peer pair gets its own
+ephemeral UDP port, advertised to both clients in `OnP2PRoute`. Datagrams leave
+through that same socket so the native client's source-endpoint lookup can
+distinguish every peer. Complete payloads and packet boundaries are preserved.
+Repeated and reversed route requests reuse the port. Leave, expiration, relay
+disable and shutdown close the socket; a failed allocation advertises no port.
+The shared listener rejects unassociated traffic in this mode.
+
+Run `python relay_pair_ports_test.py` for real UDP tests of three- and four-peer
+meshes, all six four-peer pairs in both directions, byte-exact payloads, native
+source-port identity, negotiation retries, unrelated senders, and lifecycle
+cleanup. The existing stock compatibility matrix (45/45), relay impairment
+checks (5/5), and server smoke checks (6/6) also passed on 2026-10-07.
+
+Native four-client validation used the isolated coopflow run
+`C:\BZRCoop\runs\cr-misn05-first-4p-20261007-170003`. All three guests joined as
+teams 2/3/4, all four clients entered misn05, and their complete player
+registries, local ownership, directional alliances and host authority checks
+passed. The relay reported six active pair ports, 11,658 received/forwarded
+datagrams and zero drops or ambiguous routes. Guest opening presentation,
+script-error and audio checks passed. That mission run subsequently failed a
+starting-resource assertion; this evidence validates four-client routing and
+mission entry, not a complete mission victory.
+
+This mode remains opt-in. Remote use requires access to the allocated UDP
+ports; official relay association parity and ambiguous NAT rebinding remain
+unqualified. Same-IP peers require distinct, known source ports. Route expiry
+is evaluated on route registration, datagrams and metrics reads, as in the
+shared-port mode.
 
 ### Preemptive Ops Checklist
 

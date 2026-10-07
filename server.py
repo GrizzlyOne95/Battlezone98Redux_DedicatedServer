@@ -3780,6 +3780,24 @@ class RelayTraceWriter:
             self._fh.close()
 
 
+class BZRPairRelayProtocol(asyncio.DatagramProtocol):
+    """A dedicated socket supplies the peer-pair association, not the payload."""
+
+    def __init__(self, owner: BZRRelayProtocol, route_key: tuple[str, str]) -> None:
+        self.owner = owner
+        self.route_key = route_key
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.owner.datagram_received(data, addr, route_key=self.route_key, pair_transport=self.transport)
+
+    def error_received(self, exc: Exception) -> None:
+        self.owner.error_received(exc)
+
+
 class BZRRelayProtocol(asyncio.DatagramProtocol):
     """Transparent datagram relay for WS-associated peer pairs.
 
@@ -3788,6 +3806,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
     fallback associates routes from DoP2PRoute plus each user's known WAN
     endpoint.  If an endpoint maps to more than one candidate peer, forwarding
     stops rather than guessing and risking cross-session delivery.
+    The opt-in pair-port mode allocates a separate UDP socket for each route,
+    allowing the same endpoint to participate in several opaque peer streams.
     """
 
     def __init__(
@@ -3798,6 +3818,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         route_ttl_seconds: int = DEFAULT_RELAY_ROUTE_TTL_SECONDS,
         fault_injector: RelayFaultInjector | None = None,
         trace_writer: RelayTraceWriter | None = None,
+        pair_ports: bool = False,
     ) -> None:
         self.logger = logger
         self.state = state
@@ -3806,6 +3827,9 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         self.listen_port = DEFAULT_RELAY_PORT
         self.routing_enabled = True
         self.routes: dict[tuple[str, str], RelayRoute] = {}
+        self.pair_ports = bool(pair_ports)
+        self.pair_transports: dict[tuple[str, str], asyncio.DatagramTransport] = {}
+        self._allocation_lock = asyncio.Lock()
         self.rx_count = 0
         self.tx_count = 0
         self.drop_count = 0
@@ -3834,7 +3858,20 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
     def set_enabled(self, enabled: bool) -> None:
         self.routing_enabled = bool(enabled)
         if not self.routing_enabled:
-            self.routes.clear()
+            for key in list(self.routes):
+                self._remove_route(key)
+
+    def _remove_route(self, key: tuple[str, str]) -> None:
+        self.routes.pop(key, None)
+        transport = self.pair_transports.pop(key, None)
+        if transport is not None:
+            transport.close()
+
+    def close(self) -> None:
+        self.set_enabled(False)
+        if self.transport is not None:
+            self.transport.close()
+            self.transport = None
 
     def metrics(self) -> dict[str, Any]:
         self._expire_routes()
@@ -3849,7 +3886,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             "unmappedDropsTotal": self.unmapped_drop_count,
             "expiredRoutesTotal": self.expired_route_count,
             "routeTtlSeconds": self.route_ttl_seconds,
-            "associationMode": "ws-route-endpoint-pair",
+            "associationMode": "ws-route-dedicated-port" if self.pair_ports else "ws-route-endpoint-pair",
+            "activePairPorts": len(self.pair_transports),
             "officialAssociationParity": False,
             "faultInjector": self.fault_injector.metrics() if self.fault_injector else {"mode": "", "active": False},
             "trace": self.trace_writer.metrics() if self.trace_writer else {"enabled": False},
@@ -3863,7 +3901,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             if now - route.last_activity_monotonic > self.route_ttl_seconds
         ]
         for key in expired:
-            self.routes.pop(key, None)
+            self._remove_route(key)
             self.expired_route_count += 1
 
     def remove_user(self, user_id: str, *, lobby_id: int | None = None) -> None:
@@ -3875,7 +3913,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 continue
             removed.append(key)
         for key in removed:
-            self.routes.pop(key, None)
+            self._remove_route(key)
 
     def register_route(self, source: UserSession, target: UserSession) -> tuple[bool, str]:
         self._expire_routes()
@@ -3893,6 +3931,9 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
 
         key = tuple(sorted((source.user_id, target.user_id)))
         previous = self.routes.get(key)
+        if previous is not None and previous.lobby_id != source.current_lobby_id:
+            self._remove_route(key)
+            previous = None
         if key[0] == source.user_id:
             endpoint_a, endpoint_b = source_endpoint, target_endpoint
         else:
@@ -3919,9 +3960,55 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         )
         return True, "ok"
 
-    def _match_sender(self, addr: tuple[str, int]) -> tuple[RelayRoute, str] | None:
+    async def allocate_route(self, source: UserSession, target: UserSession) -> tuple[bool, str, int | None]:
+        """Register a route and return only a port with a live backing socket.
+
+        Route signaling can arrive concurrently from both clients. Serializing
+        allocation keeps their advertised port stable through retries and
+        ensures that a peer-pair never accumulates duplicate sockets.
+        """
+        async with self._allocation_lock:
+            ok, reason = self.register_route(source, target)
+            if not ok:
+                return False, reason, None
+            if not self.pair_ports:
+                return True, "ok", self.listen_port
+            key = tuple(sorted((source.user_id, target.user_id)))
+            transport = self.pair_transports.get(key)
+            if transport is None:
+                assert self.transport is not None
+                sockname = self.transport.get_extra_info("sockname")
+                try:
+                    transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                        lambda: BZRPairRelayProtocol(self, key),
+                        local_addr=(sockname[0], 0),
+                    )
+                except OSError as exc:
+                    self._remove_route(key)
+                    self.logger.warning("Could not allocate relay port for %s: %s", key, exc)
+                    return False, "could not allocate relay pair port", None
+                # A disconnect, disable, or lobby change may occur while the
+                # event loop creates the socket. Do not publish a stale route.
+                route = self.routes.get(key)
+                if (not self.enabled or route is None
+                        or source.current_lobby_id != route.lobby_id
+                        or target.current_lobby_id != route.lobby_id):
+                    transport.close()
+                    self._remove_route(key)
+                    return False, "relay peers left before port allocation", None
+                self.pair_transports[key] = transport
+            port = int(transport.get_extra_info("sockname")[1])
+            return True, "ok", port
+
+    def _match_sender(
+        self, addr: tuple[str, int], route_key: tuple[str, str] | None = None,
+    ) -> tuple[RelayRoute, str] | None:
+        candidates = self.routes.items()
+        if route_key is not None:
+            route = self.routes.get(route_key)
+            candidates = [(route_key, route)] if route is not None else []
         exact: dict[tuple[str, str], tuple[RelayRoute, str]] = {}
-        for key, route in self.routes.items():
+        for key, route in candidates:
             if addr == route.endpoint_a or addr == route.observed_a:
                 exact[("|".join(key), "a")] = (route, "a")
             if addr == route.endpoint_b or addr == route.observed_b:
@@ -3936,7 +4023,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         # identifies one unique side.  Multiple candidates are deliberately not
         # guessed because the unrecovered stock relay may carry an association id.
         ip_matches: dict[tuple[str, str], tuple[RelayRoute, str]] = {}
-        for key, route in self.routes.items():
+        for key, route in candidates:
             a_ips = {route.endpoint_a[0]}
             b_ips = {route.endpoint_b[0]}
             if route.observed_a:
@@ -3953,7 +4040,11 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             self.ambiguous_drop_count += 1
         return None
 
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+    def datagram_received(
+        self, data: bytes, addr: tuple[str, int], *,
+        route_key: tuple[str, str] | None = None,
+        pair_transport: asyncio.DatagramTransport | None = None,
+    ) -> None:
         self.rx_count += 1
         self._expire_routes()
 
@@ -3981,7 +4072,16 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             return
 
         ambiguous_before = self.ambiguous_drop_count
-        matched = self._match_sender(addr)
+        if self.pair_ports:
+            # The shared listener is not an association in this mode. Reject
+            # it, and reject callbacks from a socket whose route was removed.
+            matched = (self._match_sender(addr, route_key)
+                       if route_key is not None and pair_transport is not None
+                       and self.pair_transports.get(route_key) is pair_transport else None)
+            send_transport = pair_transport
+        else:
+            matched = self._match_sender(addr)
+            send_transport = self.transport
         if matched is None:
             self.drop_count += 1
             if self.ambiguous_drop_count == ambiguous_before:
@@ -4009,7 +4109,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             target = route.observed_a or route.endpoint_a
         route.last_activity_monotonic = time.monotonic()
 
-        if target == addr or self.transport is None:
+        if target == addr or send_transport is None:
             self.drop_count += 1
             return
 
@@ -4055,7 +4155,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 )
                 return
 
-        self.transport.sendto(data, target)
+        send_transport.sendto(data, target)
         self.tx_count += 1
         if sampled:
             self.state.record_protocol_event(
@@ -4989,9 +5089,7 @@ class BZRWebSocketServer:
             elif self.relay_protocol is None:
                 relay_reason = "relay transport is unavailable"
             else:
-                relay_route_ok, relay_reason = self.relay_protocol.register_route(session, target_session)
-                if relay_route_ok:
-                    relay_port = self.relay_protocol.listen_port
+                relay_route_ok, relay_reason, relay_port = await self.relay_protocol.allocate_route(session, target_session)
 
         success = target_session is not None and (not route or relay_route_ok)
         base_payload = {
@@ -5869,6 +5967,7 @@ async def run_server(args: argparse.Namespace) -> None:
             route_ttl_seconds=args.relay_route_ttl_seconds,
             fault_injector=fault_injector,
             trace_writer=trace_writer,
+            pair_ports=args.relay_pair_ports,
         )
         state.relay_requested = True
     else:
@@ -5964,7 +6063,8 @@ async def run_server(args: argparse.Namespace) -> None:
 
     udp_transport.close()
     if relay_transport is not None:
-        relay_transport.close()
+        assert relay_protocol is not None
+        relay_protocol.close()
     await asyncio.sleep(0.05)
 
 
@@ -5976,6 +6076,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help=f"UDP bind port (default: {DEFAULT_UDP_PORT})")
     parser.add_argument("--relay-host", default=DEFAULT_RELAY_HOST, help=f"UDP relay bind host (default: {DEFAULT_RELAY_HOST})")
     parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP relay port, 0 to disable (default: {DEFAULT_RELAY_PORT})")
+    parser.add_argument("--relay-pair-ports", action="store_true", help="Allocate an ephemeral UDP port per peer pair (private multi-client testing; requires access to those ports)")
     parser.add_argument("--relay-route-ttl-seconds", type=int, default=DEFAULT_RELAY_ROUTE_TTL_SECONDS, help="Inactive relay route expiration interval")
     parser.add_argument("--disable-relay", action="store_true", help="Disable the community UDP relay transport")
     parser.add_argument(
