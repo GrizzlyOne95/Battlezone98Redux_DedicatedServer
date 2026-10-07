@@ -245,6 +245,58 @@ unqualified. Same-IP peers require distinct, known source ports. Route expiry
 is evaluated on route registration, datagrams and metrics reads, as in the
 shared-port mode.
 
+### Native Acceptance Check
+
+Opaque relay counters show forwarding, not whether the game accepted those
+packets. Analyze every client after a coopflow run with:
+
+```powershell
+python native_network_health.py --run-dir C:\BZRCoop\runs\<run-name> --clients 4 --json-out C:\BZRCoop\runs\<run-name>\native-network-health.json
+```
+
+The analyzer ignores a five-second loading grace interval and stale reliable
+retransmissions. Its default gate flags at least 20 type-0, zero-expected
+sequence rejections across four active one-second bins within a five-second
+window. Exit status is 0 when that pattern is absent, 1 when it occurs, and 2
+when logs, peer connections or observation time are incomplete. This is an
+explicit, configurable rejection-pattern gate, not a measured loss percentage.
+ACK comparisons include sample age because a native ACK log entry may be old;
+they are diagnostics and do not determine the gate result.
+`python native_network_health_test.py` covers the gate with sanitized fixtures.
+
+The native receive guard at `0x75D800` compares reliable and unreliable
+sequence numbers with the connection's receive counter. When an unreliable
+packet fails that comparison, the diagnostic deliberately prints expected
+zero; that does not establish a counter reset. The reliable send path at
+`0x75BEB0` keeps increasing its sequence as it queues packets, while retry mode
+in `0x75AAF0` drains limited batches. A reliable backlog can therefore make
+newer unreliable state/ping packets fail the strict sequence check.
+
+The four-client win attempt `cr-misn05-win-Overridemisn05-coop-4p-20261007-181309`
+exhibited this pattern on host/client 3. Client 3's cumulative ACK toward the
+host advanced from 250 to 1097, while its last rejected unreliable host
+sequence was 1383. Route callbacks had completed before the mission interval;
+there was no supported evidence of a signaling reset. Reliable retry logs
+contained substantial repeated Lua presentation traffic. This establishes
+backlog symptoms, but does not isolate the initial cause or prove a relay fix.
+
+The subsequent `cr-misn05-net-trace-4p-20261007-183555` run completed the full
+four-client win after campaign subtitle and scenario-timing fixes, using the
+same relay implementation. Every client passed the native rejection-pattern
+gate. Client 3 had zero post-grace zero-expected rejections from the host.
+The host still observed 113 sporadic rejections from client 1, with 17 in its
+worst five-second window, below the configured sustained-pattern threshold.
+The final native HUD showed all peers at 15 ms with displayed losses 10/0/0;
+the evidence supports recovery from the sustained client-3 failure, without
+claiming zero loss on every link. These local run artifacts remain in
+`C:\BZRCoop\runs`, including `native-network-health.json` and relay traces.
+
+Enable `--relay-trace <run-dir>/relay-trace.jsonl` for additional transport-header
+evidence. The analyzer summarizes it alongside the native logs. It reads only
+the first transport header per datagram; cumulative ACK/header ages and
+forwarded counts cannot independently establish native acceptance or relay-hop
+latency. Raw run logs and traces stay outside Git.
+
 ### Preemptive Ops Checklist
 
 *   Open/forward ports:
