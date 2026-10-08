@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from relay_impairment import PASS as IMPAIR_PASS, RelayImpairment, parse_spec as parse_impairment_spec
+
 websockets = None
 ConnectionClosed = Exception
 
@@ -3790,6 +3792,7 @@ class RelayTraceWriter:
         match_ordinal: int | None = None,
         route: dict[str, Any] | None = None,
         relay_endpoint: tuple[str, int] | None = None,
+        impairment: dict[str, Any] | None = None,
     ) -> None:
         record: dict[str, Any] = {
             "runId": self.run_id,
@@ -3822,6 +3825,8 @@ class RelayTraceWriter:
         }
         if match_ordinal is not None:
             record["matchOrdinal"] = match_ordinal
+        if impairment is not None:
+            record["impairment"] = impairment
         self._write_line(record)
 
     def event(self, name: str, **fields: Any) -> None:
@@ -3882,6 +3887,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         route_ttl_seconds: int = DEFAULT_RELAY_ROUTE_TTL_SECONDS,
         fault_injector: RelayFaultInjector | None = None,
         trace_writer: RelayTraceWriter | None = None,
+        impairment: RelayImpairment | None = None,
         pair_ports: bool = False,
         pair_port_start: int = 0,
         pair_port_end: int = 0,
@@ -3917,6 +3923,49 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         # path below is unchanged byte-transparent forwarding.
         self.fault_injector = fault_injector
         self.trace_writer = trace_writer
+        # Opt-in network impairment for private test runs (relay_impairment.py).
+        # None keeps the hot path immediate, byte-transparent forwarding.
+        self.impairment = impairment
+        self.impair_drop_count = 0
+        self.impair_late_drop_count = 0
+
+    def schedule_later(self, delay: float, callback: Any, *args: Any) -> None:
+        asyncio.get_running_loop().call_later(delay, callback, *args)
+
+    def set_impairment(self, spec_text: str) -> dict[str, Any]:
+        """Apply a new impairment spec, or clear it with an empty one. Raises ValueError."""
+        spec_text = (spec_text or "").strip()
+        previous = self.impairment
+        self.impairment = RelayImpairment(parse_impairment_spec(spec_text)) if spec_text else None
+        if self.impairment is not None:
+            self.logger.warning("RELAY IMPAIRMENT applied: %s -- private test runs only",
+                                self.impairment.spec.describe())
+        elif previous is not None:
+            self.logger.warning("RELAY IMPAIRMENT cleared (was %s)", previous.spec.describe())
+        self._impairment_event("impairment_set" if self.impairment else "impairment_cleared", previous)
+        return self.impairment_metrics()
+
+    def impairment_metrics(self) -> dict[str, Any]:
+        return self.impairment.metrics() if self.impairment else {"active": False, "spec": ""}
+
+    def _impairment_event(self, name: str, previous: RelayImpairment | None) -> None:
+        if self.trace_writer is not None:
+            self.trace_writer.event(name, spec=self.impairment.spec.describe() if self.impairment else "",
+                                    previous=previous.metrics() if previous else None)
+
+    def _user_labels(self, user_id: str) -> set[str]:
+        labels = {user_id}
+        session = self.state.sessions_by_user_id.get(user_id)
+        if session is not None:
+            labels.update(x for x in (session.name, session.player_name) if x)
+        return labels
+
+    def _send_impaired(self, transport: asyncio.DatagramTransport, data: bytes, target: tuple[str, int]) -> None:
+        if transport.is_closing():
+            self.impair_late_drop_count += 1
+            return
+        transport.sendto(data, target)
+        self.tx_count += 1
 
     @property
     def enabled(self) -> bool:
@@ -3975,6 +4024,9 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             "officialAssociationParity": False,
             "faultInjector": self.fault_injector.metrics() if self.fault_injector else {"mode": "", "active": False},
             "trace": self.trace_writer.metrics() if self.trace_writer else {"enabled": False},
+            "impairment": self.impairment_metrics(),
+            "impairmentDropsTotal": self.impair_drop_count,
+            "impairmentLateDropsTotal": self.impair_late_drop_count,
         }
 
     def _expire_routes(self) -> None:
@@ -4263,6 +4315,18 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         # previous behavior. The injector performs no interpretation beyond the
         # bare-0x80 predicate and never rewrites or reorders anything; the
         # sendto below always transmits `data` unmodified.
+        impairment = self.impairment
+        if impairment is not None and impairment.expired():
+            self.impairment = None
+            self.logger.warning("RELAY IMPAIRMENT expired (%s)", impairment.spec.describe())
+            self._impairment_event("impairment_expired", impairment)
+            impairment = None
+        decision = IMPAIR_PASS
+        if impairment is not None:
+            src_user, dst_user = (route.user_a, route.user_b) if side == "a" else (route.user_b, route.user_a)
+            decision = impairment.decide(len(data), (addr[0], addr[1], target[0], target[1]), src_user,
+                                         self._user_labels(src_user), self._user_labels(dst_user))
+
         instrumented = self.fault_injector is not None or self.trace_writer is not None
         if instrumented:
             stream_key = (addr[0], addr[1], target[0], target[1])
@@ -4272,7 +4336,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             if self.fault_injector is not None:
                 drop_for_faultinject = self.fault_injector.decide_drop(data, stream_key)
                 match_ordinal = self.fault_injector._stream_match_ordinals.get(stream_key)
-            disposition = "dropped_faultinject" if drop_for_faultinject else "forwarded"
+            disposition = ("dropped_faultinject" if drop_for_faultinject
+                           else f"dropped_impair_{decision.drop}" if decision.drop else "forwarded")
             if self.trace_writer is not None:
                 self.trace_writer.log(
                     direction=direction,
@@ -4283,6 +4348,11 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                     match_ordinal=match_ordinal,
                     route={"lobbyId": route.lobby_id, "users": [route.user_a, route.user_b], "sourceSide": side},
                     relay_endpoint=send_transport.get_extra_info("sockname"),
+                    impairment=None if decision is IMPAIR_PASS else {
+                        "drop": decision.drop,
+                        "delaysMs": [round(d * 1000.0, 3) for d in decision.delays],
+                        "reordered": decision.reordered,
+                    },
                 )
             if drop_for_faultinject:
                 assert self.fault_injector is not None
@@ -4298,8 +4368,16 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 )
                 return
 
-        send_transport.sendto(data, target)
-        self.tx_count += 1
+        if decision.drop is not None:
+            self.drop_count += 1
+            self.impair_drop_count += 1
+            return
+        for delay in decision.delays:
+            if delay > 0:
+                self.schedule_later(delay, self._send_impaired, send_transport, data, target)
+            else:
+                send_transport.sendto(data, target)
+                self.tx_count += 1
         if sampled:
             self.state.record_protocol_event(
                 channel="relay",
@@ -5992,18 +6070,42 @@ async def serve_health_http(
             await writer.drain()
             return
 
+        if method == "POST" and path == "/relay/impairment":
+            # Test control: only from this machine, whatever --health-host is.
+            peer = writer.get_extra_info("peername")
+            peer_ip = str(peer[0]) if isinstance(peer, tuple) and peer else ""
+            if not (peer_ip.startswith("127.") or peer_ip in ("::1", "::ffff:127.0.0.1")):
+                writer.write(_http_json(403, {"ok": False, "error": "relay impairment is local-only"}))
+            elif relay_protocol is None:
+                writer.write(_http_json(409, {"ok": False, "error": "the relay is disabled"}))
+            else:
+                raw = await asyncio.wait_for(reader.readexactly(content_length), timeout=2.0) if content_length else b"{}"
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                    spec = body.get("spec", "") if isinstance(body, dict) else None
+                    if not isinstance(spec, str):
+                        raise ValueError('body must be {"spec": "<impairment spec or empty to clear>"}')
+                    writer.write(_http_json(200, {"ok": True, "impairment": relay_protocol.set_impairment(spec)}))
+                except ValueError as exc:
+                    writer.write(_http_json(400, {"ok": False, "error": str(exc)}))
+            await writer.drain()
+            return
+
         if method != "GET":
             writer.write(_http_json(405, {"ok": False, "error": "Only GET supported"}))
             await writer.drain()
             return
 
-        if path not in ("/health", "/status", "/captures", "/protocol", "/lobbies", "/access"):
+        if path not in ("/health", "/status", "/captures", "/protocol", "/lobbies", "/access", "/relay/impairment"):
             writer.write(_http_json(404, {"ok": False, "error": "Unknown path"}))
             await writer.drain()
             return
 
         if path == "/access":
             payload = {"ok": True, "time": utc_now_str(), "access": state.access.snapshot()}
+        elif path == "/relay/impairment":
+            payload = {"ok": True, "time": utc_now_str(),
+                       "impairment": relay_protocol.impairment_metrics() if relay_protocol else {"active": False, "spec": ""}}
         elif path == "/lobbies":
             payload = build_lobbies_payload(state)
         elif path in ("/health", "/status"):
@@ -6135,6 +6237,8 @@ async def run_server(args: argparse.Namespace) -> None:
             pair_port_end=args.relay_pair_port_end,
             reserved_ports={args.udp_port, args.relay_port},
         )
+        if args.impair:
+            relay_protocol.set_impairment(args.impair)
         if args.relay_pair_ports:
             port_description = (f"UDP {args.relay_pair_port_start}-{args.relay_pair_port_end}"
                                 if args.relay_pair_port_start else "ephemeral UDP ports (private/local use)")
@@ -6264,6 +6368,15 @@ def parse_args() -> argparse.Namespace:
                         help="Last UDP pair port, inclusive (env BZR_RELAY_PAIR_PORT_END). Allow/forward this entire range for LAN/WAN players")
     parser.add_argument("--relay-route-ttl-seconds", type=int, default=DEFAULT_RELAY_ROUTE_TTL_SECONDS, help="Inactive relay route expiration interval")
     parser.add_argument("--disable-relay", action="store_true", help="Disable the community UDP relay transport")
+    parser.add_argument(
+        "--impair",
+        default=os.getenv("BZR_RELAY_IMPAIR", ""),
+        help=(
+            "Relay network impairment for private test runs, DEFAULT OFF (env BZR_RELAY_IMPAIR). "
+            "Example: loss=3,delay=80,jitter=20,seed=7. See relay_impairment.py for every key; "
+            "POST /relay/impairment changes it at run time. Never enable in normal service."
+        ),
+    )
     parser.add_argument(
         "--fault-inject",
         default=os.getenv("BZRNET_FAULT_INJECT", ""),
