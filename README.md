@@ -386,6 +386,33 @@ the clients entered retry mode. The existing header-only trace cannot exclude
 batched reliable tails; maximum native/relay captures are needed for that
 comparison. No relay behavior change was made on this evidence.
 
+### Network Impairment (private test runs only)
+
+The relay can stand in for a bad network so netcode changes can be tested
+under loss, latency and congestion without a packet-filter driver. It never
+rewrites a datagram, only decides whether each one is sent, when and how many
+times. It is off by default; never enable it on a server real players use.
+
+```text
+--impair "loss=3,delay=80,jitter=20,seed=7"
+```
+
+Keys (all optional, comma separated; full reference in `relay_impairment.py`):
+`loss=P` and `dup=P` (percent), `outage=D/T` (drop everything for D ms every
+T ms), `delay=MS` with `jitter=MS` (each stream stays in order), `reorder=P`
+with `reorder_ms=MS`, `rate=KBPS` with `queue=MS` (a per-player uplink cap with
+tail drop), `peer=A|B` with `dir=both|from|to` (only those players' streams),
+`for=S` (clear after S seconds) and `seed=N`. `loss=100,peer=<name>,for=20`
+blackholes one player for 20 seconds.
+
+`POST /relay/impairment` with `{"spec": "..."}` changes it while a session runs
+and `{"spec": ""}` clears it; like `/access` it only answers this machine.
+`GET /relay/impairment` and `/health` report its counters. With `--relay-trace`
+every impaired datagram records its drop reason or delivery delays, and each
+change is a trace event, so a run can be replayed in the order the receivers
+got it. `python relay_impairment_test.py` covers parsing, determinism, every
+mode and the relay hook.
+
 ### Preemptive Ops Checklist
 
 *   Open/forward ports:
