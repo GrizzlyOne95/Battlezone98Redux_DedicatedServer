@@ -3883,6 +3883,9 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         fault_injector: RelayFaultInjector | None = None,
         trace_writer: RelayTraceWriter | None = None,
         pair_ports: bool = False,
+        pair_port_start: int = 0,
+        pair_port_end: int = 0,
+        reserved_ports: set[int] | None = None,
     ) -> None:
         self.logger = logger
         self.state = state
@@ -3892,6 +3895,16 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         self.routing_enabled = True
         self.routes: dict[tuple[str, str], RelayRoute] = {}
         self.pair_ports = bool(pair_ports)
+        self.pair_port_start = int(pair_port_start)
+        self.pair_port_end = int(pair_port_end)
+        if (self.pair_port_start, self.pair_port_end) != (0, 0) and not (
+                1 <= self.pair_port_start <= self.pair_port_end <= 65535):
+            raise ValueError("relay pair port bounds must both be 0 (ephemeral) or an inclusive range within 1-65535")
+        self.reserved_ports = set(reserved_ports or ())
+        self._pair_port_cursor = self.pair_port_start
+        self.pair_port_allocation_failures = 0
+        self.shared_route_warnings = 0
+        self._last_ambiguity_warning = float("-inf")
         self.pair_transports: dict[tuple[str, str], asyncio.DatagramTransport] = {}
         self._allocation_lock = asyncio.Lock()
         self.rx_count = 0
@@ -3955,6 +3968,10 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             "routeTtlSeconds": self.route_ttl_seconds,
             "associationMode": "ws-route-dedicated-port" if self.pair_ports else "ws-route-endpoint-pair",
             "activePairPorts": len(self.pair_transports),
+            "pairPortRange": [self.pair_port_start, self.pair_port_end]
+            if self.pair_ports and self.pair_port_start else None,
+            "pairPortAllocationFailuresTotal": self.pair_port_allocation_failures,
+            "sharedRouteWarningsTotal": self.shared_route_warnings,
             "officialAssociationParity": False,
             "faultInjector": self.fault_injector.metrics() if self.fault_injector else {"mode": "", "active": False},
             "trace": self.trace_writer.metrics() if self.trace_writer else {"enabled": False},
@@ -4020,6 +4037,15 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 route.observed_b = previous.observed_b
             route.created_monotonic = previous.created_monotonic
         self.routes[key] = route
+        if not self.pair_ports and previous is None and any(
+                {route.endpoint_a, route.endpoint_b} & {other.endpoint_a, other.endpoint_b}
+                for other_key, other in self.routes.items() if other_key != key):
+            self.shared_route_warnings += 1
+            warning = (f"Shared UDP relay routes overlap for {route.user_a}<->{route.user_b}; "
+                       "multiple relayed peers cannot be distinguished. Enable --relay-pair-ports "
+                       "and configure an accessible UDP pair-port range for LAN/WAN players.")
+            self.logger.warning(warning)
+            self.state.record_stdout_entry("warn", warning)
         self.state.record_stdout_entry(
             "info",
             f"Relay route registered lobby={route.lobby_id} {route.user_a}<->{route.user_b} "
@@ -4044,16 +4070,17 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             transport = self.pair_transports.get(key)
             if transport is None:
                 assert self.transport is not None
-                sockname = self.transport.get_extra_info("sockname")
                 try:
-                    transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
-                        lambda: BZRPairRelayProtocol(self, key),
-                        local_addr=(sockname[0], 0),
-                    )
+                    transport = await self._bind_pair_transport(key)
                 except OSError as exc:
                     self._remove_route(key)
+                    self.pair_port_allocation_failures += 1
                     self.logger.warning("Could not allocate relay port for %s: %s", key, exc)
-                    return False, "could not allocate relay pair port", None
+                    reason = f"could not allocate relay pair port: {exc}"
+                    self.state.record_stdout_entry("warn", reason)
+                    if self.trace_writer is not None:
+                        self.trace_writer.event("route_allocation_failed", users=list(key), reason=reason)
+                    return False, reason, None
                 # A disconnect, disable, or lobby change may occur while the
                 # event loop creates the socket. Do not publish a stale route.
                 route = self.routes.get(key)
@@ -4070,6 +4097,39 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                                         users=list(key), relayEndpoint=transport.get_extra_info("sockname"),
                                         endpointA=self.routes[key].endpoint_a, endpointB=self.routes[key].endpoint_b)
             return True, "ok", port
+
+    async def _bind_pair_transport(self, key: tuple[str, str]) -> asyncio.DatagramTransport:
+        """Bind a usable pair port; a bounded pool never falls back to shared/ephemeral."""
+        assert self.transport is not None
+        host = self.transport.get_extra_info("sockname")[0]
+        loop = asyncio.get_running_loop()
+        if not self.pair_port_start:
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: BZRPairRelayProtocol(self, key), local_addr=(host, 0))
+            return transport
+
+        used = {int(t.get_extra_info("sockname")[1]) for t in self.pair_transports.values()}
+        unavailable = self.reserved_ports | used | {self.listen_port}
+        span = self.pair_port_end - self.pair_port_start + 1
+        collisions = 0
+        last_error: OSError | None = None
+        for offset in range(span):
+            port = self.pair_port_start + (self._pair_port_cursor - self.pair_port_start + offset) % span
+            if port in unavailable:
+                continue
+            try:
+                transport, _ = await loop.create_datagram_endpoint(
+                    lambda: BZRPairRelayProtocol(self, key), local_addr=(host, port))
+            except OSError as exc:
+                collisions += 1
+                last_error = exc
+                self.logger.debug("Relay pair UDP port %d cannot bind: %s", port, exc)
+                continue
+            self._pair_port_cursor = port + 1 if port < self.pair_port_end else self.pair_port_start
+            return transport
+        detail = f"; {collisions} bind failure(s), last: {last_error}" if last_error else ""
+        raise OSError(f"UDP pair-port range {self.pair_port_start}-{self.pair_port_end} is exhausted "
+                      f"or unavailable{detail}; free ports or enlarge the configured/forwarded range")
 
     def _match_sender(
         self, addr: tuple[str, int], route_key: tuple[str, str] | None = None,
@@ -4158,6 +4218,12 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             self.drop_count += 1
             if self.ambiguous_drop_count == ambiguous_before:
                 self.unmapped_drop_count += 1
+            elif not self.pair_ports and time.monotonic() - self._last_ambiguity_warning >= 5:
+                self._last_ambiguity_warning = time.monotonic()
+                warning = ("Shared UDP relay dropped an ambiguous peer datagram; enable --relay-pair-ports "
+                           "with an accessible UDP range when a player has multiple relayed peers.")
+                self.logger.warning(warning)
+                self.state.record_stdout_entry("warn", warning)
             self._trace_unroutable(data, addr, "ambiguous" if self.ambiguous_drop_count != ambiguous_before else "unmapped",
                                    route_key, pair_transport)
             if decoder is None:
@@ -6065,7 +6131,14 @@ async def run_server(args: argparse.Namespace) -> None:
             fault_injector=fault_injector,
             trace_writer=trace_writer,
             pair_ports=args.relay_pair_ports,
+            pair_port_start=args.relay_pair_port_start,
+            pair_port_end=args.relay_pair_port_end,
+            reserved_ports={args.udp_port, args.relay_port},
         )
+        if args.relay_pair_ports:
+            port_description = (f"UDP {args.relay_pair_port_start}-{args.relay_pair_port_end}"
+                                if args.relay_pair_port_start else "ephemeral UDP ports (private/local use)")
+            logger.info("Relay peer pairs use %s; LAN/WAN clients need access to every allocated port", port_description)
         state.relay_requested = True
     else:
         state.relay_requested = False
@@ -6177,7 +6250,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help=f"UDP bind port (default: {DEFAULT_UDP_PORT})")
     parser.add_argument("--relay-host", default=DEFAULT_RELAY_HOST, help=f"UDP relay bind host (default: {DEFAULT_RELAY_HOST})")
     parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP relay port, 0 to disable (default: {DEFAULT_RELAY_PORT})")
-    parser.add_argument("--relay-pair-ports", action="store_true", help="Allocate an ephemeral UDP port per peer pair (private multi-client testing; requires access to those ports)")
+    pair_mode = os.getenv("BZR_RELAY_PAIR_PORTS", "0").strip().lower()
+    if pair_mode not in {"", "0", "false", "no", "off", "1", "true", "yes", "on"}:
+        parser.error("BZR_RELAY_PAIR_PORTS must be 0/1 or false/true")
+    parser.add_argument("--relay-pair-ports", action=argparse.BooleanOptionalAction,
+                        default=pair_mode in {"1", "true", "yes", "on"},
+                        help="One UDP port per peer pair; use explicit bounds for LAN/WAN. Default off (env BZR_RELAY_PAIR_PORTS); --no-relay-pair-ports restores shared relay")
+    parser.add_argument("--relay-pair-port-start", type=int,
+                        default=os.getenv("BZR_RELAY_PAIR_PORT_START", "0"),
+                        help="First UDP pair port, inclusive (env BZR_RELAY_PAIR_PORT_START). Both bounds 0 uses ephemeral ports; bounds alone do not enable pair mode")
+    parser.add_argument("--relay-pair-port-end", type=int,
+                        default=os.getenv("BZR_RELAY_PAIR_PORT_END", "0"),
+                        help="Last UDP pair port, inclusive (env BZR_RELAY_PAIR_PORT_END). Allow/forward this entire range for LAN/WAN players")
     parser.add_argument("--relay-route-ttl-seconds", type=int, default=DEFAULT_RELAY_ROUTE_TTL_SECONDS, help="Inactive relay route expiration interval")
     parser.add_argument("--disable-relay", action="store_true", help="Disable the community UDP relay transport")
     parser.add_argument(
@@ -6231,7 +6315,11 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.relay_pair_port_start, args.relay_pair_port_end) != (0, 0) and not (
+            1 <= args.relay_pair_port_start <= args.relay_pair_port_end <= 65535):
+        parser.error("relay pair port bounds must both be 0 (ephemeral) or an inclusive range within 1-65535")
+    return args
 
 
 def main() -> None:

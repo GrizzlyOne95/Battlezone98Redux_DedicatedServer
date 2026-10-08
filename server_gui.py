@@ -57,6 +57,9 @@ DEFAULTS = {
     "udp_port": 1338,
     "relay_port": 1339,
     "relay_enabled": True,
+    "relay_pair_ports": False,
+    "relay_pair_port_start": 1340,
+    "relay_pair_port_end": 1369,
     "health_port": 8080,
     "state_file": str(HERE / "data" / "server_state.json"),
     "motd": "",
@@ -76,6 +79,15 @@ ACCESS_CHOICES = {
     "Approve new players": "approve",
     "Allowlist only": "allowlist",
 }
+
+
+def pair_port_notice(enabled: bool, start: int, end: int) -> str:
+    if not enabled:
+        return "Shared relay supports one relayed peer per player. Use separate pair ports for 3+ relayed players."
+    if start == end == 0:
+        return "Ephemeral pair ports: this PC only. Choose a fixed UDP range for LAN/internet players."
+    return (f"Pair relay UDP {start}-{end}: allow/forward this range too. "
+            f"{end - start + 1} pair ports total across all lobbies; four fully relayed players need six.")
 
 
 def lan_addresses() -> list[str]:
@@ -146,7 +158,8 @@ class ServerGUI:
         h = min(root.winfo_reqheight() + 16, root.winfo_screenheight() - 80)
         root.geometry(f"{w}x{h}")
         root.minsize(min(w, root.winfo_reqwidth()), min(h, root.winfo_reqheight()))
-        for key in ("ws_port", "udp_port", "relay_port", "bind", "public_host"):
+        for key in ("ws_port", "udp_port", "relay_port", "relay_pair_ports", "relay_pair_port_start",
+                    "relay_pair_port_end", "bind", "public_host"):
             self.vars[key].trace_add("write", lambda *_: self.update_switch())
         self.refresh_buttons()
 
@@ -217,6 +230,15 @@ class ServerGUI:
         label("Relay UDP", row)
         ttk.Spinbox(settings, from_=1, to=65535, textvariable=var("relay_port", tk.IntVar), width=7).grid(row=row, column=1, sticky="w")
         ttk.Checkbutton(settings, text="Relay enabled", variable=var("relay_enabled", tk.BooleanVar)).grid(row=row, column=2, columnspan=2, sticky="w")
+        row += 1
+
+        ttk.Checkbutton(settings, text="Separate UDP port per peer pair (3+ relayed players)",
+                        variable=var("relay_pair_ports", tk.BooleanVar)).grid(row=row, column=0, columnspan=4, sticky="w")
+        row += 1
+        label("Pair UDP from", row)
+        ttk.Spinbox(settings, from_=0, to=65535, textvariable=var("relay_pair_port_start", tk.IntVar), width=7).grid(row=row, column=1, sticky="w")
+        label("through", row, 2)
+        ttk.Spinbox(settings, from_=0, to=65535, textvariable=var("relay_pair_port_end", tk.IntVar), width=7).grid(row=row, column=3, sticky="w")
         row += 1
 
         label("Status port", row)
@@ -322,7 +344,7 @@ class ServerGUI:
         self.detect_btn.grid(row=3, column=2, padx=(4, 0), pady=(6, 0))
         ttk.Entry(conn, textvariable=self.wan_switch_var, state="readonly").grid(row=4, column=1, columnspan=2, sticky="we", pady=(2, 0))
         ttk.Button(conn, text="Copy", width=6, command=self.copy_wan_switch).grid(row=4, column=3, padx=(4, 0), pady=(2, 0))
-        self.wan_note = ttk.Label(conn, foreground="#666")
+        self.wan_note = ttk.Label(conn, foreground="#666", wraplength=520, justify="left")
         self.wan_note.grid(row=5, column=1, columnspan=3, sticky="w")
         self.update_lan()
 
@@ -557,6 +579,15 @@ class ServerGUI:
         ]
         if not v["relay_enabled"]:
             cmd.append("--disable-relay")
+        if v["relay_pair_ports"]:
+            start, end = int(v["relay_pair_port_start"]), int(v["relay_pair_port_end"])
+            if (start, end) != (0, 0) and not 1 <= start <= end <= 65535:
+                raise ValueError("Pair UDP bounds must both be 0 (this PC only), or a range within 1-65535.")
+            if start == end == 0 and not bind.startswith("127."):
+                raise ValueError("Choose a fixed pair UDP range for LAN/internet, or listen on 127.0.0.1 for ephemeral ports.")
+            cmd += ["--relay-pair-ports", "--relay-pair-port-start", str(start), "--relay-pair-port-end", str(end)]
+        else:
+            cmd.append("--no-relay-pair-ports")
         cmd += ["--access-mode", ACCESS_CHOICES.get(v["access_mode"], v["access_mode"]),
                 "--pin-ips" if v["pin_ips"] else "--no-pin-ips"]
         if v["retain_empty_lobbies"]:
@@ -718,8 +749,15 @@ class ServerGUI:
             relay = int(self.vars["relay_port"].get())
         except (tk.TclError, ValueError):
             relay = ws + 2
+        try:
+            pair_enabled = bool(self.vars["relay_pair_ports"].get())
+            pair_start = int(self.vars["relay_pair_port_start"].get())
+            pair_end = int(self.vars["relay_pair_port_end"].get())
+        except (tk.TclError, ValueError):
+            return
         self.wan_note.configure(
-            text=f"Public IP or DDNS name. Forward TCP {ws} + UDP {udp}, {relay} to this PC."
+            text=f"Public IP or DDNS name. Forward TCP {ws} + UDP {udp}, {relay} to this PC. "
+                 + pair_port_notice(pair_enabled, pair_start, pair_end)
         )
 
     def first_lan(self) -> str:

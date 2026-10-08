@@ -76,6 +76,11 @@ lobbies from the local health port. It needs no extra packages. Stop sends `stop
 are saved to `server_gui.json` (gitignored). The players/lobbies view comes from
 `GET http://127.0.0.1:8080/lobbies`, which is also usable on its own.
 
+For three or more players who may need relay fallback, enable **Separate UDP port per peer pair**
+and choose an inclusive UDP range (the launcher suggests `1340`–`1369`). Allow/forward that entire
+range as well as the lobby/probe ports. Existing saved settings keep shared relay selected until
+you enable pair mode. The connection help shows the required range and its capacity.
+
 #### Access control (who may join)
 
 Stock clients only present a claimed id: Steam's `steamAppTicket` cannot be validated without
@@ -118,13 +123,24 @@ Default bind addresses:
 
 *   WebSocket: `ws://0.0.0.0:1337`
 *   UDP endpoint probe: `0.0.0.0:1338`
-*   UDP relay: `0.0.0.0:1339`
+*   UDP relay: `0.0.0.0:1339` (shared mode by default; optional bounded peer-pair ports)
 *   Health: `http://127.0.0.1:8080/health`
 *   Protocol: `http://127.0.0.1:8080/protocol`
 *   Captures: `http://127.0.0.1:8080/captures`
 *   Lobbies/players: `http://127.0.0.1:8080/lobbies`
 
 ### Docker / Compose Deployment
+
+The base Compose file keeps shared relay. For multi-client relay, use the optional overlay:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.pair-ports.yml up --build
+```
+
+Set `BZR_RELAY_PAIR_PORT_START` / `BZR_RELAY_PAIR_PORT_END` in `.env` to the range you allow/forward.
+The overlay enables pair mode and publishes the same UDP range with identical host/container
+port numbers. Its default `1340`–`1369` gives 30 pair ports total across all active lobbies.
+`EXPOSE` in the Dockerfile is metadata; the Compose overlay performs port publishing.
 
 1.  Copy env template:
     ```bash
@@ -209,10 +225,34 @@ Notes:
 *   UDP `1338` performs the capture-confirmed public endpoint probe.
 *   UDP `1339` now forwards WS-associated peer-pair datagrams byte-for-byte; it does not deserialize `7a75`, `0x5f`, or other gameplay payloads.
 *   The official `1339` association/allocation envelope is still unrecovered. The community relay intentionally drops ambiguous multi-target mappings, so strict/symmetric-NAT parity remains a live validation target.
-*   Private tests with three or more clients can use the opt-in pair-port relay described below.
+*   A shared relay endpoint cannot distinguish multiple relayed peers for one player. The server
+    warns when shared routes overlap and drops ambiguous traffic. Use bounded pair ports for
+    LAN/WAN fallback meshes, or ephemeral pair ports for private loopback tests as described below.
 *   Run `python stock_client_compat_test.py` for in-process checks built around the executable-confirmed client message shapes.
 
-### Private Multi-Client Relay
+### Multi-Client Relay Ports
+
+For LAN/internet clients, explicitly enable one UDP port per peer pair and choose a range the
+clients can reach:
+
+```bash
+python server.py --relay-pair-ports --relay-pair-port-start 1340 --relay-pair-port-end 1369
+```
+
+Allow/forward UDP `1340`–`1369` as well as TCP `1337` and UDP `1338`–`1339`; substitute your chosen
+range everywhere. Only UDP probe/shared relay ports are excluded from allocation; TCP services
+can use the same numeric port without a UDP collision. Occupied UDP ports are skipped. When no
+usable port remains, negotiation fails with a range/bind error and advertises no endpoint;
+existing pairs keep working and the server never falls back to an ambiguous shared port.
+
+A fully relayed lobby with `n` players uses `n*(n-1)/2` pair ports: four players need six. Capacity
+is shared across all active lobbies. A `1340`–`1369` pool contains 30 ports, reduced by occupied or
+reserved ports. Disconnect, lobby leave, idle expiration and relay disable release the port.
+`/status` reports `pairPortRange`, `activePairPorts` and `pairPortAllocationFailuresTotal`.
+
+CLI defaults preserve shared relay. `BZR_RELAY_PAIR_PORTS=1` explicitly enables pair mode;
+`BZR_RELAY_PAIR_PORT_START` / `_END` supply the bounds. Bounds alone do not enable the mode.
+`--no-relay-pair-ports` overrides an environment opt-in. Both bounds `0` select ephemeral ports.
 
 Start the isolated server with `--relay-host 127.0.0.1 --relay-pair-ports` for
 multiple clients on one computer. Each negotiated peer pair gets its own
@@ -223,11 +263,19 @@ Repeated and reversed route requests reuse the port. Leave, expiration, relay
 disable and shutdown close the socket; a failed allocation advertises no port.
 The shared listener rejects unassociated traffic in this mode.
 
+Ephemeral ports are intended for isolated/private use; ordinary WAN port forwarding needs the
+bounded mode above. The launcher permits `0`/`0` only when listening on `127.0.0.1`. Its **Extra
+args** field still permits explicit CLI overrides, including older `--relay-pair-ports` settings.
+
 Run `python relay_pair_ports_test.py` for real UDP tests of three- and four-peer
 meshes, all six four-peer pairs in both directions, byte-exact payloads, native
 source-port identity, negotiation retries, unrelated senders, and lifecycle
 cleanup. The existing stock compatibility matrix (45/45), relay impairment
 checks (5/5), and server smoke checks (6/6) also passed on 2026-10-07.
+
+Run `python -m unittest relay_bounded_pair_ports_test server_gui_test` for bounded four-player
+endpoint identity, real UDP bind collisions, exhaustion cleanup, release/reuse, allocation/leave
+races, shared-mode warnings, CLI/environment configuration and GUI persistence/propagation.
 
 Native four-client validation used the isolated coopflow run
 `C:\BZRCoop\runs\cr-misn05-first-4p-20261007-170003`. All three guests joined as
