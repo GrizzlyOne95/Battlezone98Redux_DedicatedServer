@@ -297,6 +297,47 @@ the first transport header per datagram; cumulative ACK/header ages and
 forwarded counts cannot independently establish native acceptance or relay-hop
 latency. Raw run logs and traces stay outside Git.
 
+### Maximum Network Capture
+
+Use all of these server options for a private diagnostic run:
+
+```text
+--log-level DEBUG --relay-pair-ports --relay-trace <run-dir>/relay-trace.jsonl --relay-trace-payloads --protocol-trace <run-dir>/protocol-trace.jsonl
+```
+
+`DEBUG` is the maximum Python log level. The protocol JSONL additionally
+archives untruncated WS/UDP event payloads beyond the 400-entry `/captures`
+history, with authentication credentials and passwords redacted. The relay
+JSONL records every routed datagram and unroutable, socket-error and route
+lifecycle events. Routed records include the peer-pair/lobby identity,
+advertised relay socket, nanosecond wall timestamp, opaque datagram SHA-256 and
+first transport header. `--relay-trace-payloads` also copies the complete opaque
+datagram as hex, without decoding gameplay payloads or changing forwarding.
+It is off by default and adds logging overhead. Both traces share a run ID;
+their raw files, endpoints and game payloads stay outside Git.
+
+`python network_capture_test.py` validates history overflow, full message
+retention, credential redaction, byte-exact maximum capture, default payload
+omission, unroutable/error records and real pair-socket lifecycle capture.
+The native clients separately need `/netpktlog /netlog=3 /bzrnetlog=3` to log
+their original reliable and unreliable sends; server counters cannot replace
+native receive evidence.
+
+The host-skip case `cr-misn05-win-Overridemisn05-coop-Skipperhost-4p-20261007-191204`
+completed every mission/camera step but failed native acceptance in both
+directions between clients 1 and 2. The first offending unreliable sequence221
+reached the relay at 19:19:25.411, almost eight seconds before the first camera.
+The receiver rejected it against sequence220, while the required reliable
+sequence220 reached the relay only at 19:19:26.386. Corresponding native kind6
+rejection ACKs confirmed that all zero-expected rejections were ahead of the
+receiver's counter. Reliable sequence numbers remained contiguous and ACKs
+kept advancing; first-header timestamps did not reverse order in the relay.
+Rejections continued after camera release, so the evidence supports native
+reliable queue delay followed by unreliable overtaking, without isolating why
+the clients entered retry mode. The existing header-only trace cannot exclude
+batched reliable tails; maximum native/relay captures are needed for that
+comparison. No relay behavior change was made on this evidence.
+
 ### Preemptive Ops Checklist
 
 *   Open/forward ports:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -3211,6 +3212,47 @@ class AccessControl:
         }
 
 
+def redact_protocol_trace_payload(value: Any, *, message_type: str) -> Any:
+    """Retain full protocol shapes without persisting credentials."""
+    secret_names = {"password", "token", "ticket", "authticket", "steamticket", "adminkey", "secret", "authorization"}
+    if isinstance(value, dict):
+        password_update = str(value.get("key", "")).lower() == "password"
+        return {
+            key: "<redacted>" if (str(key).lower() in secret_names
+                                  or str(key).lower() == "key" and message_type == "Authorization"
+                                  or password_update and str(key).lower() in {"value", "val", "data"})
+            else redact_protocol_trace_payload(item, message_type=message_type)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_protocol_trace_payload(item, message_type=message_type) for item in value]
+    return value
+
+
+class ProtocolTraceWriter:
+    """Opt-in untruncated protocol event archive, independent of UI history."""
+
+    def __init__(self, path: str, run_id: str) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.lines_written = 0
+        self._fh = open(path, "a", encoding="utf-8", newline="\n")
+        self._write({"format": "bzr-protocol-trace", "version": 1, "runId": run_id})
+
+    def _write(self, record: dict[str, Any]) -> None:
+        self._fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._fh.flush()
+        self.lines_written += 1
+
+    def log(self, entry: dict[str, Any], payload: Any) -> None:
+        redacted = redact_protocol_trace_payload(payload, message_type=entry["type"])
+        self._write({**entry, "runId": self.run_id, "tsUnixNs": time.time_ns(),
+                     "preview": compact_preview(redacted), "payload": redacted})
+
+    def close(self) -> None:
+        self._fh.close()
+
+
 class ServerState:
     def __init__(
         self,
@@ -3219,6 +3261,7 @@ class ServerState:
         state_file: str | None = None,
         admin_key: str = "",
         admin_ids: set[str] | None = None,
+        protocol_trace: ProtocolTraceWriter | None = None,
     ) -> None:
         self.log = logger
         self.next_lobby_id = 1000
@@ -3235,6 +3278,7 @@ class ServerState:
         self.access = AccessControl(logger.getChild("access"), self.mark_dirty)
         self.stdout_history: list[str] = []
         self.protocol_history: list[dict[str, Any]] = []
+        self.protocol_trace = protocol_trace
         self._dirty = False
 
     def allocate_lobby_id(self) -> int:
@@ -3346,6 +3390,8 @@ class ServerState:
         }
         if decoder:
             entry["decoder"] = decoder
+        if self.protocol_trace is not None:
+            self.protocol_trace.log(entry, payload)
         self.protocol_history.append(entry)
         if len(self.protocol_history) > MAX_PROTOCOL_HISTORY:
             self.protocol_history = self.protocol_history[-MAX_PROTOCOL_HISTORY:]
@@ -3704,25 +3750,27 @@ class RelayTraceWriter:
     """Forensic JSONL trace of relayed datagrams (opt-in; local-only output).
 
     One line per routed datagram with transport-envelope fields only.  Payload
-    bytes are deliberately never written: decoding beyond the header is not
-    needed for later comparison (work order §4 forensic minimum).  Traces may
+    bytes are omitted by default; opt-in maximum capture copies complete
+    datagram bytes as hex without parsing them.  Traces may
     contain real endpoints; they live beside runtime state and must never be
     committed raw.
     """
 
     FORMAT_NAME = "bzr-relay-trace"
-    FORMAT_VERSION = 1
+    FORMAT_VERSION = 2
 
-    def __init__(self, path: str, run_id: str) -> None:
+    def __init__(self, path: str, run_id: str, *, include_payloads: bool = False) -> None:
         self.path = path
         self.run_id = run_id
         self.lines_written = 0
+        self.include_payloads = bool(include_payloads)
         self._fh = open(path, "a", encoding="utf-8", newline="\n")
         self._write_line(
             {
                 "format": self.FORMAT_NAME,
                 "version": self.FORMAT_VERSION,
                 "runId": run_id,
+                "payloadCapture": self.include_payloads,
             }
         )
 
@@ -3740,16 +3788,26 @@ class RelayTraceWriter:
         data: bytes,
         disposition: str,
         match_ordinal: int | None = None,
+        route: dict[str, Any] | None = None,
+        relay_endpoint: tuple[str, int] | None = None,
     ) -> None:
         record: dict[str, Any] = {
             "runId": self.run_id,
             "tsMonotonic": round(time.monotonic(), 6),
             "tsUnixMs": int(time.time() * 1000),
+            "tsUnixNs": time.time_ns(),
             "direction": direction,
             "source": f"{source[0]}:{source[1]}",
             "target": f"{target[0]}:{target[1]}",
             "disposition": disposition,
+            "datagramSha256": hashlib.sha256(data).hexdigest(),
         }
+        if route is not None:
+            record["route"] = route
+        if relay_endpoint is not None:
+            record["relayEndpoint"] = f"{relay_endpoint[0]}:{relay_endpoint[1]}"
+        if self.include_payloads:
+            record["datagramHex"] = data.hex()
         header_hex = data[:18].hex() if len(data) >= 18 else ""
         record["transport"] = {
             "flagsByte": f"0x{data[0]:02x}" if data else None,
@@ -3760,10 +3818,16 @@ class RelayTraceWriter:
             "headerBytes": len(header_hex) // 2,
             "payloadBytes": max(0, len(data) - BZR_TRANSPORT_HEADER_BYTES),
             "wireBytes": len(data),
+            "headerHex": header_hex,
         }
         if match_ordinal is not None:
             record["matchOrdinal"] = match_ordinal
         self._write_line(record)
+
+    def event(self, name: str, **fields: Any) -> None:
+        self._write_line({"runId": self.run_id, "tsMonotonic": round(time.monotonic(), 6),
+                          "tsUnixMs": int(time.time() * 1000), "tsUnixNs": time.time_ns(),
+                          "event": name, **fields})
 
     def metrics(self) -> dict[str, Any]:
         return {
@@ -3795,7 +3859,7 @@ class BZRPairRelayProtocol(asyncio.DatagramProtocol):
         self.owner.datagram_received(data, addr, route_key=self.route_key, pair_transport=self.transport)
 
     def error_received(self, exc: Exception) -> None:
-        self.owner.error_received(exc)
+        self.owner.error_received(exc, route_key=self.route_key, transport=self.transport)
 
 
 class BZRRelayProtocol(asyncio.DatagramProtocol):
@@ -3862,8 +3926,11 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 self._remove_route(key)
 
     def _remove_route(self, key: tuple[str, str]) -> None:
-        self.routes.pop(key, None)
+        removed = self.routes.pop(key, None)
         transport = self.pair_transports.pop(key, None)
+        if removed is not None and self.trace_writer is not None:
+            self.trace_writer.event("route_removed", lobbyId=removed.lobby_id, users=list(key),
+                                    relayEndpoint=transport.get_extra_info("sockname") if transport else None)
         if transport is not None:
             transport.close()
 
@@ -3998,6 +4065,10 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                     return False, "relay peers left before port allocation", None
                 self.pair_transports[key] = transport
             port = int(transport.get_extra_info("sockname")[1])
+            if self.trace_writer is not None:
+                self.trace_writer.event("route_allocated", lobbyId=source.current_lobby_id,
+                                        users=list(key), relayEndpoint=transport.get_extra_info("sockname"),
+                                        endpointA=self.routes[key].endpoint_a, endpointB=self.routes[key].endpoint_b)
             return True, "ok", port
 
     def _match_sender(
@@ -4069,6 +4140,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
 
         if not self.enabled:
             self.drop_count += 1
+            self._trace_unroutable(data, addr, "disabled", route_key, pair_transport)
             return
 
         ambiguous_before = self.ambiguous_drop_count
@@ -4086,6 +4158,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             self.drop_count += 1
             if self.ambiguous_drop_count == ambiguous_before:
                 self.unmapped_drop_count += 1
+            self._trace_unroutable(data, addr, "ambiguous" if self.ambiguous_drop_count != ambiguous_before else "unmapped",
+                                   route_key, pair_transport)
             if decoder is None:
                 decoder = _decode_bzr_transport_header(data)
                 if decoder:
@@ -4111,6 +4185,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
 
         if target == addr or send_transport is None:
             self.drop_count += 1
+            self._trace_unroutable(data, addr, "self-target-or-no-socket", route_key, pair_transport)
             return
 
         # Preserve the complete datagram and packet boundary exactly. The relay
@@ -4140,6 +4215,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                     data=data,
                     disposition=disposition,
                     match_ordinal=match_ordinal,
+                    route={"lobbyId": route.lobby_id, "users": [route.user_a, route.user_b], "sourceSide": side},
+                    relay_endpoint=send_transport.get_extra_info("sockname"),
                 )
             if drop_for_faultinject:
                 assert self.fault_injector is not None
@@ -4167,8 +4244,24 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 decoder=decoder,
             )
 
-    def error_received(self, exc: Exception) -> None:
+    def _trace_unroutable(
+        self, data: bytes, addr: tuple[str, int], reason: str,
+        route_key: tuple[str, str] | None, transport: asyncio.DatagramTransport | None,
+    ) -> None:
+        if self.trace_writer is not None:
+            raw_capture = {"datagramHex": data.hex()} if self.trace_writer.include_payloads else {}
+            self.trace_writer.event("unroutable_datagram", source=f"{addr[0]}:{addr[1]}",
+                                    reason=reason, users=list(route_key) if route_key else None,
+                                    relayEndpoint=transport.get_extra_info("sockname") if transport else None,
+                                    wireBytes=len(data), headerHex=data[:BZR_TRANSPORT_HEADER_BYTES].hex(),
+                                    datagramSha256=hashlib.sha256(data).hexdigest(), **raw_capture)
+
+    def error_received(self, exc: Exception, *, route_key: tuple[str, str] | None = None,
+                       transport: asyncio.DatagramTransport | None = None) -> None:
         self.logger.warning("UDP relay error: %s", exc)
+        if self.trace_writer is not None:
+            self.trace_writer.event("socket_error", error=str(exc), users=list(route_key) if route_key else None,
+                                    relayEndpoint=transport.get_extra_info("sockname") if transport else None)
 
 
 class BZRWebSocketServer:
@@ -5934,11 +6027,14 @@ async def run_server(args: argparse.Namespace) -> None:
 
     admin_ids = {x.strip() for x in args.admin_ids.split(",") if x.strip()}
     admin_key = args.admin_key or os.getenv("BZR_ADMIN_KEY", "")
+    diagnostic_run_id = uuid.uuid4().hex[:12]
+    protocol_trace = ProtocolTraceWriter(args.protocol_trace, diagnostic_run_id) if args.protocol_trace else None
     state = ServerState(
         logger.getChild("state"),
         state_file=args.state_file,
         admin_key=admin_key,
         admin_ids=admin_ids,
+        protocol_trace=protocol_trace,
     )
     state.load_state(retain_empty_lobbies=args.retain_empty_lobbies)
     state.access.approval_wait_seconds = max(1, args.approval_wait_seconds)
@@ -5959,7 +6055,8 @@ async def run_server(args: argparse.Namespace) -> None:
                 args.fault_inject,
             )
         if args.relay_trace:
-            trace_writer = RelayTraceWriter(args.relay_trace, run_id=uuid.uuid4().hex[:12])
+            trace_writer = RelayTraceWriter(args.relay_trace, run_id=diagnostic_run_id,
+                                            include_payloads=args.relay_trace_payloads)
             logger.info("Relay forensic trace writing to %s", args.relay_trace)
         relay_protocol = BZRRelayProtocol(
             logger.getChild("relay"),
@@ -6066,6 +6163,10 @@ async def run_server(args: argparse.Namespace) -> None:
         assert relay_protocol is not None
         relay_protocol.close()
     await asyncio.sleep(0.05)
+    if relay_protocol is not None and relay_protocol.trace_writer is not None:
+        relay_protocol.trace_writer.close()
+    if protocol_trace is not None:
+        protocol_trace.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -6093,6 +6194,10 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("BZRNET_RELAY_TRACE", ""),
         help="Optional JSONL forensic trace of routed relay datagrams (transport envelope fields only; local-only output)",
     )
+    parser.add_argument("--protocol-trace", default=os.getenv("BZRNET_PROTOCOL_TRACE", ""),
+                        help="Optional untruncated protocol event JSONL with credentials redacted; pair with --relay-trace for every opaque relay datagram")
+    parser.add_argument("--relay-trace-payloads", action="store_true",
+                        help="Maximum diagnostic capture: copy complete opaque datagrams to --relay-trace as hex; default OFF, adds disk/CPU load")
     parser.add_argument("--health-host", default=DEFAULT_HEALTH_HOST, help=f"Health HTTP bind host (default: {DEFAULT_HEALTH_HOST})")
     parser.add_argument("--health-port", type=int, default=DEFAULT_HEALTH_PORT, help=f"Health HTTP bind port, 0 to disable (default: {DEFAULT_HEALTH_PORT})")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"Path to persistent state JSON (default: {DEFAULT_STATE_FILE})")
