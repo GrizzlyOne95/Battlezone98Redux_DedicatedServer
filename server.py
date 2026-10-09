@@ -27,6 +27,7 @@ import socket
 import struct
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -3766,6 +3767,11 @@ class RelayTraceWriter:
         self.run_id = run_id
         self.lines_written = 0
         self.include_payloads = bool(include_payloads)
+        self.trace_id = uuid.uuid4().hex
+        self._packet_sequence = 0
+        self._socket_sequence = 0
+        self._socket_ids: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+        self.closed = False
         self._fh = open(path, "a", encoding="utf-8", newline="\n")
         self._write_line(
             {
@@ -3773,6 +3779,8 @@ class RelayTraceWriter:
                 "version": self.FORMAT_VERSION,
                 "runId": run_id,
                 "payloadCapture": self.include_payloads,
+                "traceId": self.trace_id,
+                "sendOutcomeCapture": True,
             }
         )
 
@@ -3780,6 +3788,14 @@ class RelayTraceWriter:
         self._fh.write(json.dumps(record, separators=(",", ":")) + "\n")
         self._fh.flush()
         self.lines_written += 1
+
+    def socket_id(self, transport: asyncio.DatagramTransport) -> str:
+        identity = self._socket_ids.get(transport)
+        if identity is None:
+            self._socket_sequence += 1
+            identity = f"{self.trace_id}:socket:{self._socket_sequence}"
+            self._socket_ids[transport] = identity
+        return identity
 
     def log(
         self,
@@ -3793,8 +3809,12 @@ class RelayTraceWriter:
         route: dict[str, Any] | None = None,
         relay_endpoint: tuple[str, int] | None = None,
         impairment: dict[str, Any] | None = None,
-    ) -> None:
+        send_context: dict[str, Any] | None = None,
+    ) -> str:
+        self._packet_sequence += 1
+        packet_id = f"{self.trace_id}:{self._packet_sequence}"
         record: dict[str, Any] = {
+            "packetId": packet_id,
             "runId": self.run_id,
             "tsMonotonic": round(time.monotonic(), 6),
             "tsUnixMs": int(time.time() * 1000),
@@ -3827,9 +3847,16 @@ class RelayTraceWriter:
             record["matchOrdinal"] = match_ordinal
         if impairment is not None:
             record["impairment"] = impairment
+        if send_context is not None:
+            record.update(send_context)
         self._write_line(record)
+        return packet_id
 
     def event(self, name: str, **fields: Any) -> None:
+        # Delayed sends and asynchronous socket errors may outlive capture.
+        # Their outcomes remain unknown in the closed trace.
+        if self.closed:
+            return
         self._write_line({"runId": self.run_id, "tsMonotonic": round(time.monotonic(), 6),
                           "tsUnixMs": int(time.time() * 1000), "tsUnixNs": time.time_ns(),
                           "event": name, **fields})
@@ -3843,9 +3870,12 @@ class RelayTraceWriter:
         }
 
     def close(self) -> None:
+        if self.closed:
+            return
         try:
             self._fh.flush()
         finally:
+            self.closed = True
             self._fh.close()
 
 
@@ -3960,12 +3990,48 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             labels.update(x for x in (session.name, session.player_name) if x)
         return labels
 
-    def _send_impaired(self, transport: asyncio.DatagramTransport, data: bytes, target: tuple[str, int]) -> None:
+    def _send_impaired(self, transport: asyncio.DatagramTransport, data: bytes, target: tuple[str, int],
+                       send_context: dict[str, Any] | None = None) -> None:
         if transport.is_closing():
             self.impair_late_drop_count += 1
+            self._trace_send_outcome(send_context, "skipped_closing", transport)
             return
-        transport.sendto(data, target)
+        self._send_relay(transport, data, target, send_context)
         self.tx_count += 1
+
+    def _trace_send_outcome(self, context: dict[str, Any] | None, outcome: str,
+                            transport: asyncio.DatagramTransport, exc: Exception | None = None,
+                            attempt_monotonic: float | None = None) -> None:
+        if self.trace_writer is None or self.trace_writer.closed or context is None:
+            return
+        fields = dict(context)
+        received = fields.pop("receivedMonotonic")
+        scheduled = fields.pop("scheduledMonotonic")
+        now = time.monotonic()
+        attempt = now if attempt_monotonic is None else attempt_monotonic
+        closing = getattr(transport, "is_closing", None)
+        fields.update(outcome=outcome, queueWaitMs=round((attempt - received) * 1000, 3),
+                      schedulerLagMs=round(max(0.0, attempt - scheduled) * 1000, 3),
+                      sendCallMs=round((now - attempt) * 1000, 3),
+                      transportClosing=closing() if closing else None)
+        if exc is not None:
+            fields.update(errorType=type(exc).__name__, error=str(exc))
+        # Deliberately no transport/disposition: legacy replay consumes only
+        # the existing decision rows, never these socket submission events.
+        self.trace_writer.event("socket_send", **fields)
+
+    def _send_relay(self, transport: asyncio.DatagramTransport, data: bytes,
+                    target: tuple[str, int], context: dict[str, Any] | None = None) -> None:
+        if context is None:
+            transport.sendto(data, target)
+            return
+        attempt = time.monotonic()
+        try:
+            transport.sendto(data, target)
+        except Exception as exc:
+            self._trace_send_outcome(context, "exception", transport, exc, attempt)
+            raise
+        self._trace_send_outcome(context, "submitted", transport, attempt_monotonic=attempt)
 
     @property
     def enabled(self) -> bool:
@@ -4228,6 +4294,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         route_key: tuple[str, str] | None = None,
         pair_transport: asyncio.DatagramTransport | None = None,
     ) -> None:
+        received_monotonic = time.monotonic() if self.trace_writer is not None else None
         self.rx_count += 1
         self._expire_routes()
 
@@ -4328,6 +4395,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                                          self._user_labels(src_user), self._user_labels(dst_user))
 
         instrumented = self.fault_injector is not None or self.trace_writer is not None
+        send_context = None
         if instrumented:
             stream_key = (addr[0], addr[1], target[0], target[1])
             direction = f"{addr[0]}:{addr[1]}->{target[0]}:{target[1]}"
@@ -4339,7 +4407,12 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             disposition = ("dropped_faultinject" if drop_for_faultinject
                            else f"dropped_impair_{decision.drop}" if decision.drop else "forwarded")
             if self.trace_writer is not None:
-                self.trace_writer.log(
+                src_user, dst_user = (route.user_a, route.user_b) if side == "a" else (route.user_b, route.user_a)
+                identity = {"sourceUser": src_user, "targetUser": dst_user,
+                            "routeKey": [route.user_a, route.user_b], "lobbyId": route.lobby_id,
+                            "socketId": self.trace_writer.socket_id(send_transport),
+                            "relayEndpoint": send_transport.get_extra_info("sockname")}
+                packet_id = self.trace_writer.log(
                     direction=direction,
                     source=addr,
                     target=target,
@@ -4353,7 +4426,13 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                         "delaysMs": [round(d * 1000.0, 3) for d in decision.delays],
                         "reordered": decision.reordered,
                     },
+                    send_context={k: v for k, v in identity.items() if k != "relayEndpoint"},
                 )
+                send_context = {**identity, "packetId": packet_id, "source": f"{addr[0]}:{addr[1]}",
+                                "target": f"{target[0]}:{target[1]}", "wireBytes": len(data),
+                                "receivedMonotonic": received_monotonic}
+                endpoint = identity["relayEndpoint"]
+                send_context["relayEndpoint"] = f"{endpoint[0]}:{endpoint[1]}" if endpoint else None
             if drop_for_faultinject:
                 assert self.fault_injector is not None
                 info = self.fault_injector.last_dropped or {}
@@ -4372,11 +4451,22 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             self.drop_count += 1
             self.impair_drop_count += 1
             return
-        for delay in decision.delays:
+        for copy_index, delay in enumerate(decision.delays):
+            context = None
+            if send_context is not None:
+                context = {**send_context, "copyIndex": copy_index, "copyCount": len(decision.delays),
+                           "scheduledDelayMs": round(delay * 1000, 3),
+                           "scheduledMonotonic": time.monotonic() + delay}
             if delay > 0:
-                self.schedule_later(delay, self._send_impaired, send_transport, data, target)
+                if context is None:
+                    self.schedule_later(delay, self._send_impaired, send_transport, data, target)
+                else:
+                    self.schedule_later(delay, self._send_impaired, send_transport, data, target, context)
             else:
-                send_transport.sendto(data, target)
+                if context is None:
+                    send_transport.sendto(data, target)
+                else:
+                    self._send_relay(send_transport, data, target, context)
                 self.tx_count += 1
         if sampled:
             self.state.record_protocol_event(
@@ -4404,8 +4494,11 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                        transport: asyncio.DatagramTransport | None = None) -> None:
         self.logger.warning("UDP relay error: %s", exc)
         if self.trace_writer is not None:
+            socket_transport = transport or self.transport
             self.trace_writer.event("socket_error", error=str(exc), users=list(route_key) if route_key else None,
-                                    relayEndpoint=transport.get_extra_info("sockname") if transport else None)
+                                    errorType=type(exc).__name__, packetCorrelation="unknown",
+                                    socketId=self.trace_writer.socket_id(socket_transport) if socket_transport else None,
+                                    relayEndpoint=socket_transport.get_extra_info("sockname") if socket_transport else None)
 
 
 class BZRWebSocketServer:

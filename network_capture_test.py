@@ -157,7 +157,7 @@ class PairCaptureTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(source, ("127.0.0.1", port))
                 relay.remove_user("A")
                 rows = records(path)
-                events = [r["event"] for r in rows if "event" in r]
+                events = [r["event"] for r in rows if r.get("event", "").startswith("route_")]
                 self.assertEqual(events, ["route_allocated", "route_removed"])
                 packet = next(r for r in rows if "disposition" in r)
                 self.assertEqual(packet["relayEndpoint"], f"127.0.0.1:{port}")

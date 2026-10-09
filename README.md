@@ -364,6 +364,30 @@ datagram as hex, without decoding gameplay payloads or changing forwarding.
 It is off by default and adds logging overhead. Both traces share a run ID;
 their raw files, endpoints and game payloads stay outside Git.
 
+With `--relay-trace`, routed decision records also have a unique `packetId`,
+`sourceUser`/`targetUser`, route identity, and a process-local `socketId` scoped
+to the trace instance. Each forwarded copy emits a separate `socket_send`
+event after `sendto` returns, or when it raises or a delayed callback skips a
+closing transport. Join on `packetId` and `copyIndex`; duplicate copies share
+one arrival ID. `outcome=submitted` means the transport call returned, accepting
+the datagram for OS submission (possibly buffered); it does not prove OS send
+success, network delivery, or client receipt. A closing transport may silently accept an immediate call;
+`transportClosing` records that state without changing the existing send path.
+Events record scheduled delay, actual queue wait from relay callback entry,
+scheduler lateness, and send-call duration in milliseconds. Existing decision
+timestamps and impairment counters describe planned forwarding; these outcome
+events provide submission evidence. Copies with no outcome at capture end
+remain unknown. Asynchronous `socket_error` events have socket identity but
+`packetCorrelation=unknown` because they cannot reliably identify one datagram.
+Send events omit `transport` and `disposition` so existing replay tools retain
+their original decision-based behavior. The trace header advertises
+`sendOutcomeCapture=true`. Both trace writers already flush every record.
+Diagnostics are disabled when no relay trace writer is configured.
+
+`python relay_observability_test.py` checks immediate and delayed outcomes,
+duplicate correlation, closing sockets and send failures, legacy replay
+filtering, and opaque byte-exact UDP forwarding on ephemeral loopback ports.
+
 `python network_capture_test.py` validates history overflow, full message
 retention, credential redaction, byte-exact maximum capture, default payload
 omission, unroutable/error records and real pair-socket lifecycle capture.
