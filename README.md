@@ -388,6 +388,32 @@ Diagnostics are disabled when no relay trace writer is configured.
 duplicate correlation, closing sockets and send failures, legacy replay
 filtering, and opaque byte-exact UDP forwarding on ephemeral loopback ports.
 
+Native same-PC qualification on 2026-10-09 used four private GOG clients and
+clean relay settings with mixed AI battles, nav beacons and ammo/repair pickups.
+The relay implementation tested was `fcc350d`; raw endpoint/payload captures
+remain private. Each run passed 32 gameplay/cleanup checks and native rejection
+health, with four clean, untruncated captures and zero capture drops:
+
+| AI / beacons / pickups | Source TX = decisions = submissions | Target RX gaps, whole run | Conservative post-ramp RX gaps |
+|---|---:|---:|---:|
+| 40 / 8 / 32 | 45,774 | 64 | 6 (5 unreliable, 1 reliable) |
+| 80 / 16 / 64 | 50,585 | 54 | 2 (unreliable) |
+| 160 / 16 / 128 | 57,709 | 58 | 5 (2 unreliable, 3 reliable) |
+
+All twelve directed links matched source bytes and correlated submitted outcomes;
+no missing outcomes, submission exceptions or byte mismatches were found. Inner
+windows exclude ramp and the finished sample, spanning 55.9 / 56.4 / 55.0 seconds,
+rather than exact 60-second intervals. Most whole-run gaps follow final receive
+activity on a target P2P socket generation, mostly after sampled combat. Binary RX also
+lacks those datagrams; this does not establish OS/network loss or native game
+acceptance. Native guest shutdown logs include receive error 10054 and invalid
+close error 10038, without proven causal attribution. Do not score a whole-run
+gap ratio as sustained-combat loss. The 160 run's queue wait p95/max was
+0.113/0.420 ms and send call p95/max 0.043/0.241 ms. This exercises server logging
+through the native chain; WAN, impaired battles, stock/fix battle A/B and soak
+remain separate qualification gates. RDP PrintWindow images were black/stale;
+rendering and FPS are not qualified by this evidence.
+
 `python network_capture_test.py` validates history overflow, full message
 retention, credential redaction, byte-exact maximum capture, default payload
 omission, unroutable/error records and real pair-socket lifecycle capture.
