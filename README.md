@@ -410,9 +410,21 @@ acceptance. Native guest shutdown logs include receive error 10054 and invalid
 close error 10038, without proven causal attribution. Do not score a whole-run
 gap ratio as sustained-combat loss. The 160 run's queue wait p95/max was
 0.113/0.420 ms and send call p95/max 0.043/0.241 ms. This exercises server logging
-through the native chain; WAN, impaired battles, stock/fix battle A/B and soak
+through the native chain; WAN, repeated impaired battle A/B and soak
 remain separate qualification gates. RDP PrintWindow images were black/stale;
 rendering and FPS are not qualified by this evidence.
+
+One completed 80-AI / 16-beacon / 64-pickup fix ON versus stock pair at 3%
+loss also exercised this logging. ON: 57,224 decisions, 1,719 intentional drops,
+55,505 forwarded/submitted; stock: 47,305 decisions, 1,417 drops, 45,888
+forwarded/submitted. All source bytes and socket outcomes matched across 12
+links, with complete clean captures. Both gameplay/cleanup passed, but both
+native rejection-health checks failed. Excluding intentional drops, additional
+target RX deficits were 86/87, including 1/11 in conservative post-ramp windows;
+80/72 occurred beyond final P2P RX. These are missing receive records, not
+proven OS delivery failures. The four-arm repeat stopped on the third arm's
+pre-impairment co-op admission failure. Retain incomplete qualification and the
+separate completed services matrix verdict; raw captures remain private.
 
 `python network_capture_test.py` validates history overflow, full message
 retention, credential redaction, byte-exact maximum capture, default payload
