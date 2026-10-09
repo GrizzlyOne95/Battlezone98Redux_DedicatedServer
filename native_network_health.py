@@ -2,9 +2,11 @@
 """Read native sequence rejection logs; relay forwarding alone is not health.
 
 This does not compute a packet-loss percentage. It flags a sustained native
-rejection pattern after a configurable loading grace interval. The native
-receive gate prints expected=0 for unreliable packets, so those records are
-reported as zero-expected rejections without inferring a sequence reset.
+rejection frequency after a configurable loading grace interval. A Drop line
+can print expected=0 even when the adjacent Received line has a nonzero
+expectation. Pair those records conservatively; unmatched expectations remain
+unknown. The historical frequency gate is unchanged and does not measure a
+continuous blackout or imply a sequence reset.
 Optional relay traces describe opaque forwarding and cumulative ACK progress;
 they cannot independently prove native packet acceptance.
 """
@@ -22,13 +24,35 @@ TIMESTAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)")
 DROP = re.compile(r"Dropping Packet Type (\d+) For Client (\S+) \(Packet #(\d+) received, #(\d+) expected\)")
 CONNECT = re.compile(r"Completed (?:RELAY|WAN|LAN) Connect For Client (\S+), using address (\S+)")
 SENT = re.compile(r"(?:TRY|REL|UNR) Sent Packet \((\d+),(\d+)\) to ([^: ]+:\d+):")
+RECEIVED = re.compile(r"Received Packet \((\d+),(\d+)\) expecting \((\d+),(\d+)\) from (\S+) sent at \d+, received at \d+, diff -?\d+: ([0-9a-fA-F]+)\s*$")
+
+
+def paired_receive(previous: str, timestamp: float, rejected, routes: dict):
+    """Only an adjacent, matching, complete native header can identify a drop."""
+    stamp = TIMESTAMP.match(previous)
+    received = RECEIVED.search(previous)
+    if not stamp or not received:
+        return None, None
+    age = timestamp - datetime.fromisoformat(stamp[1]).timestamp()
+    if not 0 <= age <= 0.05 or routes.get(received[5]) != rejected[2]:
+        return None, None
+    try:
+        header = bytes.fromhex(received[6])
+    except ValueError:
+        return None, None
+    if (len(header) < 18 or int.from_bytes(header[10:14], "big") != int(received[1]) or
+            int.from_bytes(header[14:18], "big") != int(received[2]) or
+            int(received[1]) != int(rejected[3]) or header[1] != int(rejected[1])):
+        return None, None
+    return int(received[3]), header[0]
 
 
 def analyze_native_text(text: str, *, grace_seconds: float = 5,
                         window_seconds: int = 5, rejection_threshold: int = 20,
                         active_seconds_threshold: int = 4) -> dict:
     lines = []
-    for line in text.splitlines():
+    raw_lines = text.splitlines()
+    for line in raw_lines:
         match = TIMESTAMP.match(line)
         if match:
             lines.append((datetime.fromisoformat(match[1]).timestamp(), line))
@@ -43,7 +67,11 @@ def analyze_native_text(text: str, *, grace_seconds: float = 5,
     routes = {}
     drops = defaultdict(list)
     acks = defaultdict(list)
-    for timestamp, line in lines:
+    for index, line in enumerate(raw_lines):
+        stamp = TIMESTAMP.match(line)
+        if not stamp:
+            continue
+        timestamp = datetime.fromisoformat(stamp[1]).timestamp()
         connected = CONNECT.search(line)
         if connected:
             routes[connected[2]] = connected[1]
@@ -52,7 +80,8 @@ def analyze_native_text(text: str, *, grace_seconds: float = 5,
             acks[routes[sent[3]]].append((timestamp, int(sent[2])))
         rejected = DROP.search(line)
         if rejected and start <= timestamp <= stop:
-            drops[rejected[2]].append((timestamp, int(rejected[1]), int(rejected[3]), int(rejected[4])))
+            expected, flags = paired_receive(raw_lines[index - 1] if index else "", timestamp, rejected, routes)
+            drops[rejected[2]].append((timestamp, int(rejected[1]), int(rejected[3]), int(rejected[4]), expected, flags))
     peers = []
     for peer in sorted(set(routes.values()) | set(drops)):
         events = drops[peer]
@@ -81,6 +110,10 @@ def analyze_native_text(text: str, *, grace_seconds: float = 5,
             "peer": peer, "status": "fail" if sustained else "pass",
             "rejectionsTotal": len(events), "loadingGraceRejections": len(events) - len(after_grace),
             "zeroExpectedAfterGrace": len(zero_expected), "staleAfterGrace": len(stale),
+            "unreliableRejectedAfterGrace": sum(e[5] is not None and not (e[5] & 0x80) for e in after_grace),
+            "actualReceiveExpectedZero": sum(e[4] == 0 for e in zero_expected),
+            "actualReceiveExpectedNonzero": sum(e[4] is not None and e[4] != 0 for e in zero_expected),
+            "actualReceiveExpectedUnknown": sum(e[4] is None for e in zero_expected),
             "worstWindow": worst, "sustainedWindowStartsSeconds": sustained,
             "ackFirst": ack_values[0][1] if ack_values else None,
             "ackLast": ack_values[-1][1] if ack_values else None,
@@ -95,7 +128,10 @@ def analyze_native_text(text: str, *, grace_seconds: float = 5,
             "missionObservedSeconds": round(stop - start, 3),
             "graceSeconds": grace_seconds, "windowSeconds": window_seconds,
             "rejectionThreshold": rejection_threshold,
-            "activeSecondsThreshold": active_seconds_threshold, "peers": peers}
+            "activeSecondsThreshold": active_seconds_threshold, "peers": peers,
+            "criterion": "frequency of type-0 Drop diagnostics printing expected=0; not continuous blackout duration",
+            "legacyFieldNote": "zeroExpected* fields retain printed Drop values, not actual receiver expectation",
+            "receiveExpectationScope": "actualReceiveExpected counts partition zeroExpectedAfterGrace using adjacent matching Received headers within 50 ms; unknown is not zero"}
 
 
 def analyze_trace(path: Path) -> dict:
@@ -144,7 +180,7 @@ def analyze_run(run_dir: Path, *, clients: int = 4, **options) -> dict:
     status = "fail" if any(r["status"] == "fail" for r in results) else (
         "incomplete" if any(r["status"] == "incomplete" for r in results) else "pass")
     output = {"status": status, "runDir": str(run_dir), "clients": results,
-              "interpretation": "pass means no sustained native zero-expected rejection pattern in the observed mission interval, not measured zero packet loss"}
+              "interpretation": "pass means no sustained native rejection-frequency pattern in the observed mission interval; printed expected=0 is not actual receiver expectation, and the gate does not measure packet loss or continuous blackout duration"}
     trace = run_dir / "relay-trace.jsonl"
     if trace.exists():
         output["relayTrace"] = analyze_trace(trace)
@@ -174,7 +210,8 @@ def main() -> int:
         for peer in client["peers"]:
             ack_age = peer["ackSampleAgeAtLastRejectionSeconds"]
             age_text = f"{ack_age}s" if ack_age is not None else "unavailable"
-            print(f"    {peer['peer']}: zero-expected rejects={peer['zeroExpectedAfterGrace']} "
+            print(f"    {peer['peer']}: printed-zero rejection count={peer['zeroExpectedAfterGrace']} "
+                  f"actual expected zero/nonzero/unknown={peer['actualReceiveExpectedZero']}/{peer['actualReceiveExpectedNonzero']}/{peer['actualReceiveExpectedUnknown']} "
                   f"worst window={peer['worstWindow']['count']} "
                   f"ACK={peer['ackFirst']}->{peer['ackLast']} sampled sequence/ACK lag={peer['lastZeroExpectedMinusAck']} "
                   f"ACK sample age={age_text}")

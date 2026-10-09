@@ -303,11 +303,16 @@ python native_network_health.py --run-dir C:\BZRCoop\runs\<run-name> --clients 4
 ```
 
 The analyzer ignores a five-second loading grace interval and stale reliable
-retransmissions. Its default gate flags at least 20 type-0, zero-expected
-sequence rejections across four active one-second bins within a five-second
+retransmissions. Its default gate flags at least 20 type-0 rejections whose
+Drop diagnostic prints expected=0, across four active one-second bins within a five-second
 window. Exit status is 0 when that pattern is absent, 1 when it occurs, and 2
 when logs, peer connections or observation time are incomplete. This is an
-explicit, configurable rejection-pattern gate, not a measured loss percentage.
+explicit, configurable rejection-frequency gate, not a measured loss percentage
+or a continuous five-second blackout. The Drop line's expected=0 is not the
+receiver's actual expected sequence: a matching preceding Received line can
+show a nonzero expectation. The analyzer reports those paired expectations
+separately and leaves unmatched expectations unknown. Historical gate results
+and legacy field names retain their original diagnostic-count meaning.
 ACK comparisons include sample age because a native ACK log entry may be old;
 they are diagnostics and do not determine the gate result.
 `python native_network_health_test.py` covers the gate with sanitized fixtures.
@@ -425,6 +430,44 @@ target RX deficits were 86/87, including 1/11 in conservative post-ramp windows;
 proven OS delivery failures. The four-arm repeat stopped on the third arm's
 pre-impairment co-op admission failure. Retain incomplete qualification and the
 separate completed services matrix verdict; raw captures remain private.
+
+An unchanged-policy synchronized respawn diagnostic under periodic one-second
+outages passed 14 steps, 24 checks and native rejection health. All four owners
+died within 2 ms during the logged outage and chose rally fallback. Across the
+complete trace, 65,641 decisions equal 60,817 forwarded/submitted plus 4,824
+intentional drops; source TX matches on every link, with no missing outcomes
+or socket errors. Four complete clean captures retain 108 additional RX gaps,
+99 beyond final P2P RX, and none during the aligned outage-to-placement window
+after intentional drops are excluded. A successful synchronized reproduction
+does not erase the earlier staggered-death failure or qualify every outage
+offset. Native submission still does not prove delivery or application acceptance.
+
+The remaining seed-112 ON/stock battle pair completed too: gameplay/cleanup
+passed in all four completed arms, while every whole-mission rejection-frequency
+gate failed. Matched post-ramp modeled blackout seconds per link-minute were
+0.6334/17.1155 (seed 12) and 0.5566/26.3344 (seed 112), ON/stock. Those are
+forwarding-based replay durations, not measured native acceptance. Frequency
+windows entirely inside post-ramp combat affected 1/11 and 0/12 directed links.
+The interrupted pre-impairment startup attempts remain separate INCOMPLETE
+records; native DLL, server implementation and battle workload matched.
+
+Seed-112 ON logging has 56,284 decisions = 54,601 submitted + 1,683 deliberate
+drops; stock has 50,282 = 48,782 submitted + 1,500 drops. Exact source bytes
+and every correlated outcome match, with four clean captures per arm. Extra
+target JSON RX deficits excluding deliberate drops are 106/83, including 5/11
+post-ramp. All 83 stock deficits are also missing by binary multiset count;
+two duplicate hashes cannot uniquely identify a missing occurrence. Three
+other datagrams are in JSON without a matching binary receive, an unresolved
+capture discrepancy despite complete ring retention. Stock deficits precede
+its final P2P RX, unlike the mostly late deficits in other runs. Full network
+qualification remains open.
+
+The analyzer correction passed 14 focused fixtures and preserved every legacy
+field/status across all four battle logs. All 1,168/5,503/865/8,921 counted
+printed-zero rejections (ON1/stock1/ON2/stock2) paired to actual nonzero receiver
+expectations. One investigated ON1 window contained 36 received-but-rejected
+datagrams and four short replay gaps of 94/86/120/94 ms, explaining a frequency
+failure without a continuous five-second blackout. Raw diagnostics stay private.
 
 `python network_capture_test.py` validates history overflow, full message
 retention, credential redaction, byte-exact maximum capture, default payload
