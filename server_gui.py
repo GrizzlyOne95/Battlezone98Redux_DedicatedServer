@@ -378,12 +378,14 @@ class ServerGUI:
         )
         self.user_tree = self.make_tree(
             nb, "Players",
-            [("id", "User ID", 160), ("name", "Name", 180), ("auth", "Auth", 70), ("lobby", "Lobby", 70), ("where", "Where", 90), ("wan", "Address", 180), ("admin", "Admin", 60)],
+            [("id", "User ID", 160), ("name", "Name", 180), ("auth", "Auth", 150), ("lobby", "Lobby", 70), ("where", "Where", 90), ("wan", "Address", 180), ("admin", "Admin", 60), ("muted", "Muted", 60)],
             buttons=[
                 ("Approve", lambda: self.act_selected(self.user_tree, "approve")),
                 ("Kick", lambda: self.act_selected(self.user_tree, "kick")),
                 ("Ban", lambda: self.act_selected(self.user_tree, "ban", confirm="Ban {n}?")),
                 ("Ban + IP", lambda: self.act_selected(self.user_tree, "ban", withIp=True, confirm="Ban {n} and their IP?")),
+                ("Mute 15 min", lambda: self.act_selected(self.user_tree, "mute", duration="15m")),
+                ("Unmute", lambda: self.act_selected(self.user_tree, "unmute")),
             ],
         )
         self.build_access_tab(nb)
@@ -458,9 +460,15 @@ class ServerGUI:
         )
         self.bans_tree = self.make_tree(
             frame, "Bans",
-            [("what", "Banned", 200), ("kind", "Type", 60), ("name", "Name", 170), ("reason", "Reason", 200), ("at", "When", 150)],
+            [("what", "Banned", 200), ("kind", "Type", 60), ("name", "Name", 170), ("reason", "Reason", 200), ("at", "When", 150), ("expires", "Expires", 150)],
             height=3,
             buttons=[("Unban", self.unban_selected)],
+        )
+        self.mutes_tree = self.make_tree(
+            frame, "Muted players",
+            [("id", "User ID", 170), ("name", "Name", 170), ("reason", "Reason", 200), ("at", "When", 150), ("expires", "Expires", 150)],
+            height=3,
+            buttons=[("Unmute", lambda: self.act_selected(self.mutes_tree, "unmute"))],
         )
         self.last_pending_count = 0
 
@@ -534,11 +542,15 @@ class ServerGUI:
             for a in access.get("approved", [])
         ])
         self.fill_tree(self.bans_tree, [
-            (f"id:{b['id']}", (b["id"], "ID", b.get("name", ""), b.get("reason", ""), b.get("at", "")))
+            (f"id:{b['id']}", (b["id"], "ID", b.get("name", ""), b.get("reason", ""), b.get("at", ""), b.get("expiresAt", "never")))
             for b in access.get("bannedIds", [])
         ] + [
-            (f"ip:{b['ip']}", (b["ip"], "IP", b.get("name", ""), b.get("reason", ""), b.get("at", "")))
+            (f"ip:{b['ip']}", (b["ip"], "IP", b.get("name", ""), b.get("reason", ""), b.get("at", ""), b.get("expiresAt", "never")))
             for b in access.get("bannedIps", [])
+        ])
+        self.fill_tree(self.mutes_tree, [
+            (m["id"], (m["id"], m.get("name", ""), m.get("reason", ""), m.get("at", ""), m.get("expiresAt", "until unmuted")))
+            for m in access.get("mutedIds", [])
         ])
         waiting = sum(1 for p in access.get("pending", []) if p.get("waiting"))
         self.notebook.tab(self.access_frame, text=f"Access ({waiting} waiting)" if waiting else "Access")
@@ -930,7 +942,7 @@ class ServerGUI:
             rows.append((str(u.get("id")), (
                 u.get("id"), name, u.get("authtype", ""), u.get("lobbyId") or "",
                 "lounge" if u.get("inLounge") else ("in lobby" if u.get("lobbyId") else ""),
-                u.get("wanAddress", ""), "yes" if u.get("isAdmin") else "",
+                u.get("wanAddress", ""), "yes" if u.get("isAdmin") else "", "yes" if u.get("muted") else "",
             )))
         self.fill_tree(self.user_tree, rows)
         if result.get("access"):
