@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
+import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -25,10 +29,14 @@ import signal
 import socket
 import struct
 import time
+import unicodedata
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+from relay_impairment import PASS as IMPAIR_PASS, RelayImpairment, parse_spec as parse_impairment_spec
 
 websockets = None
 ConnectionClosed = Exception
@@ -3004,6 +3012,15 @@ class UserSession:
     current_lobby_id: int | None = None
     extra_data: dict[str, Any] = field(default_factory=dict)
     ws: Any = None
+    # OpenShim sends the literal "withheld" instead of a platform ticket to
+    # non-Rebellion servers; recorded for operators only (never on the wire).
+    ticket_withheld: bool = False
+    # Chat flood bookkeeping (runtime only).
+    chat_tokens: float | None = None
+    chat_stamp: float = 0.0
+    chat_strikes: list[float] = field(default_factory=list)
+    chat_notice_stamp: float = 0.0
+    chat_dropped: int = 0
 
 
 @dataclass
@@ -3020,6 +3037,181 @@ class LobbyState:
     # Persistent lobbies (e.g. the seeded ~chat~pub~~default room) survive even
     # when empty. The official service keeps such bridge-owned rooms forever.
     persistent: bool = False
+
+
+SECRET_FIELD_NAMES = frozenset({"password", "token", "ticket", "authticket", "steamticket", "steamappticket",
+                                "gogappticket", "platformticket", "adminkey", "secret", "authorization"})
+TICKET_WITHHELD_MARKER = "withheld"
+TICKET_FIELDS = ("steamAppTicket", "gogAppTicket", "authTicket", "platformTicket")
+DEFAULT_AUDIT_LOG = "data/audit.log"
+DEFAULT_RESERVED_NAMES = "SERVER,Admin,Administrator,Moderator,Mod,Console,System,Rebellion,Staff"
+LOOPBACK_NAMES = ("::1", "::ffff:127.0.0.1")
+
+
+def is_loopback_ip(ip: str) -> bool:
+    return ip.startswith("127.") or ip in LOOPBACK_NAMES
+
+
+def ticket_is_withheld(content: dict[str, Any]) -> bool:
+    return any(str(content.get(key, "") or "").strip().lower() == TICKET_WITHHELD_MARKER for key in TICKET_FIELDS)
+
+
+def describe_authtype(authtype: str, ticket_withheld: bool) -> str:
+    """Operator-facing auth label. The wire value (authType) is never altered."""
+    return f"{authtype} (ticket withheld)" if ticket_withheld else authtype
+
+
+def redact_secrets(value: Any, secrets: Any = ()) -> Any:
+    """Recursively blank credential-named fields and any value containing a known secret."""
+    if isinstance(value, dict):
+        return {k: "<redacted>" if str(k).lower() in SECRET_FIELD_NAMES or str(k).lower() == "key"
+                else redact_secrets(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_secrets(v, secrets) for v in value]
+    if isinstance(value, str) and value and any(sec and (sec == value or (len(sec) >= 6 and sec in value)) for sec in secrets):
+        return "<redacted>"
+    return value
+
+
+class AuditLog:
+    """Append-only JSON Lines audit trail, rotated by size. Never stores credentials."""
+
+    def __init__(self, path: str | None = None, *, max_bytes: int = 5_000_000, backups: int = 3) -> None:
+        self.path = Path(path).expanduser() if path else None
+        self.max_bytes = max(0, int(max_bytes))
+        self.backups = max(0, int(backups))
+        self.secrets: set[str] = set()
+        self.records_written = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.path is not None
+
+    def _rotate(self) -> None:
+        assert self.path is not None
+        if self.backups <= 0:
+            self.path.unlink(missing_ok=True)
+            return
+        for i in range(self.backups - 1, 0, -1):
+            src = self.path.with_name(f"{self.path.name}.{i}")
+            if src.exists():
+                src.replace(self.path.with_name(f"{self.path.name}.{i + 1}"))
+        self.path.replace(self.path.with_name(f"{self.path.name}.1"))
+
+    def write(self, event: str, **fields: Any) -> None:
+        if self.path is None:
+            return
+        record = {"time": utc_now_str(), "ts": round(time.time(), 3), "event": event}
+        record.update({k: v for k, v in redact_secrets(fields, self.secrets).items() if v is not None})
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.max_bytes and self.path.exists() and self.path.stat().st_size >= self.max_bytes:
+                self._rotate()
+            with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n")
+            self.records_written += 1
+        except OSError:
+            logging.getLogger("bzr-dedicated.audit").exception("Audit log write failed: %s", self.path)
+
+
+def parse_duration(value: Any) -> float | None:
+    """Seconds from 90, "90", "30s", "15m", "2h", "7d"; None for empty/permanent."""
+    if value is None or value == "" or value is False:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = float(value)
+    else:
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhdw]?)\s*", str(value).lower())
+        if not match:
+            raise ValueError(f"bad duration {value!r} (use e.g. 30m, 2h, 7d, or seconds)")
+        seconds = float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match.group(2)]
+    if seconds <= 0:
+        raise ValueError("duration must be positive")
+    return seconds
+
+
+def sanitize_display_name(raw: Any, *, max_length: int = 32, reserved: Any = (), allow_reserved: bool = False) -> tuple[str, list[str]]:
+    """Return (clean_name, adjustments).
+
+    Strips control, bidi, zero-width and other invisible/format characters,
+    collapses whitespace, trims and caps the length. An empty result returns ""
+    so the caller can fall back. A reserved name (server/admin impersonation)
+    also returns "" with a "reserved" adjustment.
+    """
+    notes: list[str] = []
+    text = str(raw if raw is not None else "")
+    kept = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if ch in ("\t", "\n", "\r"):
+            kept.append(" ")
+            continue
+        if cat in ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"):
+            continue
+        kept.append(" " if cat == "Zs" else ch)
+    clean = " ".join("".join(kept).split())
+    if clean != text.strip():
+        notes.append("stripped")
+    if max_length > 0 and len(clean) > max_length:
+        clean = clean[:max_length].rstrip()
+        notes.append("truncated")
+    if clean and not allow_reserved and reserved:
+        def fold(x: str) -> str:
+            return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", x).casefold())
+        if fold(clean) in {fold(str(r)) for r in reserved}:
+            notes.append("reserved")
+            return "", notes
+    return clean, notes
+
+
+def parse_version(text: str) -> tuple[int, ...] | None:
+    parts = re.findall(r"\d+", str(text))
+    return tuple(int(p) for p in parts[:6]) if parts else None
+
+
+@dataclass
+class HardeningConfig:
+    """Operator-tunable abuse controls. Defaults keep stock clients working."""
+
+    name_max_length: int = 32
+    reserved_names: tuple[str, ...] = tuple(x.strip() for x in DEFAULT_RESERVED_NAMES.split(",") if x.strip())
+    version_policy: str = "log"            # off | log | enforce
+    min_client_version: str = ""
+    allowed_client_versions: tuple[str, ...] = ()
+    chat_rate: float = 2.0                 # sustained messages per second, 0 = unlimited
+    chat_burst: int = 8
+    chat_flood_strikes: int = 5            # dropped messages inside chat_flood_window before auto-mute
+    chat_flood_window: float = 30.0
+    chat_automute_minutes: float = 5.0     # 0 disables auto-mute
+    trusted_proxies: tuple[str, ...] = ()
+    allow_plain_remote_admin: bool = False
+
+    def version_verdict(self, version: str) -> tuple[bool, str]:
+        """(acceptable, reason). Always (True, "") when no restriction is configured."""
+        if self.allowed_client_versions:
+            for pattern in self.allowed_client_versions:
+                if pattern == version or (pattern.endswith("*") and version.startswith(pattern[:-1])):
+                    break
+            else:
+                return False, f"client version {version!r} not in allowlist"
+        if self.min_client_version:
+            have, need = parse_version(version), parse_version(self.min_client_version)
+            if need is not None and (have is None or have < need):
+                return False, f"client version {version!r} older than {self.min_client_version}"
+        return True, ""
+
+    def is_trusted_proxy(self, ip: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip.split("%")[0])
+        except ValueError:
+            return False
+        for entry in self.trusted_proxies:
+            try:
+                if addr in ipaddress.ip_network(entry, strict=False):
+                    return True
+            except ValueError:
+                continue
+        return False
 
 
 ACCESS_MODES = ("open", "approve", "allowlist")
@@ -3047,6 +3239,9 @@ class AccessControl:
         self.approved: dict[str, dict[str, Any]] = {}
         self.banned_ids: dict[str, dict[str, Any]] = {}
         self.banned_ips: dict[str, dict[str, Any]] = {}
+        self.muted_ids: dict[str, dict[str, Any]] = {}
+        self.audit: AuditLog = AuditLog()
+        self.clock = time.time  # epoch seconds; replaceable in tests
         # Runtime only: players waiting for a decision.
         self.pending: dict[str, dict[str, Any]] = {}
         self._attempts: dict[str, list[float]] = {}
@@ -3060,6 +3255,7 @@ class AccessControl:
             "approved": self.approved,
             "bannedIds": self.banned_ids,
             "bannedIps": self.banned_ips,
+            "mutedIds": self.muted_ids,
         }
 
     def load_payload(self, payload: Any) -> None:
@@ -3068,10 +3264,35 @@ class AccessControl:
         mode = str(payload.get("mode", self.mode))
         self.mode = mode if mode in ACCESS_MODES else "open"
         self.pin_ips = bool(payload.get("pinIps", self.pin_ips))
-        for attr, key in (("approved", "approved"), ("banned_ids", "bannedIds"), ("banned_ips", "bannedIps")):
+        for attr, key in (("approved", "approved"), ("banned_ids", "bannedIds"), ("banned_ips", "bannedIps"),
+                           ("muted_ids", "mutedIds")):
             value = payload.get(key)
             if isinstance(value, dict):
                 setattr(self, attr, {str(k): dict(v) if isinstance(v, dict) else {} for k, v in value.items()})
+        self.prune_expired()
+
+    # ---- expiry (entries without expiresEpoch are permanent) ----
+    def _expiry(self, seconds: float | None) -> dict[str, Any]:
+        if seconds is None:
+            return {}
+        epoch = self.clock() + seconds
+        return {"expiresEpoch": round(epoch, 3),
+                "expiresAt": datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")}
+
+    def _live(self, entry: dict[str, Any]) -> bool:
+        expires = entry.get("expiresEpoch")
+        return not isinstance(expires, (int, float)) or expires > self.clock()
+
+    def prune_expired(self) -> int:
+        removed = 0
+        for kind, table in (("ban_id", self.banned_ids), ("ban_ip", self.banned_ips), ("mute", self.muted_ids)):
+            for key in [k for k, v in table.items() if not self._live(v)]:
+                table.pop(key, None)
+                removed += 1
+                self.audit.write(f"{kind}_expired", target=key)
+        if removed:
+            self._changed()
+        return removed
 
     def _changed(self) -> None:
         self._on_change()
@@ -3088,6 +3309,7 @@ class AccessControl:
 
     def decide(self, user_id: str, ip: str) -> tuple[str, str]:
         """Return ("allow" | "pending" | "deny", reason)."""
+        self.prune_expired()
         if user_id in self.banned_ids:
             return "deny", "banned id"
         if ip and ip in self.banned_ips:
@@ -3163,8 +3385,9 @@ class AccessControl:
         if self.approved.pop(user_id, None) is not None:
             self._changed()
 
-    def ban(self, user_id: str = "", ip: str = "", name: str = "", reason: str = "") -> None:
-        stamp = {"name": name, "reason": reason, "at": utc_now_str()}
+    def ban(self, user_id: str = "", ip: str = "", name: str = "", reason: str = "",
+            duration: float | None = None, actor: dict[str, Any] | None = None) -> None:
+        stamp = {"name": name, "reason": reason, "at": utc_now_str(), **self._expiry(duration)}
         if user_id:
             self.banned_ids[user_id] = dict(stamp)
             self.approved.pop(user_id, None)
@@ -3172,14 +3395,39 @@ class AccessControl:
         if ip:
             self.banned_ips[ip] = dict(stamp)
         self.log.info("Access: banned id=%s ip=%s", user_id or "-", ip or "-")
+        self.audit.write("ban", actor=actor, targetId=user_id or None, targetIp=ip or None, name=name or None,
+                         reason=reason or None, expiresAt=stamp.get("expiresAt"))
         self._changed()
 
-    def unban(self, user_id: str = "", ip: str = "") -> None:
+    def unban(self, user_id: str = "", ip: str = "", actor: dict[str, Any] | None = None) -> None:
         if user_id:
             self.banned_ids.pop(user_id, None)
         if ip:
             self.banned_ips.pop(ip, None)
+        self.audit.write("unban", actor=actor, targetId=user_id or None, targetIp=ip or None)
         self._changed()
+
+    def mute(self, user_id: str, name: str = "", reason: str = "", duration: float | None = None,
+             actor: dict[str, Any] | None = None) -> None:
+        self.muted_ids[user_id] = {"name": name, "reason": reason, "at": utc_now_str(), **self._expiry(duration)}
+        self.log.info("Access: muted id=%s", user_id)
+        self.audit.write("mute", actor=actor, targetId=user_id, name=name or None, reason=reason or None,
+                         expiresAt=self.muted_ids[user_id].get("expiresAt"))
+        self._changed()
+
+    def unmute(self, user_id: str, actor: dict[str, Any] | None = None) -> None:
+        self.muted_ids.pop(user_id, None)
+        self.audit.write("unmute", actor=actor, targetId=user_id)
+        self._changed()
+
+    def is_muted(self, user_id: str) -> bool:
+        entry = self.muted_ids.get(user_id)
+        if entry is None:
+            return False
+        if self._live(entry):
+            return True
+        self.prune_expired()
+        return False
 
     def set_mode(self, mode: str | None = None, pin_ips: bool | None = None) -> None:
         if mode is not None:
@@ -3195,6 +3443,7 @@ class AccessControl:
 
     def snapshot(self) -> dict[str, Any]:
         self._expire_pending()
+        self.prune_expired()
         return {
             "mode": self.mode,
             "pinIps": self.pin_ips,
@@ -3207,8 +3456,50 @@ class AccessControl:
             "approved": [{"id": k, **v} for k, v in sorted(self.approved.items())],
             "bannedIds": [{"id": k, **v} for k, v in sorted(self.banned_ids.items())],
             "bannedIps": [{"ip": k, **v} for k, v in sorted(self.banned_ips.items())],
+            "mutedIds": [{"id": k, **v} for k, v in sorted(self.muted_ids.items())],
             "deniedTotal": self.denied_total,
         }
+
+
+def redact_protocol_trace_payload(value: Any, *, message_type: str) -> Any:
+    """Retain full protocol shapes without persisting credentials."""
+    secret_names = SECRET_FIELD_NAMES
+    if isinstance(value, dict):
+        password_update = str(value.get("key", "")).lower() == "password"
+        return {
+            key: "<redacted>" if (str(key).lower() in secret_names
+                                  or str(key).lower() == "key" and message_type == "Authorization"
+                                  or password_update and str(key).lower() in {"value", "val", "data"})
+            else redact_protocol_trace_payload(item, message_type=message_type)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_protocol_trace_payload(item, message_type=message_type) for item in value]
+    return value
+
+
+class ProtocolTraceWriter:
+    """Opt-in untruncated protocol event archive, independent of UI history."""
+
+    def __init__(self, path: str, run_id: str) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.lines_written = 0
+        self._fh = open(path, "a", encoding="utf-8", newline="\n")
+        self._write({"format": "bzr-protocol-trace", "version": 1, "runId": run_id})
+
+    def _write(self, record: dict[str, Any]) -> None:
+        self._fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._fh.flush()
+        self.lines_written += 1
+
+    def log(self, entry: dict[str, Any], payload: Any) -> None:
+        redacted = redact_protocol_trace_payload(payload, message_type=entry["type"])
+        self._write({**entry, "runId": self.run_id, "tsUnixNs": time.time_ns(),
+                     "preview": compact_preview(redacted), "payload": redacted})
+
+    def close(self) -> None:
+        self._fh.close()
 
 
 class ServerState:
@@ -3219,8 +3510,13 @@ class ServerState:
         state_file: str | None = None,
         admin_key: str = "",
         admin_ids: set[str] | None = None,
+        protocol_trace: ProtocolTraceWriter | None = None,
+        audit: AuditLog | None = None,
     ) -> None:
         self.log = logger
+        self.audit = audit or AuditLog()
+        if admin_key:
+            self.audit.secrets.add(admin_key)
         self.next_lobby_id = 1000
         self.sessions_by_ws: dict[Any, UserSession] = {}
         self.sessions_by_user_id: dict[str, UserSession] = {}
@@ -3233,8 +3529,10 @@ class ServerState:
         self.relay_requested = False
         self.test_mode = False
         self.access = AccessControl(logger.getChild("access"), self.mark_dirty)
+        self.access.audit = self.audit
         self.stdout_history: list[str] = []
         self.protocol_history: list[dict[str, Any]] = []
+        self.protocol_trace = protocol_trace
         self._dirty = False
 
     def allocate_lobby_id(self) -> int:
@@ -3317,6 +3615,9 @@ class ServerState:
             "stateDirty": self._dirty,
             "accessMode": self.access.mode,
             "accessPending": sum(1 for p in self.access.pending.values() if not p["future"].done()),
+            "bansActive": len(self.access.banned_ids) + len(self.access.banned_ips),
+            "mutesActive": len(self.access.muted_ids),
+            "auditLogRecords": self.audit.records_written,
         }
 
     def record_stdout_entry(self, level: str, message: str) -> str:
@@ -3346,6 +3647,8 @@ class ServerState:
         }
         if decoder:
             entry["decoder"] = decoder
+        if self.protocol_trace is not None:
+            self.protocol_trace.log(entry, payload)
         self.protocol_history.append(entry)
         if len(self.protocol_history) > MAX_PROTOCOL_HISTORY:
             self.protocol_history = self.protocol_history[-MAX_PROTOCOL_HISTORY:]
@@ -3704,25 +4007,34 @@ class RelayTraceWriter:
     """Forensic JSONL trace of relayed datagrams (opt-in; local-only output).
 
     One line per routed datagram with transport-envelope fields only.  Payload
-    bytes are deliberately never written: decoding beyond the header is not
-    needed for later comparison (work order §4 forensic minimum).  Traces may
+    bytes are omitted by default; opt-in maximum capture copies complete
+    datagram bytes as hex without parsing them.  Traces may
     contain real endpoints; they live beside runtime state and must never be
     committed raw.
     """
 
     FORMAT_NAME = "bzr-relay-trace"
-    FORMAT_VERSION = 1
+    FORMAT_VERSION = 2
 
-    def __init__(self, path: str, run_id: str) -> None:
+    def __init__(self, path: str, run_id: str, *, include_payloads: bool = False) -> None:
         self.path = path
         self.run_id = run_id
         self.lines_written = 0
+        self.include_payloads = bool(include_payloads)
+        self.trace_id = uuid.uuid4().hex
+        self._packet_sequence = 0
+        self._socket_sequence = 0
+        self._socket_ids: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+        self.closed = False
         self._fh = open(path, "a", encoding="utf-8", newline="\n")
         self._write_line(
             {
                 "format": self.FORMAT_NAME,
                 "version": self.FORMAT_VERSION,
                 "runId": run_id,
+                "payloadCapture": self.include_payloads,
+                "traceId": self.trace_id,
+                "sendOutcomeCapture": True,
             }
         )
 
@@ -3730,6 +4042,14 @@ class RelayTraceWriter:
         self._fh.write(json.dumps(record, separators=(",", ":")) + "\n")
         self._fh.flush()
         self.lines_written += 1
+
+    def socket_id(self, transport: asyncio.DatagramTransport) -> str:
+        identity = self._socket_ids.get(transport)
+        if identity is None:
+            self._socket_sequence += 1
+            identity = f"{self.trace_id}:socket:{self._socket_sequence}"
+            self._socket_ids[transport] = identity
+        return identity
 
     def log(
         self,
@@ -3740,16 +4060,31 @@ class RelayTraceWriter:
         data: bytes,
         disposition: str,
         match_ordinal: int | None = None,
-    ) -> None:
+        route: dict[str, Any] | None = None,
+        relay_endpoint: tuple[str, int] | None = None,
+        impairment: dict[str, Any] | None = None,
+        send_context: dict[str, Any] | None = None,
+    ) -> str:
+        self._packet_sequence += 1
+        packet_id = f"{self.trace_id}:{self._packet_sequence}"
         record: dict[str, Any] = {
+            "packetId": packet_id,
             "runId": self.run_id,
             "tsMonotonic": round(time.monotonic(), 6),
             "tsUnixMs": int(time.time() * 1000),
+            "tsUnixNs": time.time_ns(),
             "direction": direction,
             "source": f"{source[0]}:{source[1]}",
             "target": f"{target[0]}:{target[1]}",
             "disposition": disposition,
+            "datagramSha256": hashlib.sha256(data).hexdigest(),
         }
+        if route is not None:
+            record["route"] = route
+        if relay_endpoint is not None:
+            record["relayEndpoint"] = f"{relay_endpoint[0]}:{relay_endpoint[1]}"
+        if self.include_payloads:
+            record["datagramHex"] = data.hex()
         header_hex = data[:18].hex() if len(data) >= 18 else ""
         record["transport"] = {
             "flagsByte": f"0x{data[0]:02x}" if data else None,
@@ -3760,10 +4095,25 @@ class RelayTraceWriter:
             "headerBytes": len(header_hex) // 2,
             "payloadBytes": max(0, len(data) - BZR_TRANSPORT_HEADER_BYTES),
             "wireBytes": len(data),
+            "headerHex": header_hex,
         }
         if match_ordinal is not None:
             record["matchOrdinal"] = match_ordinal
+        if impairment is not None:
+            record["impairment"] = impairment
+        if send_context is not None:
+            record.update(send_context)
         self._write_line(record)
+        return packet_id
+
+    def event(self, name: str, **fields: Any) -> None:
+        # Delayed sends and asynchronous socket errors may outlive capture.
+        # Their outcomes remain unknown in the closed trace.
+        if self.closed:
+            return
+        self._write_line({"runId": self.run_id, "tsMonotonic": round(time.monotonic(), 6),
+                          "tsUnixMs": int(time.time() * 1000), "tsUnixNs": time.time_ns(),
+                          "event": name, **fields})
 
     def metrics(self) -> dict[str, Any]:
         return {
@@ -3774,10 +4124,31 @@ class RelayTraceWriter:
         }
 
     def close(self) -> None:
+        if self.closed:
+            return
         try:
             self._fh.flush()
         finally:
+            self.closed = True
             self._fh.close()
+
+
+class BZRPairRelayProtocol(asyncio.DatagramProtocol):
+    """A dedicated socket supplies the peer-pair association, not the payload."""
+
+    def __init__(self, owner: BZRRelayProtocol, route_key: tuple[str, str]) -> None:
+        self.owner = owner
+        self.route_key = route_key
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.owner.datagram_received(data, addr, route_key=self.route_key, pair_transport=self.transport)
+
+    def error_received(self, exc: Exception) -> None:
+        self.owner.error_received(exc, route_key=self.route_key, transport=self.transport)
 
 
 class BZRRelayProtocol(asyncio.DatagramProtocol):
@@ -3788,6 +4159,8 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
     fallback associates routes from DoP2PRoute plus each user's known WAN
     endpoint.  If an endpoint maps to more than one candidate peer, forwarding
     stops rather than guessing and risking cross-session delivery.
+    The opt-in pair-port mode allocates a separate UDP socket for each route,
+    allowing the same endpoint to participate in several opaque peer streams.
     """
 
     def __init__(
@@ -3798,6 +4171,11 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         route_ttl_seconds: int = DEFAULT_RELAY_ROUTE_TTL_SECONDS,
         fault_injector: RelayFaultInjector | None = None,
         trace_writer: RelayTraceWriter | None = None,
+        impairment: RelayImpairment | None = None,
+        pair_ports: bool = False,
+        pair_port_start: int = 0,
+        pair_port_end: int = 0,
+        reserved_ports: set[int] | None = None,
     ) -> None:
         self.logger = logger
         self.state = state
@@ -3806,6 +4184,19 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         self.listen_port = DEFAULT_RELAY_PORT
         self.routing_enabled = True
         self.routes: dict[tuple[str, str], RelayRoute] = {}
+        self.pair_ports = bool(pair_ports)
+        self.pair_port_start = int(pair_port_start)
+        self.pair_port_end = int(pair_port_end)
+        if (self.pair_port_start, self.pair_port_end) != (0, 0) and not (
+                1 <= self.pair_port_start <= self.pair_port_end <= 65535):
+            raise ValueError("relay pair port bounds must both be 0 (ephemeral) or an inclusive range within 1-65535")
+        self.reserved_ports = set(reserved_ports or ())
+        self._pair_port_cursor = self.pair_port_start
+        self.pair_port_allocation_failures = 0
+        self.shared_route_warnings = 0
+        self._last_ambiguity_warning = float("-inf")
+        self.pair_transports: dict[tuple[str, str], asyncio.DatagramTransport] = {}
+        self._allocation_lock = asyncio.Lock()
         self.rx_count = 0
         self.tx_count = 0
         self.drop_count = 0
@@ -3816,6 +4207,104 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         # path below is unchanged byte-transparent forwarding.
         self.fault_injector = fault_injector
         self.trace_writer = trace_writer
+        # Opt-in network impairment for private test runs (relay_impairment.py).
+        # None keeps the hot path immediate, byte-transparent forwarding.
+        self.impairment = impairment
+        self.impair_drop_count = 0
+        self.impair_late_drop_count = 0
+        # In-order delayed datagrams per (socket, target). Their deadlines are
+        # monotonic per stream, but a burst often shares one deadline and the
+        # event loop's timer heap does not keep equal deadlines in FIFO order;
+        # every timer therefore sends the oldest pending datagram of its stream.
+        self._impair_fifo: dict[tuple[int, tuple[str, int]], collections.deque] = {}
+
+    def schedule_later(self, delay: float, callback: Any, *args: Any) -> None:
+        asyncio.get_running_loop().call_later(delay, callback, *args)
+
+    def _schedule_in_order(self, delay: float, args: tuple) -> None:
+        key = (id(args[0]), args[2])
+        self._impair_fifo.setdefault(key, collections.deque()).append(args)
+        self.schedule_later(delay, self._send_impaired_head, key)
+
+    def _send_impaired_head(self, key: tuple[int, tuple[str, int]]) -> None:
+        fifo = self._impair_fifo.get(key)
+        if not fifo:
+            return
+        args = fifo.popleft()
+        if not fifo:
+            del self._impair_fifo[key]
+        self._send_impaired(*args)
+
+    def set_impairment(self, spec_text: str) -> dict[str, Any]:
+        """Apply a new impairment spec, or clear it with an empty one. Raises ValueError."""
+        spec_text = (spec_text or "").strip()
+        previous = self.impairment
+        self.impairment = RelayImpairment(parse_impairment_spec(spec_text)) if spec_text else None
+        if self.impairment is not None:
+            self.logger.warning("RELAY IMPAIRMENT applied: %s -- private test runs only",
+                                self.impairment.spec.describe())
+        elif previous is not None:
+            self.logger.warning("RELAY IMPAIRMENT cleared (was %s)", previous.spec.describe())
+        self._impairment_event("impairment_set" if self.impairment else "impairment_cleared", previous)
+        return self.impairment_metrics()
+
+    def impairment_metrics(self) -> dict[str, Any]:
+        return self.impairment.metrics() if self.impairment else {"active": False, "spec": ""}
+
+    def _impairment_event(self, name: str, previous: RelayImpairment | None) -> None:
+        if self.trace_writer is not None:
+            self.trace_writer.event(name, spec=self.impairment.spec.describe() if self.impairment else "",
+                                    previous=previous.metrics() if previous else None)
+
+    def _user_labels(self, user_id: str) -> set[str]:
+        labels = {user_id}
+        session = self.state.sessions_by_user_id.get(user_id)
+        if session is not None:
+            labels.update(x for x in (session.name, session.player_name) if x)
+        return labels
+
+    def _send_impaired(self, transport: asyncio.DatagramTransport, data: bytes, target: tuple[str, int],
+                       send_context: dict[str, Any] | None = None) -> None:
+        if transport.is_closing():
+            self.impair_late_drop_count += 1
+            self._trace_send_outcome(send_context, "skipped_closing", transport)
+            return
+        self._send_relay(transport, data, target, send_context)
+        self.tx_count += 1
+
+    def _trace_send_outcome(self, context: dict[str, Any] | None, outcome: str,
+                            transport: asyncio.DatagramTransport, exc: Exception | None = None,
+                            attempt_monotonic: float | None = None) -> None:
+        if self.trace_writer is None or self.trace_writer.closed or context is None:
+            return
+        fields = dict(context)
+        received = fields.pop("receivedMonotonic")
+        scheduled = fields.pop("scheduledMonotonic")
+        now = time.monotonic()
+        attempt = now if attempt_monotonic is None else attempt_monotonic
+        closing = getattr(transport, "is_closing", None)
+        fields.update(outcome=outcome, queueWaitMs=round((attempt - received) * 1000, 3),
+                      schedulerLagMs=round(max(0.0, attempt - scheduled) * 1000, 3),
+                      sendCallMs=round((now - attempt) * 1000, 3),
+                      transportClosing=closing() if closing else None)
+        if exc is not None:
+            fields.update(errorType=type(exc).__name__, error=str(exc))
+        # Deliberately no transport/disposition: legacy replay consumes only
+        # the existing decision rows, never these socket submission events.
+        self.trace_writer.event("socket_send", **fields)
+
+    def _send_relay(self, transport: asyncio.DatagramTransport, data: bytes,
+                    target: tuple[str, int], context: dict[str, Any] | None = None) -> None:
+        if context is None:
+            transport.sendto(data, target)
+            return
+        attempt = time.monotonic()
+        try:
+            transport.sendto(data, target)
+        except Exception as exc:
+            self._trace_send_outcome(context, "exception", transport, exc, attempt)
+            raise
+        self._trace_send_outcome(context, "submitted", transport, attempt_monotonic=attempt)
 
     @property
     def enabled(self) -> bool:
@@ -3834,7 +4323,23 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
     def set_enabled(self, enabled: bool) -> None:
         self.routing_enabled = bool(enabled)
         if not self.routing_enabled:
-            self.routes.clear()
+            for key in list(self.routes):
+                self._remove_route(key)
+
+    def _remove_route(self, key: tuple[str, str]) -> None:
+        removed = self.routes.pop(key, None)
+        transport = self.pair_transports.pop(key, None)
+        if removed is not None and self.trace_writer is not None:
+            self.trace_writer.event("route_removed", lobbyId=removed.lobby_id, users=list(key),
+                                    relayEndpoint=transport.get_extra_info("sockname") if transport else None)
+        if transport is not None:
+            transport.close()
+
+    def close(self) -> None:
+        self.set_enabled(False)
+        if self.transport is not None:
+            self.transport.close()
+            self.transport = None
 
     def metrics(self) -> dict[str, Any]:
         self._expire_routes()
@@ -3849,10 +4354,18 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             "unmappedDropsTotal": self.unmapped_drop_count,
             "expiredRoutesTotal": self.expired_route_count,
             "routeTtlSeconds": self.route_ttl_seconds,
-            "associationMode": "ws-route-endpoint-pair",
+            "associationMode": "ws-route-dedicated-port" if self.pair_ports else "ws-route-endpoint-pair",
+            "activePairPorts": len(self.pair_transports),
+            "pairPortRange": [self.pair_port_start, self.pair_port_end]
+            if self.pair_ports and self.pair_port_start else None,
+            "pairPortAllocationFailuresTotal": self.pair_port_allocation_failures,
+            "sharedRouteWarningsTotal": self.shared_route_warnings,
             "officialAssociationParity": False,
             "faultInjector": self.fault_injector.metrics() if self.fault_injector else {"mode": "", "active": False},
             "trace": self.trace_writer.metrics() if self.trace_writer else {"enabled": False},
+            "impairment": self.impairment_metrics(),
+            "impairmentDropsTotal": self.impair_drop_count,
+            "impairmentLateDropsTotal": self.impair_late_drop_count,
         }
 
     def _expire_routes(self) -> None:
@@ -3863,7 +4376,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             if now - route.last_activity_monotonic > self.route_ttl_seconds
         ]
         for key in expired:
-            self.routes.pop(key, None)
+            self._remove_route(key)
             self.expired_route_count += 1
 
     def remove_user(self, user_id: str, *, lobby_id: int | None = None) -> None:
@@ -3875,7 +4388,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 continue
             removed.append(key)
         for key in removed:
-            self.routes.pop(key, None)
+            self._remove_route(key)
 
     def register_route(self, source: UserSession, target: UserSession) -> tuple[bool, str]:
         self._expire_routes()
@@ -3893,6 +4406,9 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
 
         key = tuple(sorted((source.user_id, target.user_id)))
         previous = self.routes.get(key)
+        if previous is not None and previous.lobby_id != source.current_lobby_id:
+            self._remove_route(key)
+            previous = None
         if key[0] == source.user_id:
             endpoint_a, endpoint_b = source_endpoint, target_endpoint
         else:
@@ -3912,6 +4428,15 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 route.observed_b = previous.observed_b
             route.created_monotonic = previous.created_monotonic
         self.routes[key] = route
+        if not self.pair_ports and previous is None and any(
+                {route.endpoint_a, route.endpoint_b} & {other.endpoint_a, other.endpoint_b}
+                for other_key, other in self.routes.items() if other_key != key):
+            self.shared_route_warnings += 1
+            warning = (f"Shared UDP relay routes overlap for {route.user_a}<->{route.user_b}; "
+                       "multiple relayed peers cannot be distinguished. Enable --relay-pair-ports "
+                       "and configure an accessible UDP pair-port range for LAN/WAN players.")
+            self.logger.warning(warning)
+            self.state.record_stdout_entry("warn", warning)
         self.state.record_stdout_entry(
             "info",
             f"Relay route registered lobby={route.lobby_id} {route.user_a}<->{route.user_b} "
@@ -3919,9 +4444,93 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         )
         return True, "ok"
 
-    def _match_sender(self, addr: tuple[str, int]) -> tuple[RelayRoute, str] | None:
+    async def allocate_route(self, source: UserSession, target: UserSession) -> tuple[bool, str, int | None]:
+        """Register a route and return only a port with a live backing socket.
+
+        Route signaling can arrive concurrently from both clients. Serializing
+        allocation keeps their advertised port stable through retries and
+        ensures that a peer-pair never accumulates duplicate sockets.
+        """
+        async with self._allocation_lock:
+            ok, reason = self.register_route(source, target)
+            if not ok:
+                return False, reason, None
+            if not self.pair_ports:
+                return True, "ok", self.listen_port
+            key = tuple(sorted((source.user_id, target.user_id)))
+            transport = self.pair_transports.get(key)
+            if transport is None:
+                assert self.transport is not None
+                try:
+                    transport = await self._bind_pair_transport(key)
+                except OSError as exc:
+                    self._remove_route(key)
+                    self.pair_port_allocation_failures += 1
+                    self.logger.warning("Could not allocate relay port for %s: %s", key, exc)
+                    reason = f"could not allocate relay pair port: {exc}"
+                    self.state.record_stdout_entry("warn", reason)
+                    if self.trace_writer is not None:
+                        self.trace_writer.event("route_allocation_failed", users=list(key), reason=reason)
+                    return False, reason, None
+                # A disconnect, disable, or lobby change may occur while the
+                # event loop creates the socket. Do not publish a stale route.
+                route = self.routes.get(key)
+                if (not self.enabled or route is None
+                        or source.current_lobby_id != route.lobby_id
+                        or target.current_lobby_id != route.lobby_id):
+                    transport.close()
+                    self._remove_route(key)
+                    return False, "relay peers left before port allocation", None
+                self.pair_transports[key] = transport
+            port = int(transport.get_extra_info("sockname")[1])
+            if self.trace_writer is not None:
+                self.trace_writer.event("route_allocated", lobbyId=source.current_lobby_id,
+                                        users=list(key), relayEndpoint=transport.get_extra_info("sockname"),
+                                        endpointA=self.routes[key].endpoint_a, endpointB=self.routes[key].endpoint_b)
+            return True, "ok", port
+
+    async def _bind_pair_transport(self, key: tuple[str, str]) -> asyncio.DatagramTransport:
+        """Bind a usable pair port; a bounded pool never falls back to shared/ephemeral."""
+        assert self.transport is not None
+        host = self.transport.get_extra_info("sockname")[0]
+        loop = asyncio.get_running_loop()
+        if not self.pair_port_start:
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: BZRPairRelayProtocol(self, key), local_addr=(host, 0))
+            return transport
+
+        used = {int(t.get_extra_info("sockname")[1]) for t in self.pair_transports.values()}
+        unavailable = self.reserved_ports | used | {self.listen_port}
+        span = self.pair_port_end - self.pair_port_start + 1
+        collisions = 0
+        last_error: OSError | None = None
+        for offset in range(span):
+            port = self.pair_port_start + (self._pair_port_cursor - self.pair_port_start + offset) % span
+            if port in unavailable:
+                continue
+            try:
+                transport, _ = await loop.create_datagram_endpoint(
+                    lambda: BZRPairRelayProtocol(self, key), local_addr=(host, port))
+            except OSError as exc:
+                collisions += 1
+                last_error = exc
+                self.logger.debug("Relay pair UDP port %d cannot bind: %s", port, exc)
+                continue
+            self._pair_port_cursor = port + 1 if port < self.pair_port_end else self.pair_port_start
+            return transport
+        detail = f"; {collisions} bind failure(s), last: {last_error}" if last_error else ""
+        raise OSError(f"UDP pair-port range {self.pair_port_start}-{self.pair_port_end} is exhausted "
+                      f"or unavailable{detail}; free ports or enlarge the configured/forwarded range")
+
+    def _match_sender(
+        self, addr: tuple[str, int], route_key: tuple[str, str] | None = None,
+    ) -> tuple[RelayRoute, str] | None:
+        candidates = self.routes.items()
+        if route_key is not None:
+            route = self.routes.get(route_key)
+            candidates = [(route_key, route)] if route is not None else []
         exact: dict[tuple[str, str], tuple[RelayRoute, str]] = {}
-        for key, route in self.routes.items():
+        for key, route in candidates:
             if addr == route.endpoint_a or addr == route.observed_a:
                 exact[("|".join(key), "a")] = (route, "a")
             if addr == route.endpoint_b or addr == route.observed_b:
@@ -3936,7 +4545,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         # identifies one unique side.  Multiple candidates are deliberately not
         # guessed because the unrecovered stock relay may carry an association id.
         ip_matches: dict[tuple[str, str], tuple[RelayRoute, str]] = {}
-        for key, route in self.routes.items():
+        for key, route in candidates:
             a_ips = {route.endpoint_a[0]}
             b_ips = {route.endpoint_b[0]}
             if route.observed_a:
@@ -3953,7 +4562,12 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             self.ambiguous_drop_count += 1
         return None
 
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+    def datagram_received(
+        self, data: bytes, addr: tuple[str, int], *,
+        route_key: tuple[str, str] | None = None,
+        pair_transport: asyncio.DatagramTransport | None = None,
+    ) -> None:
+        received_monotonic = time.monotonic() if self.trace_writer is not None else None
         self.rx_count += 1
         self._expire_routes()
 
@@ -3978,14 +4592,32 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
 
         if not self.enabled:
             self.drop_count += 1
+            self._trace_unroutable(data, addr, "disabled", route_key, pair_transport)
             return
 
         ambiguous_before = self.ambiguous_drop_count
-        matched = self._match_sender(addr)
+        if self.pair_ports:
+            # The shared listener is not an association in this mode. Reject
+            # it, and reject callbacks from a socket whose route was removed.
+            matched = (self._match_sender(addr, route_key)
+                       if route_key is not None and pair_transport is not None
+                       and self.pair_transports.get(route_key) is pair_transport else None)
+            send_transport = pair_transport
+        else:
+            matched = self._match_sender(addr)
+            send_transport = self.transport
         if matched is None:
             self.drop_count += 1
             if self.ambiguous_drop_count == ambiguous_before:
                 self.unmapped_drop_count += 1
+            elif not self.pair_ports and time.monotonic() - self._last_ambiguity_warning >= 5:
+                self._last_ambiguity_warning = time.monotonic()
+                warning = ("Shared UDP relay dropped an ambiguous peer datagram; enable --relay-pair-ports "
+                           "with an accessible UDP range when a player has multiple relayed peers.")
+                self.logger.warning(warning)
+                self.state.record_stdout_entry("warn", warning)
+            self._trace_unroutable(data, addr, "ambiguous" if self.ambiguous_drop_count != ambiguous_before else "unmapped",
+                                   route_key, pair_transport)
             if decoder is None:
                 decoder = _decode_bzr_transport_header(data)
                 if decoder:
@@ -4009,8 +4641,9 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             target = route.observed_a or route.endpoint_a
         route.last_activity_monotonic = time.monotonic()
 
-        if target == addr or self.transport is None:
+        if target == addr or send_transport is None:
             self.drop_count += 1
+            self._trace_unroutable(data, addr, "self-target-or-no-socket", route_key, pair_transport)
             return
 
         # Preserve the complete datagram and packet boundary exactly. The relay
@@ -4022,7 +4655,20 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         # previous behavior. The injector performs no interpretation beyond the
         # bare-0x80 predicate and never rewrites or reorders anything; the
         # sendto below always transmits `data` unmodified.
+        impairment = self.impairment
+        if impairment is not None and impairment.expired():
+            self.impairment = None
+            self.logger.warning("RELAY IMPAIRMENT expired (%s)", impairment.spec.describe())
+            self._impairment_event("impairment_expired", impairment)
+            impairment = None
+        decision = IMPAIR_PASS
+        if impairment is not None:
+            src_user, dst_user = (route.user_a, route.user_b) if side == "a" else (route.user_b, route.user_a)
+            decision = impairment.decide(len(data), (addr[0], addr[1], target[0], target[1]), src_user,
+                                         self._user_labels(src_user), self._user_labels(dst_user))
+
         instrumented = self.fault_injector is not None or self.trace_writer is not None
+        send_context = None
         if instrumented:
             stream_key = (addr[0], addr[1], target[0], target[1])
             direction = f"{addr[0]}:{addr[1]}->{target[0]}:{target[1]}"
@@ -4031,16 +4677,35 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
             if self.fault_injector is not None:
                 drop_for_faultinject = self.fault_injector.decide_drop(data, stream_key)
                 match_ordinal = self.fault_injector._stream_match_ordinals.get(stream_key)
-            disposition = "dropped_faultinject" if drop_for_faultinject else "forwarded"
+            disposition = ("dropped_faultinject" if drop_for_faultinject
+                           else f"dropped_impair_{decision.drop}" if decision.drop else "forwarded")
             if self.trace_writer is not None:
-                self.trace_writer.log(
+                src_user, dst_user = (route.user_a, route.user_b) if side == "a" else (route.user_b, route.user_a)
+                identity = {"sourceUser": src_user, "targetUser": dst_user,
+                            "routeKey": [route.user_a, route.user_b], "lobbyId": route.lobby_id,
+                            "socketId": self.trace_writer.socket_id(send_transport),
+                            "relayEndpoint": send_transport.get_extra_info("sockname")}
+                packet_id = self.trace_writer.log(
                     direction=direction,
                     source=addr,
                     target=target,
                     data=data,
                     disposition=disposition,
                     match_ordinal=match_ordinal,
+                    route={"lobbyId": route.lobby_id, "users": [route.user_a, route.user_b], "sourceSide": side},
+                    relay_endpoint=send_transport.get_extra_info("sockname"),
+                    impairment=None if decision is IMPAIR_PASS else {
+                        "drop": decision.drop,
+                        "delaysMs": [round(d * 1000.0, 3) for d in decision.delays],
+                        "reordered": decision.reordered,
+                    },
+                    send_context={k: v for k, v in identity.items() if k != "relayEndpoint"},
                 )
+                send_context = {**identity, "packetId": packet_id, "source": f"{addr[0]}:{addr[1]}",
+                                "target": f"{target[0]}:{target[1]}", "wireBytes": len(data),
+                                "receivedMonotonic": received_monotonic}
+                endpoint = identity["relayEndpoint"]
+                send_context["relayEndpoint"] = f"{endpoint[0]}:{endpoint[1]}" if endpoint else None
             if drop_for_faultinject:
                 assert self.fault_injector is not None
                 info = self.fault_injector.last_dropped or {}
@@ -4055,8 +4720,28 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 )
                 return
 
-        self.transport.sendto(data, target)
-        self.tx_count += 1
+        if decision.drop is not None:
+            self.drop_count += 1
+            self.impair_drop_count += 1
+            return
+        for copy_index, delay in enumerate(decision.delays):
+            context = None
+            if send_context is not None:
+                context = {**send_context, "copyIndex": copy_index, "copyCount": len(decision.delays),
+                           "scheduledDelayMs": round(delay * 1000, 3),
+                           "scheduledMonotonic": time.monotonic() + delay}
+            args = (send_transport, data, target) if context is None else (send_transport, data, target, context)
+            if decision.reordered:
+                # Deliberately held past the stream floor; it must not join the FIFO.
+                self.schedule_later(delay, self._send_impaired, *args)
+            elif delay > 0 or (id(send_transport), target) in self._impair_fifo:
+                self._schedule_in_order(delay, args)
+            else:
+                if context is None:
+                    send_transport.sendto(data, target)
+                else:
+                    self._send_relay(send_transport, data, target, context)
+                self.tx_count += 1
         if sampled:
             self.state.record_protocol_event(
                 channel="relay",
@@ -4067,8 +4752,27 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 decoder=decoder,
             )
 
-    def error_received(self, exc: Exception) -> None:
+    def _trace_unroutable(
+        self, data: bytes, addr: tuple[str, int], reason: str,
+        route_key: tuple[str, str] | None, transport: asyncio.DatagramTransport | None,
+    ) -> None:
+        if self.trace_writer is not None:
+            raw_capture = {"datagramHex": data.hex()} if self.trace_writer.include_payloads else {}
+            self.trace_writer.event("unroutable_datagram", source=f"{addr[0]}:{addr[1]}",
+                                    reason=reason, users=list(route_key) if route_key else None,
+                                    relayEndpoint=transport.get_extra_info("sockname") if transport else None,
+                                    wireBytes=len(data), headerHex=data[:BZR_TRANSPORT_HEADER_BYTES].hex(),
+                                    datagramSha256=hashlib.sha256(data).hexdigest(), **raw_capture)
+
+    def error_received(self, exc: Exception, *, route_key: tuple[str, str] | None = None,
+                       transport: asyncio.DatagramTransport | None = None) -> None:
         self.logger.warning("UDP relay error: %s", exc)
+        if self.trace_writer is not None:
+            socket_transport = transport or self.transport
+            self.trace_writer.event("socket_error", error=str(exc), users=list(route_key) if route_key else None,
+                                    errorType=type(exc).__name__, packetCorrelation="unknown",
+                                    socketId=self.trace_writer.socket_id(socket_transport) if socket_transport else None,
+                                    relayEndpoint=socket_transport.get_extra_info("sockname") if socket_transport else None)
 
 
 class BZRWebSocketServer:
@@ -4081,9 +4785,11 @@ class BZRWebSocketServer:
         max_lobbies: int = 500,
         retain_empty_lobbies: bool = False,
         relay_protocol: BZRRelayProtocol | None = None,
+        hardening: HardeningConfig | None = None,
     ):
         self.state = state
         self.log = logger
+        self.hardening = hardening or HardeningConfig()
         self.motd = motd.strip()
         self.max_lobbies = max(1, int(max_lobbies))
         self.retain_empty_lobbies = bool(retain_empty_lobbies)
@@ -4304,21 +5010,79 @@ class BZRWebSocketServer:
         peer = getattr(ws, "remote_address", None)
         return str(peer[0]) if isinstance(peer, tuple) and peer else ""
 
-    async def _refuse_auth(self, ws: Any, user_id: str, reason: str) -> None:
+    @staticmethod
+    def _ws_headers(ws: Any) -> Any:
+        return getattr(getattr(ws, "request", None), "headers", None) or {}
+
+    def admin_transport(self, ws: Any) -> tuple[bool, str]:
+        """May this connection elevate with the admin key? (ok, why)
+
+        The server speaks plain ws, so the key would cross the network in clear.
+        Accept it from loopback peers, native TLS, or a trusted reverse proxy
+        that marks the hop TLS (X-Forwarded-Proto / Forwarded: proto=https).
+        """
+        h = self.hardening
+        if h.allow_plain_remote_admin:
+            return True, "plain remote admin explicitly allowed"
+        ip = self._ws_ip(ws)
+        transport = getattr(ws, "transport", None)
+        with contextlib.suppress(Exception):
+            if transport is not None and transport.get_extra_info("ssl_object") is not None:
+                return True, "tls"
+        headers = self._ws_headers(ws)
+        forwarded = [headers.get(n) for n in ("X-Forwarded-For", "X-Forwarded-Proto", "X-Real-IP", "Forwarded")]
+        if any(forwarded):
+            if not h.is_trusted_proxy(ip):
+                return False, "forwarded request from an untrusted proxy"
+            proto = str(headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+            match = re.search(r"proto=([a-z]+)", str(headers.get("Forwarded") or "").lower())
+            proto = proto or (match.group(1) if match else "")
+            if proto in ("https", "wss"):
+                return True, "trusted proxy marked TLS"
+            return False, "trusted proxy did not mark the hop as TLS"
+        if is_loopback_ip(ip):
+            return True, "loopback"
+        return False, "plain ws from a remote peer"
+
+    def check_admin_key(self, ws: Any, user_id: str, key: str, info: dict[str, Any]) -> bool:
+        """Constant-time key check plus transport policy; audited; result cached in info."""
+        if "admin_key_ok" in info:
+            return bool(info["admin_key_ok"])
+        info["admin_key_ok"] = False
+        admin_key = self.state.admin_key
+        if not admin_key or not key:
+            return False
+        ip = self._ws_ip(ws)
+        if not hmac.compare_digest(key.encode("utf-8"), admin_key.encode("utf-8")):
+            self.state.audit.write("admin_key_failure", id=user_id, ip=ip)
+            self.state.record_stdout_entry("warn", f"Admin key rejected for {user_id} from {ip}")
+            return False
+        ok, why = self.admin_transport(ws)
+        if not ok:
+            self.state.audit.write("admin_key_refused", id=user_id, ip=ip, reason=why)
+            self.state.record_stdout_entry("warn", f"Admin key refused for {user_id} from {ip}: {why}")
+            return False
+        info["admin_key_ok"] = True
+        return True
+
+    async def _refuse_auth(self, ws: Any, user_id: str, reason: str, info: dict[str, Any] | None = None, name: str = "") -> None:
         # Same shape as the upstream steam-without-ticket refusal: the client
         # shows a failed login and retries the websocket on its own timer.
         self.state.access.denied_total += 1
-        self.state.record_stdout_entry("warn", f"Access refused {user_id} from {self._ws_ip(ws)}: {reason}")
+        ip = self._ws_ip(ws)
+        self.state.audit.write("auth_denied", id=user_id, name=name or None, ip=ip, reason=reason, **(info or {}))
+        self.state.record_stdout_entry("warn", f"Access refused {user_id} from {ip}: {reason}")
         await self.send(ws, "OnAuthorization", {"type": "OnAuthorization", "time": utc_now_str(), "success": False, "id": user_id})
         await self._close_quietly(ws, 4002)
 
-    async def _admit(self, ws: Any, user_id: str, name: str, key: str) -> bool:
+    async def _admit(self, ws: Any, user_id: str, name: str, key: str, info: dict[str, Any] | None = None) -> bool:
         access = self.state.access
+        info = info if info is not None else {}
         ip = self._ws_ip(ws)
         if access.rate_limited(ip):
-            await self._refuse_auth(ws, user_id, "too many login attempts")
+            await self._refuse_auth(ws, user_id, "too many login attempts", info, name)
             return False
-        if self.state.admin_key and key == self.state.admin_key:
+        if self.check_admin_key(ws, user_id, key, info):
             return True
         verdict, reason = access.decide(user_id, ip)
         if verdict == "pending":
@@ -4329,34 +5093,102 @@ class BZRWebSocketServer:
             except asyncio.TimeoutError:
                 # Stays in the pending list; approving later lets the client's
                 # next automatic retry straight in.
-                await self._refuse_auth(ws, user_id, "approval timed out")
+                await self._refuse_auth(ws, user_id, "approval timed out", info, name)
                 return False
             if not approved:
-                await self._refuse_auth(ws, user_id, "denied")
+                await self._refuse_auth(ws, user_id, "denied", info, name)
                 return False
             verdict = "allow"
         if verdict != "allow":
-            await self._refuse_auth(ws, user_id, reason)
+            await self._refuse_auth(ws, user_id, reason, info, name)
             return False
         access.note_seen(user_id, ip, name)
         return True
 
-    async def kick_user(self, user_id: str) -> bool:
+    async def _system_chat(self, ws: Any, text: str) -> None:
+        """Server notice in the same shape as the MOTD."""
+        with contextlib.suppress(Exception):
+            await self.send(ws, "OnChatMessage", {
+                "author": "SERVER", "speakerId": "SERVER", "text": text, "lobbyId": None,
+                "isChat": True, "time": utc_now_str(), "system": True,
+            })
+
+    @staticmethod
+    def _actor(session: UserSession | None) -> dict[str, Any] | None:
+        if session is None:
+            return None
+        return {"id": session.user_id, "ip": BZRWebSocketServer._ws_ip(session.ws), "admin": session.is_admin}
+
+    def _clean_name(self, raw: Any, user_id: str, *, allow_reserved: bool = False) -> tuple[str, list[str]]:
+        h = self.hardening
+        name, notes = sanitize_display_name(raw, max_length=h.name_max_length, reserved=h.reserved_names,
+                                            allow_reserved=allow_reserved)
+        if not name:
+            if "reserved" in notes:
+                tail = re.sub(r"\W+", "", user_id)[-4:]
+                name = f"Player-{tail}" if tail else "Player"
+            else:
+                name, more = sanitize_display_name(user_id, max_length=h.name_max_length, reserved=h.reserved_names)
+                name = name or "Player"
+                notes = notes + more
+            notes.append("fallback")
+        return name, notes
+
+    async def _chat_gate(self, session: UserSession) -> bool:
+        """Mute + per-session token bucket. False means the message is dropped."""
+        access = self.state.access
+        if access.is_muted(session.user_id):
+            session.chat_dropped += 1
+            return False
+        h = self.hardening
+        if h.chat_rate <= 0:
+            return True
+        now = time.monotonic()
+        burst = float(max(1, h.chat_burst))
+        if session.chat_tokens is None:
+            session.chat_tokens, session.chat_stamp = burst, now
+        session.chat_tokens = min(burst, session.chat_tokens + (now - session.chat_stamp) * h.chat_rate)
+        session.chat_stamp = now
+        if session.chat_tokens >= 1.0:
+            session.chat_tokens -= 1.0
+            return True
+        session.chat_dropped += 1
+        session.chat_strikes = [t for t in session.chat_strikes if now - t < h.chat_flood_window] + [now]
+        if h.chat_automute_minutes > 0 and h.chat_flood_strikes > 0 and len(session.chat_strikes) >= h.chat_flood_strikes:
+            session.chat_strikes = []
+            access.mute(session.user_id, session.name, "chat flood", h.chat_automute_minutes * 60,
+                        actor={"id": "server", "auto": True})
+            self.state.save_state()
+            self.state.record_stdout_entry("warn", f"Auto-muted {session.user_id} ({session.name}) for chat flooding")
+            await self._system_chat(session.ws, f"You have been muted for {h.chat_automute_minutes:g} minutes for flooding chat.")
+        elif now - session.chat_notice_stamp >= 10.0:
+            session.chat_notice_stamp = now
+            self.state.audit.write("chat_flood_drop", id=session.user_id, ip=self._ws_ip(session.ws), dropped=session.chat_dropped)
+            await self._system_chat(session.ws, "You are sending messages too quickly; slow down.")
+        return False
+
+    async def kick_user(self, user_id: str, actor: dict[str, Any] | None = None) -> bool:
         session = self.state.sessions_by_user_id.get(user_id)
         if session is None or session.ws is None:
             return False
         self.state.record_stdout_entry("warn", f"Kicked {user_id} ({session.name})")
+        self.state.audit.write("kick", actor=actor, targetId=user_id, ip=self._ws_ip(session.ws), name=session.name)
         # Do not hold the operator's request on the client's close handshake.
         asyncio.create_task(self._close_quietly(session.ws, 4002))
         return True
 
-    async def handle_access_action(self, body: dict[str, Any]) -> dict[str, Any]:
+    async def handle_access_action(self, body: dict[str, Any], actor: dict[str, Any] | None = None) -> dict[str, Any]:
         """Operator actions from the local launcher (POST /access)."""
         access = self.state.access
+        actor = actor or {"via": "local-http"}
         action = str(body.get("action", ""))
         uid = str(body.get("id", "") or "").strip()
         ip = str(body.get("ip", "") or "").strip()
         name = str(body.get("name", "") or "")
+        reason = str(body.get("reason", ""))
+        duration = parse_duration(body.get("duration"))
+        if duration is None and body.get("expiresAt") not in (None, ""):
+            duration = self._duration_until(body["expiresAt"], access.clock())
         if action == "set":
             access.set_mode(body.get("mode"), body.get("pinIps"))
         elif action == "approve" and uid:
@@ -4370,24 +5202,48 @@ class BZRWebSocketServer:
         elif action == "remove" and uid:
             access.remove_approved(uid)
         elif action == "kick" and uid:
-            await self.kick_user(uid)
+            await self.kick_user(uid, actor)
         elif action == "ban" and (uid or ip):
             session = self.state.sessions_by_user_id.get(uid) if uid else None
             if session and body.get("withIp") and not ip:
                 ip = self._ws_ip(session.ws)
-            access.ban(uid, ip, name or (session.name if session else ""), str(body.get("reason", "")))
+            access.ban(uid, ip, name or (session.name if session else ""), reason, duration, actor)
             if uid:
-                await self.kick_user(uid)
+                await self.kick_user(uid, actor)
             if ip:
                 for s in list(self.state.sessions_by_user_id.values()):
                     if self._ws_ip(s.ws) == ip:
-                        await self.kick_user(s.user_id)
+                        await self.kick_user(s.user_id, actor)
         elif action == "unban" and (uid or ip):
-            access.unban(uid, ip)
+            access.unban(uid, ip, actor)
+        elif action == "mute" and uid:
+            session = self.state.sessions_by_user_id.get(uid)
+            access.mute(uid, name or (session.name if session else ""), reason, duration, actor)
+        elif action == "unmute" and uid:
+            access.unmute(uid, actor)
         else:
             return {"ok": False, "error": f"bad action {action!r}"}
+        if action in ("set", "approve", "deny", "remove", "kick"):
+            self.state.audit.write("access_action", actor=actor, action=action, targetId=uid or None,
+                                   targetIp=ip or None, mode=body.get("mode") if action == "set" else None,
+                                   pinIps=body.get("pinIps") if action == "set" else None)
         self.state.save_state()
         return {"ok": True, "access": access.snapshot()}
+
+    @staticmethod
+    def _duration_until(expires_at: Any, now: float) -> float:
+        """Seconds from now until an epoch number or 'YYYY-MM-DD HH:MM:SS' (UTC)."""
+        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+            epoch = float(expires_at)
+        else:
+            try:
+                epoch = datetime.strptime(str(expires_at).strip().replace("T", " ").rstrip("Z"),
+                                          "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+            except ValueError as exc:
+                raise ValueError(f"bad expiresAt {expires_at!r} (use 'YYYY-MM-DD HH:MM:SS' UTC or epoch seconds)") from exc
+        if epoch <= now:
+            raise ValueError("expiresAt is in the past")
+        return epoch - now
 
     async def _close_quietly(self, ws: Any, code: int) -> None:
         try:
@@ -4453,10 +5309,14 @@ class BZRWebSocketServer:
         await self.broadcast_all("OnLobbyListChanged", self._lobby_list_payload())
 
     def _apply_player_data(self, session: UserSession, key: str, value: Any) -> None:
-        if key == "name":
-            session.name = str(value)
-        elif key == "playerName":
-            session.player_name = str(value)
+        if key in ("name", "playerName"):
+            clean, _notes = sanitize_display_name(value, max_length=self.hardening.name_max_length,
+                                                  reserved=self.hardening.reserved_names, allow_reserved=session.is_admin)
+            if clean:
+                if key == "name":
+                    session.name = clean
+                else:
+                    session.player_name = clean
         elif key == "clientVersion":
             session.client_version = str(value)
         elif key == "authType":
@@ -4550,8 +5410,15 @@ class BZRWebSocketServer:
         if not authtype:
             # Upstream parity (2026-08-25 evidence): missing authtype closes
             # the socket (4002) with no message frame.
+            self.state.audit.write("auth_denied", id=str(content.get("id", "") or ""), ip=self._ws_ip(ws),
+                                   reason="missing authtype", ticketWithheld=ticket_is_withheld(content))
             await self._close_quietly(ws, 4002)
             return
+        info: dict[str, Any] = {
+            "authtype": authtype,
+            "clientVersion": str(content.get("clientVersion", "2.2.301")),
+            "ticketWithheld": ticket_is_withheld(content),
+        }
         if authtype.lower() == "steam" and not any(
             str(content.get(key, "") or "").strip()
             for key in ("steamAppTicket", "authTicket", "platformTicket")
@@ -4561,6 +5428,7 @@ class BZRWebSocketServer:
             # success+id shape is captured upstream; no reason string is
             # asserted here.
             requested = str(content.get("id", "") or "")
+            self.state.audit.write("auth_denied", id=requested, ip=self._ws_ip(ws), reason="steam without ticket", **info)
             await self.send(
                 ws,
                 "OnAuthorization",
@@ -4589,9 +5457,20 @@ class BZRWebSocketServer:
             user_id = f"U{uuid.uuid4().hex[:12]}"
         else:
             user_id = requested_id
-        name = str(content.get("name") or content.get("playerName") or user_id)
+        raw_name = content.get("name") or content.get("playerName") or user_id
+        name, name_notes = self._clean_name(raw_name, user_id, allow_reserved=user_id in self.state.admin_ids)
 
-        if not await self._admit(ws, user_id, name, str(content.get("key", ""))):
+        h = self.hardening
+        if h.version_policy != "off":
+            acceptable, why = h.version_verdict(info["clientVersion"])
+            if not acceptable:
+                if h.version_policy == "enforce":
+                    await self._refuse_auth(ws, user_id, why, info, name)
+                    return
+                self.state.record_stdout_entry("warn", f"Client version policy (log only) {user_id}: {why}")
+                self.state.audit.write("client_version_warning", id=user_id, ip=self._ws_ip(ws), reason=why)
+
+        if not await self._admit(ws, user_id, name, str(content.get("key", "")), info):
             return
 
         if user_id in self.state.sessions_by_user_id:
@@ -4601,27 +5480,39 @@ class BZRWebSocketServer:
         session = UserSession(
             user_id=user_id,
             name=name,
-            player_name=str(content.get("playerName") or name),
+            player_name=self._clean_name(content.get("playerName") or name, user_id, allow_reserved=user_id in self.state.admin_ids)[0],
             authtype=authtype,
-            client_version=str(content.get("clientVersion", "2.2.301")),
+            client_version=info["clientVersion"],
+            ticket_withheld=info["ticketWithheld"],
             key=str(content.get("key", "")),
             lan_addresses=[str(x) for x in content.get("lanAddresses", []) if isinstance(x, str)],
             wan_address=str(content.get("wanAddress", "")),
             in_lounge=bool(content.get("inLounge", False)),
             ws=ws,
         )
-        key = str(content.get("key", ""))
-        if self.state.admin_key and key == self.state.admin_key:
+        admin_via = []
+        if info.get("admin_key_ok"):
             session.is_admin = True
+            admin_via.append("key")
         if session.user_id in self.state.admin_ids:
             session.is_admin = True
+            admin_via.append("id")
+        if session.is_admin and "reserved" in name_notes:
+            session.name, _ = self._clean_name(raw_name, user_id, allow_reserved=True)
+            session.player_name = self._clean_name(content.get("playerName") or session.name, user_id, allow_reserved=True)[0]
 
         self.state.sessions_by_ws[ws] = session
         self.state.sessions_by_user_id[user_id] = session
         self.auth_total += 1
         self.state.record_stdout_entry(
             "info",
-            f"Authorized {session.user_id} ({session.name}) via {session.authtype}",
+            f"Authorized {session.user_id} ({session.name}) via {describe_authtype(session.authtype, session.ticket_withheld)}",
+        )
+        self.state.audit.write(
+            "auth_accepted", id=session.user_id, name=session.name, ip=self._ws_ip(ws), authtype=session.authtype,
+            clientVersion=session.client_version, ticketWithheld=session.ticket_withheld,
+            nameAdjusted=[n for n in name_notes if n != "fallback"] or None, isAdmin=session.is_admin,
+            adminVia=admin_via or None,
         )
 
         await self.send(
@@ -4989,9 +5880,7 @@ class BZRWebSocketServer:
             elif self.relay_protocol is None:
                 relay_reason = "relay transport is unavailable"
             else:
-                relay_route_ok, relay_reason = self.relay_protocol.register_route(session, target_session)
-                if relay_route_ok:
-                    relay_port = self.relay_protocol.listen_port
+                relay_route_ok, relay_reason, relay_port = await self.relay_protocol.allocate_route(session, target_session)
 
         success = target_session is not None and (not route or relay_route_ok)
         base_payload = {
@@ -5052,6 +5941,8 @@ class BZRWebSocketServer:
     async def handle_chat(self, session: UserSession, text: str) -> None:
         text = text.strip()
         if not text:
+            return
+        if not await self._chat_gate(session):
             return
         self.chat_total += 1
 
@@ -5159,6 +6050,7 @@ class BZRWebSocketServer:
             await self.send_error(session.ws, "DoKickUser ignored: user not in lobby")
             return
         self.kicks_total += 1
+        self.state.audit.write("lobby_kick", actor=self._actor(session), targetId=target_id, lobbyId=lid)
         await self.remove_from_lobby(target_session, send_exit_ack=True)
         self.state.record_stdout_entry("warn", f"{target_id} was kicked from lobby {lid} by {session.user_id}")
         await self.send_stdout(target_session.ws, "warn", "You were kicked from the lobby")
@@ -5220,6 +6112,10 @@ class BZRWebSocketServer:
             # silently ignored - no error frame is sent. (Older community
             # behavior replied "Authorization required"; removed for parity.)
             return
+
+        if msg_type in ("SetLogLevel", "AddRegex", "RemoveRegex", "SetRelay", "SetTest"):
+            self.state.audit.write("admin_verb", actor=self._actor(session), verb=msg_type, args=content,
+                                   allowed=session.is_admin or msg_type == "SetTest")
 
         if msg_type == "DoEnterLounge":
             session.in_lounge = self._coerce_bool(content)
@@ -5654,7 +6550,10 @@ def build_lobbies_payload(state: ServerState) -> dict[str, Any]:
             "id": s.user_id,
             "name": s.name,
             "playerName": s.player_name,
-            "authtype": s.authtype,
+            "authtype": describe_authtype(s.authtype, s.ticket_withheld),
+            "ticketWithheld": s.ticket_withheld,
+            "muted": state.access.is_muted(s.user_id),
+            "clientVersion": s.client_version,
             "wanAddress": s.wan_address,
             "lobbyId": s.current_lobby_id,
             "inLounge": s.in_lounge,
@@ -5728,10 +6627,31 @@ async def serve_health_http(
             raw = await asyncio.wait_for(reader.readexactly(content_length), timeout=2.0) if content_length else b"{}"
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
-                result = await ws_server.handle_access_action(body if isinstance(body, dict) else {})
+                result = await ws_server.handle_access_action(body if isinstance(body, dict) else {}, {"via": "local-http", "ip": peer_ip})
                 writer.write(_http_json(200 if result.get("ok") else 400, result))
             except ValueError as exc:
                 writer.write(_http_json(400, {"ok": False, "error": str(exc)}))
+            await writer.drain()
+            return
+
+        if method == "POST" and path == "/relay/impairment":
+            # Test control: only from this machine, whatever --health-host is.
+            peer = writer.get_extra_info("peername")
+            peer_ip = str(peer[0]) if isinstance(peer, tuple) and peer else ""
+            if not (peer_ip.startswith("127.") or peer_ip in ("::1", "::ffff:127.0.0.1")):
+                writer.write(_http_json(403, {"ok": False, "error": "relay impairment is local-only"}))
+            elif relay_protocol is None:
+                writer.write(_http_json(409, {"ok": False, "error": "the relay is disabled"}))
+            else:
+                raw = await asyncio.wait_for(reader.readexactly(content_length), timeout=2.0) if content_length else b"{}"
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                    spec = body.get("spec", "") if isinstance(body, dict) else None
+                    if not isinstance(spec, str):
+                        raise ValueError('body must be {"spec": "<impairment spec or empty to clear>"}')
+                    writer.write(_http_json(200, {"ok": True, "impairment": relay_protocol.set_impairment(spec)}))
+                except ValueError as exc:
+                    writer.write(_http_json(400, {"ok": False, "error": str(exc)}))
             await writer.drain()
             return
 
@@ -5740,13 +6660,16 @@ async def serve_health_http(
             await writer.drain()
             return
 
-        if path not in ("/health", "/status", "/captures", "/protocol", "/lobbies", "/access"):
+        if path not in ("/health", "/status", "/captures", "/protocol", "/lobbies", "/access", "/relay/impairment"):
             writer.write(_http_json(404, {"ok": False, "error": "Unknown path"}))
             await writer.drain()
             return
 
         if path == "/access":
             payload = {"ok": True, "time": utc_now_str(), "access": state.access.snapshot()}
+        elif path == "/relay/impairment":
+            payload = {"ok": True, "time": utc_now_str(),
+                       "impairment": relay_protocol.impairment_metrics() if relay_protocol else {"active": False, "spec": ""}}
         elif path == "/lobbies":
             payload = build_lobbies_payload(state)
         elif path in ("/health", "/status"):
@@ -5813,6 +6736,26 @@ async def autosave_loop(
             await asyncio.sleep(1)
 
 
+def _csv(value: str) -> tuple[str, ...]:
+    return tuple(x.strip() for x in str(value or "").split(",") if x.strip())
+
+
+def hardening_from_args(args: argparse.Namespace) -> HardeningConfig:
+    return HardeningConfig(
+        name_max_length=max(0, args.name_max_length),
+        reserved_names=_csv(args.reserved_names),
+        version_policy=args.client_version_policy,
+        min_client_version=args.min_client_version.strip(),
+        allowed_client_versions=_csv(args.allowed_client_versions),
+        chat_rate=max(0.0, args.chat_rate),
+        chat_burst=max(1, args.chat_burst),
+        chat_flood_strikes=max(0, args.chat_flood_strikes),
+        chat_automute_minutes=max(0.0, args.chat_automute_minutes),
+        trusted_proxies=_csv(args.trusted_proxies),
+        allow_plain_remote_admin=bool(args.allow_plain_remote_admin),
+    )
+
+
 async def run_server(args: argparse.Namespace) -> None:
     global websockets, ConnectionClosed
     if websockets is None:
@@ -5836,12 +6779,28 @@ async def run_server(args: argparse.Namespace) -> None:
 
     admin_ids = {x.strip() for x in args.admin_ids.split(",") if x.strip()}
     admin_key = args.admin_key or os.getenv("BZR_ADMIN_KEY", "")
+    diagnostic_run_id = uuid.uuid4().hex[:12]
+    protocol_trace = ProtocolTraceWriter(args.protocol_trace, diagnostic_run_id) if args.protocol_trace else None
+    audit = AuditLog(args.audit_log or None, max_bytes=args.audit_log_max_bytes, backups=args.audit_log_backups)
     state = ServerState(
         logger.getChild("state"),
         state_file=args.state_file,
         admin_key=admin_key,
         admin_ids=admin_ids,
+        protocol_trace=protocol_trace,
+        audit=audit,
     )
+    hardening = hardening_from_args(args)
+    if hardening.allow_plain_remote_admin:
+        logger.warning("--allow-plain-remote-admin: the admin key is accepted over plain ws from ANY peer "
+                       "and will cross the network in clear text. Prefer loopback or a TLS-terminating proxy.")
+    elif admin_key:
+        logger.info("Admin key elevation: loopback%s only",
+                    " or trusted TLS proxy " + ",".join(hardening.trusted_proxies) if hardening.trusted_proxies else "")
+    if audit.enabled:
+        logger.info("Audit log: %s", audit.path)
+        audit.write("server_start", accessMode=state.access.mode, versionPolicy=hardening.version_policy,
+                    plainRemoteAdmin=hardening.allow_plain_remote_admin)
     state.load_state(retain_empty_lobbies=args.retain_empty_lobbies)
     state.access.approval_wait_seconds = max(1, args.approval_wait_seconds)
     state.access.rate_limit_per_minute = max(0, args.auth_rate_limit)
@@ -5861,7 +6820,8 @@ async def run_server(args: argparse.Namespace) -> None:
                 args.fault_inject,
             )
         if args.relay_trace:
-            trace_writer = RelayTraceWriter(args.relay_trace, run_id=uuid.uuid4().hex[:12])
+            trace_writer = RelayTraceWriter(args.relay_trace, run_id=diagnostic_run_id,
+                                            include_payloads=args.relay_trace_payloads)
             logger.info("Relay forensic trace writing to %s", args.relay_trace)
         relay_protocol = BZRRelayProtocol(
             logger.getChild("relay"),
@@ -5869,7 +6829,17 @@ async def run_server(args: argparse.Namespace) -> None:
             route_ttl_seconds=args.relay_route_ttl_seconds,
             fault_injector=fault_injector,
             trace_writer=trace_writer,
+            pair_ports=args.relay_pair_ports,
+            pair_port_start=args.relay_pair_port_start,
+            pair_port_end=args.relay_pair_port_end,
+            reserved_ports={args.udp_port, args.relay_port},
         )
+        if args.impair:
+            relay_protocol.set_impairment(args.impair)
+        if args.relay_pair_ports:
+            port_description = (f"UDP {args.relay_pair_port_start}-{args.relay_pair_port_end}"
+                                if args.relay_pair_port_start else "ephemeral UDP ports (private/local use)")
+            logger.info("Relay peer pairs use %s; LAN/WAN clients need access to every allocated port", port_description)
         state.relay_requested = True
     else:
         state.relay_requested = False
@@ -5881,6 +6851,7 @@ async def run_server(args: argparse.Namespace) -> None:
         max_lobbies=args.max_lobbies,
         retain_empty_lobbies=args.retain_empty_lobbies,
         relay_protocol=relay_protocol,
+        hardening=hardening,
     )
 
     loop = asyncio.get_running_loop()
@@ -5964,8 +6935,13 @@ async def run_server(args: argparse.Namespace) -> None:
 
     udp_transport.close()
     if relay_transport is not None:
-        relay_transport.close()
+        assert relay_protocol is not None
+        relay_protocol.close()
     await asyncio.sleep(0.05)
+    if relay_protocol is not None and relay_protocol.trace_writer is not None:
+        relay_protocol.trace_writer.close()
+    if protocol_trace is not None:
+        protocol_trace.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -5976,8 +6952,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help=f"UDP bind port (default: {DEFAULT_UDP_PORT})")
     parser.add_argument("--relay-host", default=DEFAULT_RELAY_HOST, help=f"UDP relay bind host (default: {DEFAULT_RELAY_HOST})")
     parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP relay port, 0 to disable (default: {DEFAULT_RELAY_PORT})")
+    pair_mode = os.getenv("BZR_RELAY_PAIR_PORTS", "0").strip().lower()
+    if pair_mode not in {"", "0", "false", "no", "off", "1", "true", "yes", "on"}:
+        parser.error("BZR_RELAY_PAIR_PORTS must be 0/1 or false/true")
+    parser.add_argument("--relay-pair-ports", action=argparse.BooleanOptionalAction,
+                        default=pair_mode in {"1", "true", "yes", "on"},
+                        help="One UDP port per peer pair; use explicit bounds for LAN/WAN. Default off (env BZR_RELAY_PAIR_PORTS); --no-relay-pair-ports restores shared relay")
+    parser.add_argument("--relay-pair-port-start", type=int,
+                        default=os.getenv("BZR_RELAY_PAIR_PORT_START", "0"),
+                        help="First UDP pair port, inclusive (env BZR_RELAY_PAIR_PORT_START). Both bounds 0 uses ephemeral ports; bounds alone do not enable pair mode")
+    parser.add_argument("--relay-pair-port-end", type=int,
+                        default=os.getenv("BZR_RELAY_PAIR_PORT_END", "0"),
+                        help="Last UDP pair port, inclusive (env BZR_RELAY_PAIR_PORT_END). Allow/forward this entire range for LAN/WAN players")
     parser.add_argument("--relay-route-ttl-seconds", type=int, default=DEFAULT_RELAY_ROUTE_TTL_SECONDS, help="Inactive relay route expiration interval")
     parser.add_argument("--disable-relay", action="store_true", help="Disable the community UDP relay transport")
+    parser.add_argument(
+        "--impair",
+        default=os.getenv("BZR_RELAY_IMPAIR", ""),
+        help=(
+            "Relay network impairment for private test runs, DEFAULT OFF (env BZR_RELAY_IMPAIR). "
+            "Example: loss=3,delay=80,jitter=20,seed=7. See relay_impairment.py for every key; "
+            "POST /relay/impairment changes it at run time. Never enable in normal service."
+        ),
+    )
     parser.add_argument(
         "--fault-inject",
         default=os.getenv("BZRNET_FAULT_INJECT", ""),
@@ -5992,6 +6989,10 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("BZRNET_RELAY_TRACE", ""),
         help="Optional JSONL forensic trace of routed relay datagrams (transport envelope fields only; local-only output)",
     )
+    parser.add_argument("--protocol-trace", default=os.getenv("BZRNET_PROTOCOL_TRACE", ""),
+                        help="Optional untruncated protocol event JSONL with credentials redacted; pair with --relay-trace for every opaque relay datagram")
+    parser.add_argument("--relay-trace-payloads", action="store_true",
+                        help="Maximum diagnostic capture: copy complete opaque datagrams to --relay-trace as hex; default OFF, adds disk/CPU load")
     parser.add_argument("--health-host", default=DEFAULT_HEALTH_HOST, help=f"Health HTTP bind host (default: {DEFAULT_HEALTH_HOST})")
     parser.add_argument("--health-port", type=int, default=DEFAULT_HEALTH_PORT, help=f"Health HTTP bind port, 0 to disable (default: {DEFAULT_HEALTH_PORT})")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"Path to persistent state JSON (default: {DEFAULT_STATE_FILE})")
@@ -5999,6 +7000,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motd", default="", help="Optional message-of-the-day sent after authorization")
     parser.add_argument("--admin-key", default="", help="Admin key accepted during Authorization content.key")
     parser.add_argument("--admin-ids", default="", help="Comma-separated user IDs that are always treated as admins")
+    parser.add_argument("--audit-log", default=os.getenv("BZR_AUDIT_LOG", DEFAULT_AUDIT_LOG),
+                        help=f"Append-only JSONL audit trail of auth, admin actions, bans and mutes (default: {DEFAULT_AUDIT_LOG}; "
+                             "empty string disables; never contains tickets, passwords or admin keys)")
+    parser.add_argument("--audit-log-max-bytes", type=int, default=5_000_000, help="Rotate the audit log at this size, 0 never rotates")
+    parser.add_argument("--audit-log-backups", type=int, default=3, help="Rotated audit files to keep (audit.log.1 ...)")
+    parser.add_argument("--name-max-length", type=int, default=32,
+                        help="Longest accepted player name; control/bidi/zero-width characters are always stripped (0 = no cap)")
+    parser.add_argument("--reserved-names", default=DEFAULT_RESERVED_NAMES,
+                        help="Comma-separated names players may not use (impersonating the server or staff); admins are exempt")
+    parser.add_argument("--client-version-policy", choices=["off", "log", "enforce"], default="log",
+                        help="What to do with clients failing --min-client-version / --allowed-client-versions: "
+                             "log (default, admit and record), enforce (refuse like other admission denials), off")
+    parser.add_argument("--min-client-version", default="", help="Oldest accepted clientVersion, e.g. 2.2.301")
+    parser.add_argument("--allowed-client-versions", default="",
+                        help="Comma-separated exact clientVersion values; a trailing * is a prefix match (2.2.*)")
+    parser.add_argument("--chat-rate", type=float, default=2.0, help="Sustained chat messages per second per player, 0 disables the limit")
+    parser.add_argument("--chat-burst", type=int, default=8, help="Chat messages a player may send in a burst")
+    parser.add_argument("--chat-flood-strikes", type=int, default=5,
+                        help="Dropped messages within 30 s that trigger an auto-mute, 0 disables auto-mute")
+    parser.add_argument("--chat-automute-minutes", type=float, default=5.0, help="Auto-mute length for chat flooding, 0 disables")
+    parser.add_argument("--trusted-proxies", default="",
+                        help="Comma-separated IPs/CIDRs of reverse proxies whose X-Forwarded-Proto: https is believed for admin-key elevation")
+    parser.add_argument("--allow-plain-remote-admin", action="store_true",
+                        help="UNSAFE: accept the admin key over plain ws from any peer (default: loopback or trusted TLS proxy only)")
     parser.add_argument("--max-lobbies", type=int, default=500, help="Maximum simultaneous lobbies")
     parser.add_argument(
         "--retain-empty-lobbies",
@@ -6025,7 +7050,11 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.relay_pair_port_start, args.relay_pair_port_end) != (0, 0) and not (
+            1 <= args.relay_pair_port_start <= args.relay_pair_port_end <= 65535):
+        parser.error("relay pair port bounds must both be 0 (ephemeral) or an inclusive range within 1-65535")
+    return args
 
 
 def main() -> None:

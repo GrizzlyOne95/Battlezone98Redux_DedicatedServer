@@ -1,0 +1,11 @@
+# Optional bounded relay for multiple relayed peers. Merge with the base file:
+# docker compose -f docker-compose.yml -f docker-compose.pair-ports.yml up --build
+# Set the same inclusive range in .env and the host/router UDP rules.
+services:
+  bzr-dedicated:
+    environment:
+      BZR_RELAY_PAIR_PORTS: "1"
+      BZR_RELAY_PAIR_PORT_START: "${BZR_RELAY_PAIR_PORT_START:-1340}"
+      BZR_RELAY_PAIR_PORT_END: "${BZR_RELAY_PAIR_PORT_END:-1369}"
+    ports:
+      - "${BZR_RELAY_PAIR_PORT_START:-1340}-${BZR_RELAY_PAIR_PORT_END:-1369}:${BZR_RELAY_PAIR_PORT_START:-1340}-${BZR_RELAY_PAIR_PORT_END:-1369}/udp"

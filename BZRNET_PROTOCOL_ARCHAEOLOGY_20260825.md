@@ -329,6 +329,9 @@ Prioritized interoperability backlog (re-ranked; P0 items unchanged in substance
 
 ## 14. Unknown fields/messages (explicit register)
 
+> **Update 2026-10-06:** [`BZRNET_CLIENT_DECOMP_VALIDATION_20261006.md`](BZRNET_CLIENT_DECOMP_VALIDATION_20261006.md) resolves the 1339 envelope (there is none), the `seq_b` role (cumulative ack), the kind values (6 = resend request, 7 = ack), `EMPState` values, auto-kick defaults, and `PK`/`ns`/`RG`/`la`/`lu`/`PT`. It also documents a relay limitation for clients with two or more relayed peers.
+
+
 | Item | Status | How to resolve |
 |---|---|---|
 | UDP 1339 allocation/association envelope, keepalive, timeout | UNKNOWN | scripted Capture A (tooling ready) |
