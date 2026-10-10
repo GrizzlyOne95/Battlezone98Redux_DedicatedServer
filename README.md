@@ -155,6 +155,21 @@ The stock client only appears to need peer addresses after joining the same game
 match, so the flag is off by default. Players still see each other's addresses once in a match
 together, as with any peer-to-peer game.
 
+#### Read-only chat watchers (`--allow-loopback-watchers`)
+
+Lets a tool on the same machine, such as BZ1 Game Watcher, read chat rooms without putting an
+account in each room. A session gets the watcher role when it sends `"watcher": true` in its
+`Authorization` content, the server runs with `--allow-loopback-watchers`, and the connection comes
+straight from loopback (forwarded/proxied requests are refused). `OnAuthorization` then carries
+`"isWatcher": true`; the field is omitted otherwise, so stock clients see the usual shape.
+
+A watcher receives a copy of every `OnChatMessage` posted in an open public chat room
+(`~chat~pub~~*`, not private or passworded), with `lobbyId` and `speakerId`, plus the normal lounge
+and lobby-list traffic. It never joins a room, is never a whisper target and is left out of
+`totalUsers`. Everything except `DoEnterLounge`, `DoExitLounge`, `GetLobbyList` and `Ping`/`DoPing`
+is ignored, so it cannot join, create rooms, chat or change metadata. It gets no player addresses
+unless it is also an admin. Grants and refusals go to the audit log.
+
 #### Standalone Windows package
 
 `python build_package.py` builds `dist/BZRDedicatedServer-<version>.zip` for PCs without Python.
