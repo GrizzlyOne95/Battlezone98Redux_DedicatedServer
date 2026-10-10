@@ -274,6 +274,8 @@ async def spawned_server(args, extra: tuple[str, ...] = ()):
         sys.executable, str(HERE / "server.py"),
         "--ws-port", str(ws_port),
         "--udp-port", str(udp_port),
+        # Free relay port too, so the suite runs beside a live server on 1339.
+        "--relay-port", str(free_udp_port()),
         "--health-port", str(http_port),
         "--state-file", str(state_file),
         "--autosave-seconds", "1",
@@ -692,6 +694,7 @@ async def scenario_restart_persistence(args) -> None:
     base_cmd = [
         sys.executable, str(HERE / "server.py"),
         "--ws-port", str(ws_port), "--udp-port", str(udp_port),
+        "--relay-port", str(free_udp_port()),
         "--health-port", str(http_port), "--state-file", str(state_file),
         "--autosave-seconds", "1",
         "--retain-empty-lobbies",
