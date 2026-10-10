@@ -59,7 +59,8 @@ admission-only CRCoop override in all four arms: 80 fighting AI, 16 beacons,
 64 ammo/repair objects, 60 steady simulation seconds; 3% loss seed 212 and
 3% loss plus 256 kbit/s sender cap/200 ms queue seed 213. Native defaults are
 stock. Earlier renderer-transition, nested-lock and admission failures remain
-archived/unqualified. The matrix is currently active; no final timer verdict.
+archived/unqualified. The matrix stopped after one completed stock-timer arm
+and a navigation interruption, as recorded below; no timer comparison is qualified.
 
 Compare equal post-ramp exposure while retaining pre-window sequence state:
 modeled blackouts/update ages, repeated reliable sequences, datagram bandwidth,

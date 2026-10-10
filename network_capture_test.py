@@ -68,6 +68,29 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(rows[3]["payload"]["key"], "gameSettings")
             self.assertEqual(rows[3]["payload"]["value"], "unchanged opaque settings")
 
+    def test_supported_authorization_tickets_are_redacted(self):
+        for ticket_field in ("steamAppTicket", "authTicket", "platformTicket"):
+            with self.subTest(ticket_field=ticket_field), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "protocol.jsonl"
+                writer = ProtocolTraceWriter(str(path), "sanitized-test")
+                state = ServerState(logging.getLogger("capture-test"), protocol_trace=writer)
+                secret = f"test-{ticket_field}-credential"
+                payload = {"authtype": "steam", "id": "TEST_USER", "name": "Test Player",
+                           "key": "test-key", ticket_field: secret}
+                try:
+                    state.record_protocol_event(channel="ws", direction="rx", peer="127.0.0.1:40001",
+                                                msg_type="Authorization", payload=payload)
+                finally:
+                    writer.close()
+                row = records(path)[1]
+                self.assertEqual(row["payload"][ticket_field], "<redacted>")
+                self.assertEqual(row["payload"]["key"], "<redacted>")
+                self.assertEqual(row["payload"]["authtype"], "steam")
+                self.assertEqual(row["payload"]["id"], "TEST_USER")
+                self.assertEqual(json.loads(row["preview"])[ticket_field], "<redacted>")
+                self.assertNotIn(secret, path.read_text(encoding="utf-8"))
+                self.assertEqual(payload[ticket_field], secret)
+
     def test_maximum_opaque_capture_matches_byte_exact_forward(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "relay.jsonl"

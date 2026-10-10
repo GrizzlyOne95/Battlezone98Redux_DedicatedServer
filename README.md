@@ -360,7 +360,9 @@ Use all of these server options for a private diagnostic run:
 
 `DEBUG` is the maximum Python log level. The protocol JSONL additionally
 archives untruncated WS/UDP event payloads beyond the 400-entry `/captures`
-history, with authentication credentials and passwords redacted. The relay
+history, with authentication credentials and passwords redacted, including
+the supported `steamAppTicket`, `authTicket`, and `platformTicket` fields in
+both archived payloads and previews. The relay
 JSONL records every routed datagram and unroutable, socket-error and route
 lifecycle events. Routed records include the peer-pair/lobby identity,
 advertised relay socket, nanosecond wall timestamp, opaque datagram SHA-256 and

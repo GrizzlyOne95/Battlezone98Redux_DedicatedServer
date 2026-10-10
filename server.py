@@ -3217,7 +3217,7 @@ class AccessControl:
 
 def redact_protocol_trace_payload(value: Any, *, message_type: str) -> Any:
     """Retain full protocol shapes without persisting credentials."""
-    secret_names = {"password", "token", "ticket", "authticket", "steamticket", "adminkey", "secret", "authorization"}
+    secret_names = {"password", "token", "ticket", "authticket", "steamticket", "steamappticket", "platformticket", "adminkey", "secret", "authorization"}
     if isinstance(value, dict):
         password_update = str(value.get("key", "")).lower() == "password"
         return {
