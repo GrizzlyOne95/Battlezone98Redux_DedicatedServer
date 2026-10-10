@@ -43,6 +43,9 @@ window (Copy option), for example:
 Type it in full (ws://, port and trailing /); a bare IP does not work.
 Remove it to go back to the official servers.
 Ports: TCP 1337 (lobby), UDP 1338 (handshake), UDP 1339 (relay).
+For three or more relayed players, enable Separate UDP port per peer pair
+and allow/forward its UDP range (1340-1369 by default). Four fully relayed
+players use six ports; the 30-port pool is shared across all active lobbies.
 Windows will ask to allow BZRServer.exe through the firewall the first
 time; allow it on Private networks. See LAN_COOP.md for setting up the
 game PCs to use this server.

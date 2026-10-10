@@ -117,6 +117,13 @@ covered by `protocol_parity_test.py` E4–E8:
 - Binary frames are rejected with the upstream wording `Binary Payload
   not supported` over the existing error envelope.
 
+Community hardening layered on top (not upstream evidence; stock-visible
+shapes unchanged): the literal ticket `withheld` is admitted like any
+non-empty ticket and flagged operator-side only; names are sanitized;
+`clientVersion`, chat rate, bans/mutes (optionally timed) and admin-key
+elevation are operator-policed and audited. See README "Admin and moderation
+hardening" for the options.
+
 ## 7. UDP details
 
 18-byte big-endian header (`BZRNET_TRANSPORT_HEADER_20260812.md`): flags
@@ -131,6 +138,12 @@ classifies discovery traffic (`DISCOVERY_KIND=0x2`).
 
 1. `pip install -r requirements.txt`, then `python server.py`
    (Docker: `docker-compose up`; health at `:8080/health`).
+   Shared relay is the compatibility default. For three or more relayed players, enable
+   `--relay-pair-ports --relay-pair-port-start 1340 --relay-pair-port-end 1369` (or select pair mode
+   and these bounds in the GUI). Allow/forward the whole configured UDP range. Docker users can
+   merge `docker-compose.pair-ports.yml` with the base file. A fully relayed `n`-player lobby needs
+   `n*(n-1)/2` ports; the 30-port example is shared across all active lobbies. Ephemeral `0`/`0`
+   bounds remain available for private loopback tests. See `README.md` for failure/capacity details.
 2. Validate without the game: `python smoke_test.py --host 127.0.0.1`
    (WS/UDP/decoder/HTTP/protocol/capture checks),
    `python protocol_parity_test.py` (edge parity E1–E8),
@@ -149,7 +162,7 @@ classifies discovery traffic (`DISCOVERY_KIND=0x2`).
   prefix, cross-NAT behavior): needs a two-network forced-relay
   (`/iprelay`) capture. Current relay is opaque endpoint-pair forwarding.
 - Official `reasonCode` enum beyond 0/4/5; whitelist/admin policy;
-  abuse limits; security review.
+  security review (basic abuse limits exist; see README).
 - Production Steam-ticket validation.
 
 ## 10. Tooling map

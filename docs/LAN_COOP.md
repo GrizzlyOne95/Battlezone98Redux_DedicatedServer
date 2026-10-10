@@ -9,15 +9,23 @@ this server.
 
    ```
    cd Battlezone98Redux_DedicatedServer
-   python server.py --state-file C:\BZRCoop\server\state.json
+   python server.py --state-file C:\BZRCoop\server\state.json --relay-pair-ports --relay-pair-port-start 1340 --relay-pair-port-end 1369
    ```
 
-   Ports: TCP 1337 (lobby), UDP 1338 (handshake), UDP 1339 (relay). The 8080 status page stays
+   Ports: TCP 1337 (lobby), UDP 1338 (handshake), UDP 1339 (shared relay listener), and UDP 1340–1369
+   (separate relay peer pairs). The 8080 status page stays
    local-only (http://127.0.0.1:8080/status) and clients never use it.
 
    Or double-click `ServerGUI.bat` (same as `pythonw server_gui.py`) for a window with
    Start/Stop/Restart, the live log, connected players, open lobbies, and the LAN address players
-   should use. Set the state file there once; settings are remembered in `server_gui.json`.
+   should use. Enable **Separate UDP port per peer pair**, set its range to 1340–1369 (or your chosen
+   accessible range), and set the state file there once. Settings are remembered in `server_gui.json`.
+
+   Separate pair ports prevent shared-relay ambiguity when one player has multiple relayed peers.
+   The CLI and existing launcher settings keep legacy shared mode until explicitly enabled.
+   A fully relayed `n`-player lobby needs `n*(n-1)/2` ports; four players need six. The default GUI
+   range supplies 30 ports total across all active lobbies. Occupied ports reduce that capacity.
+   An exhausted range rejects a new route with a clear error while existing routes keep working.
 
 2. Find the PC's LAN address with `ipconfig` (the `Ethernet` or `Wi-Fi` IPv4 address, for example
    `192.168.0.44`). Give this PC a DHCP reservation in the router so the address never changes.
@@ -28,10 +36,11 @@ this server.
 
    ```
    New-NetFirewallRule -DisplayName "BZR server TCP" -Direction Inbound -Protocol TCP -LocalPort 1337 -Action Allow -Profile Private
-   New-NetFirewallRule -DisplayName "BZR server UDP" -Direction Inbound -Protocol UDP -LocalPort 1338-1339 -Action Allow -Profile Private
+   New-NetFirewallRule -DisplayName "BZR server UDP" -Direction Inbound -Protocol UDP -LocalPort 1338-1369 -Action Allow -Profile Private
    ```
 
-   The network must be set to **Private** (Settings > Network > Properties), not Public.
+   Match the rule to your configured pair-port range if it differs. The network must be set to
+   **Private** (Settings > Network > Properties), not Public.
 
 ## Every PC (the server PC too, if someone plays on it)
 
@@ -84,13 +93,17 @@ Not yet tested end to end over the internet. The steps are the LAN ones plus:
 1. Check you can receive inbound traffic: the WAN IP on the router's status page must match
    what whatismyip.com shows. If they differ you are behind carrier-grade NAT and port forwarding
    cannot work; use Tailscale instead (below).
-2. On the router, forward TCP 1337 and UDP 1338-1339 to the server PC's LAN IP. Never forward 8080.
+2. Enable pair mode with bounded UDP ports as above. On the router, forward TCP 1337, UDP 1338–1339,
+   and the entire configured pair range (1340–1369 in this example) to the server PC's LAN IP,
+   preserving port numbers. Ephemeral pair ports (`0`/`0`) do not fit ordinary static WAN forwarding.
+   Never forward 8080.
 3. In the launcher's **Internet (WAN)** box, press **Detect** (asks api.ipify.org for your public IP)
    or type a dynamic-DNS name, then send players the **Copy option** line, for example
    `/bzrserver=ws://203.0.113.25:1337/`. Players inside your house keep the LAN line.
 4. Check: from outside, `Test-NetConnection <public-ip> -Port 1337` succeeds; the launcher log shows
    `UDP RX` from the player's public IP; relay packet counts rise once a game is joined. If players
-   stall at connecting, look at `ambiguousDropsTotal` / `unmappedDropsTotal` on
+   stall at connecting, look at `pairPortRange`, `pairPortAllocationFailuresTotal`,
+   `ambiguousDropsTotal` / `unmappedDropsTotal` on
    http://127.0.0.1:8080/status.
 
 The server cannot validate Steam/GOG tickets, so anyone who finds the open port can claim any ID.
@@ -109,5 +122,5 @@ CGNAT, and the game sees it as a LAN.
 | --- | --- |
 | Lobby list empty or "connection failed" | The server is running; the IP in the launch option or `net.ini` is right (launch option needs the full `ws://IP:1337/`); the network is Private; `Test-NetConnection 192.168.0.44 -Port 1337` from the client PC succeeds |
 | Old full game with the same name listed | Restart the server (memberless game lobbies are dropped on load) |
-| Stuck in the lobby after Launch, or desync | UDP 1338-1339 is blocked, or mod files differ between PCs |
+| Stuck in the lobby after Launch, or desync | UDP 1338–1339 or the configured pair-port range is blocked, the range is exhausted, shared relay has ambiguous routes, or mod files differ between PCs |
 | Disconnected right at login | The client is still pointed at the official servers (launch option missing, `net.ini` not saved, or an old OpenShim) |
