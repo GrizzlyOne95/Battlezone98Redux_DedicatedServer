@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import hashlib
 import json
@@ -3958,9 +3959,28 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         self.impairment = impairment
         self.impair_drop_count = 0
         self.impair_late_drop_count = 0
+        # In-order delayed datagrams per (socket, target). Their deadlines are
+        # monotonic per stream, but a burst often shares one deadline and the
+        # event loop's timer heap does not keep equal deadlines in FIFO order;
+        # every timer therefore sends the oldest pending datagram of its stream.
+        self._impair_fifo: dict[tuple[int, tuple[str, int]], collections.deque] = {}
 
     def schedule_later(self, delay: float, callback: Any, *args: Any) -> None:
         asyncio.get_running_loop().call_later(delay, callback, *args)
+
+    def _schedule_in_order(self, delay: float, args: tuple) -> None:
+        key = (id(args[0]), args[2])
+        self._impair_fifo.setdefault(key, collections.deque()).append(args)
+        self.schedule_later(delay, self._send_impaired_head, key)
+
+    def _send_impaired_head(self, key: tuple[int, tuple[str, int]]) -> None:
+        fifo = self._impair_fifo.get(key)
+        if not fifo:
+            return
+        args = fifo.popleft()
+        if not fifo:
+            del self._impair_fifo[key]
+        self._send_impaired(*args)
 
     def set_impairment(self, spec_text: str) -> dict[str, Any]:
         """Apply a new impairment spec, or clear it with an empty one. Raises ValueError."""
@@ -4457,11 +4477,12 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
                 context = {**send_context, "copyIndex": copy_index, "copyCount": len(decision.delays),
                            "scheduledDelayMs": round(delay * 1000, 3),
                            "scheduledMonotonic": time.monotonic() + delay}
-            if delay > 0:
-                if context is None:
-                    self.schedule_later(delay, self._send_impaired, send_transport, data, target)
-                else:
-                    self.schedule_later(delay, self._send_impaired, send_transport, data, target, context)
+            args = (send_transport, data, target) if context is None else (send_transport, data, target, context)
+            if decision.reordered:
+                # Deliberately held past the stream floor; it must not join the FIFO.
+                self.schedule_later(delay, self._send_impaired, *args)
+            elif delay > 0 or (id(send_transport), target) in self._impair_fifo:
+                self._schedule_in_order(delay, args)
             else:
                 if context is None:
                     send_transport.sendto(data, target)

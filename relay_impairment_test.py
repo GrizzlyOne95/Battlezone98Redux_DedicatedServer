@@ -278,6 +278,24 @@ def test_relay_hotpath() -> list[str]:
     transport.closing = False
     scheduled.clear()
 
+    # A burst sharing one deadline leaves in arrival order even when the event
+    # loop fires its timers in another order (the timer heap is not FIFO).
+    transport.sent.clear()
+    scheduled.clear()
+    relay.set_impairment("delay=60,jitter=20,seed=5")
+    burst = [mk_datagram(10 + i) for i in range(8)]
+    for d in burst:
+        relay.datagram_received(d, A)
+    if transport.sent or len(scheduled) != len(burst):
+        failures.append(f"burst: sent={len(transport.sent)} scheduled={len(scheduled)}")
+    for _, cb, args in reversed(scheduled):
+        cb(*args)
+    if transport.sent != [(d, B) for d in burst]:
+        failures.append("delayed burst left out of order")
+    if relay._impair_fifo:
+        failures.append("FIFO not drained")
+    scheduled.clear()
+
     transport.sent.clear()
     relay.set_impairment("")
     data = mk_datagram(4)
@@ -303,7 +321,7 @@ def test_relay_hotpath() -> list[str]:
     if not delayed:
         failures.append("trace lacks the delay detail")
     events = [r["event"] for r in lines if "event" in r]
-    if events.count("impairment_set") != 2 or "impairment_cleared" not in events:
+    if events.count("impairment_set") != 3 or "impairment_cleared" not in events:
         failures.append(f"trace events {events}")
     if "impairment" in lines[-1]:
         failures.append("unimpaired datagram carries impairment detail")
