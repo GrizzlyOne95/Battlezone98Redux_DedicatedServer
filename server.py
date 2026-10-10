@@ -3280,7 +3280,7 @@ class ServerState:
             "id": lobby.lobby_id,
             "lobbyId": lobby.lobby_id,
             "name": name,
-            "isChat": name.startswith("~chat~"),
+            "isChat": not self.is_game_lobby(lobby),
             # Official admin page (scripts/bzdatagrids.js) renders owner == -1 as
             # "none"; an ownerless/restored lobby must therefore serialize -1,
             # not "".
@@ -3301,6 +3301,51 @@ class ServerState:
 
     def serialize_users(self) -> dict[str, dict[str, Any]]:
         return {uid: self.build_user_snapshot(s) for uid, s in self.sessions_by_user_id.items()}
+
+    # --- Address redaction (--redact-addresses) ---------------------------
+    # Upstream sends every user's WAN/LAN address to every session. The stock
+    # client only needs a peer's address once both sit in the same game lobby
+    # (OnLobbyMemberP2PConnect/OnP2PRoute carry none; ipAddress is never read),
+    # so redaction omits the keys for everyone else. Keys are omitted rather
+    # than blanked so a redacted copy can't overwrite a good cached value.
+    ADDRESS_KEYS = ("wanAddress", "ipAddress", "lanAddresses")
+    SOURCE_ADDRESS_KEYS = ("sourceWanAddress", "sourceLanAddresses")
+
+    @staticmethod
+    def is_game_lobby(lobby: LobbyState) -> bool:
+        return not str(lobby.metadata.get("name", "")).startswith("~chat~")
+
+    def shares_game_lobby(self, viewer: UserSession, subject_uid: str) -> bool:
+        if viewer.current_lobby_id is None:
+            return False
+        lobby = self.lobbies.get(viewer.current_lobby_id)
+        return (
+            lobby is not None
+            and self.is_game_lobby(lobby)
+            and viewer.user_id in lobby.users
+            and subject_uid in lobby.users
+        )
+
+    def can_see_addresses(self, viewer: UserSession | None, subject_uid: str) -> bool:
+        if viewer is None or not subject_uid:
+            return False
+        return viewer.is_admin or viewer.user_id == subject_uid or self.shares_game_lobby(viewer, subject_uid)
+
+    def redact_for(self, viewer: UserSession | None, data: Any) -> Any:
+        """Copy of an outgoing payload with addresses the viewer may not see removed."""
+        if isinstance(data, list):
+            return [self.redact_for(viewer, x) for x in data]
+        if not isinstance(data, dict):
+            return data
+        hidden: set[str] = set()
+        if any(k in data for k in self.ADDRESS_KEYS):
+            subject = str(data.get("userId") or data.get("id") or "")
+            if not self.can_see_addresses(viewer, subject):
+                hidden.update(self.ADDRESS_KEYS)
+        if any(k in data for k in self.SOURCE_ADDRESS_KEYS):
+            if not self.can_see_addresses(viewer, str(data.get("sourceUserId") or "")):
+                hidden.update(self.SOURCE_ADDRESS_KEYS)
+        return {k: self.redact_for(viewer, v) for k, v in data.items() if k not in hidden}
 
     def metrics(self) -> dict[str, Any]:
         return {
@@ -4081,12 +4126,14 @@ class BZRWebSocketServer:
         max_lobbies: int = 500,
         retain_empty_lobbies: bool = False,
         relay_protocol: BZRRelayProtocol | None = None,
+        redact_addresses: bool = False,
     ):
         self.state = state
         self.log = logger
         self.motd = motd.strip()
         self.max_lobbies = max(1, int(max_lobbies))
         self.retain_empty_lobbies = bool(retain_empty_lobbies)
+        self.redact_addresses = bool(redact_addresses)
         self.relay_protocol = relay_protocol
         self.ws_messages_total = 0
         self.auth_total = 0
@@ -4268,9 +4315,17 @@ class BZRWebSocketServer:
 
     async def _broadcast_session_addresses(self, session: UserSession) -> None:
         if session.wan_address:
-            await self.broadcast_all("OnWANUpdated", self._build_address_payload(session, message_type="OnWANUpdated"))
+            await self.broadcast_all(
+                "OnWANUpdated",
+                self._build_address_payload(session, message_type="OnWANUpdated"),
+                address_subject=session.user_id,
+            )
         if session.lan_addresses:
-            await self.broadcast_all("OnLANUpdated", self._build_address_payload(session, message_type="OnLANUpdated"))
+            await self.broadcast_all(
+                "OnLANUpdated",
+                self._build_address_payload(session, message_type="OnLANUpdated"),
+                address_subject=session.user_id,
+            )
 
     async def send_stdout(self, ws: Any, level: str, message: str) -> None:
         entry = self.state.record_stdout_entry(level, message)
@@ -4286,6 +4341,8 @@ class BZRWebSocketServer:
         )
 
     async def send(self, ws: Any, msg_type: str, data: Any) -> None:
+        if self.redact_addresses:
+            data = self.state.redact_for(self.state.sessions_by_ws.get(ws), data)
         payload = {"type": msg_type, "data": data}
         self.state.record_protocol_event(
             channel="ws",
@@ -4395,12 +4452,22 @@ class BZRWebSocketServer:
         except Exception:
             pass
 
-    async def broadcast_all(self, msg_type: str, data: Any) -> None:
+    async def broadcast_all(self, msg_type: str, data: Any, *, address_subject: str | None = None) -> None:
+        """Send to every session. With redaction on, each recipient gets its own
+        filtered copy, and when ``address_subject`` is set the message (an
+        address update about that user) goes only to sessions allowed to see it."""
         if not self.state.sessions_by_ws:
             return
         payload = json.dumps({"type": msg_type, "data": data}, separators=(",", ":"))
         coros = []
         for session in self.state.sessions_by_ws.values():
+            out = payload
+            if self.redact_addresses:
+                if address_subject is not None and not self.state.can_see_addresses(session, address_subject):
+                    continue
+                out = json.dumps(
+                    {"type": msg_type, "data": self.state.redact_for(session, data)}, separators=(",", ":")
+                )
             self.state.record_protocol_event(
                 channel="ws",
                 direction="tx",
@@ -4408,7 +4475,7 @@ class BZRWebSocketServer:
                 msg_type=msg_type,
                 payload=data,
             )
-            coros.append(session.ws.send(payload))
+            coros.append(session.ws.send(out))
         await asyncio.gather(*coros, return_exceptions=True)
 
     async def broadcast_lobby(self, lobby: LobbyState, msg_type: str, data: Any) -> None:
@@ -4424,7 +4491,12 @@ class BZRWebSocketServer:
                     msg_type=msg_type,
                     payload=data,
                 )
-                targets.append(session.ws.send(payload))
+                out = payload
+                if self.redact_addresses:
+                    out = json.dumps(
+                        {"type": msg_type, "data": self.state.redact_for(session, data)}, separators=(",", ":")
+                    )
+                targets.append(session.ws.send(out))
         if targets:
             await asyncio.gather(*targets, return_exceptions=True)
 
@@ -4946,7 +5018,11 @@ class BZRWebSocketServer:
             if lobby and session.user_id in lobby.users:
                 lobby.users[session.user_id] = self.state.build_user_snapshot(session)
         self.state.record_stdout_entry("info", f"{session.user_id} updated WAN address to {wan}")
-        await self.broadcast_all("OnWANUpdated", self._build_address_payload(session, message_type="OnWANUpdated"))
+        await self.broadcast_all(
+            "OnWANUpdated",
+            self._build_address_payload(session, message_type="OnWANUpdated"),
+            address_subject=session.user_id,
+        )
         if session.current_lobby_id and session.current_lobby_id in self.state.lobbies:
             await self.push_lobby_changed(self.state.lobbies[session.current_lobby_id])
 
@@ -4964,13 +5040,27 @@ class BZRWebSocketServer:
             "info",
             f"{session.user_id} updated LAN addresses to {','.join(session.lan_addresses)}",
         )
-        await self.broadcast_all("OnLANUpdated", self._build_address_payload(session, message_type="OnLANUpdated"))
+        await self.broadcast_all(
+            "OnLANUpdated",
+            self._build_address_payload(session, message_type="OnLANUpdated"),
+            address_subject=session.user_id,
+        )
         if session.current_lobby_id and session.current_lobby_id in self.state.lobbies:
             await self.push_lobby_changed(self.state.lobbies[session.current_lobby_id])
 
     async def handle_p2p_signal(self, session: UserSession, content: Any, *, route: bool) -> None:
         target_id = self._extract_target_user_id(content)
         target_session = self.state.sessions_by_user_id.get(target_id) if target_id else None
+        # With redaction on, signaling is only allowed between members of the
+        # same game lobby; otherwise any session could fetch any user's address.
+        outside_lobby = (
+            self.redact_addresses
+            and target_session is not None
+            and target_session is not session
+            and not self.state.shares_game_lobby(session, target_session.user_id)
+        )
+        if outside_lobby:
+            target_session = None
         reset = False
         if isinstance(content, dict) and "reset" in content:
             reset = self._coerce_bool(content.get("reset"))
@@ -4984,7 +5074,9 @@ class BZRWebSocketServer:
         relay_reason = ""
         relay_port: int | None = None
         if route:
-            if target_session is None:
+            if outside_lobby:
+                relay_reason = "target player is not in your game lobby"
+            elif target_session is None:
                 relay_reason = "target player is not connected"
             elif self.relay_protocol is None:
                 relay_reason = "relay transport is unavailable"
@@ -5360,6 +5452,12 @@ class BZRWebSocketServer:
                 "OnHeartbeat",
                 {"success": True, "serverTimeMs": int(time.time() * 1000), "time": utc_now_str()},
             )
+            return
+
+        # With redaction on, user lists and logs (which carry peer ip:port and
+        # address updates) are admin-only.
+        if msg_type in {"GetUserList", "GetFullLog", "TraceData"} and self.redact_addresses and not session.is_admin:
+            await self.send_error(ws, f"{msg_type} denied: admin only")
             return
 
         if msg_type == "GetUserList":
@@ -5881,7 +5979,10 @@ async def run_server(args: argparse.Namespace) -> None:
         max_lobbies=args.max_lobbies,
         retain_empty_lobbies=args.retain_empty_lobbies,
         relay_protocol=relay_protocol,
+        redact_addresses=args.redact_addresses,
     )
+    if args.redact_addresses:
+        logger.info("Address redaction on: player addresses only go to members of the same game lobby")
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -6004,6 +6105,12 @@ def parse_args() -> argparse.Namespace:
         "--retain-empty-lobbies",
         action="store_true",
         help="Do not delete lobbies when last user leaves (useful with persistence)",
+    )
+    parser.add_argument(
+        "--redact-addresses",
+        action="store_true",
+        help="Only send a player's WAN/LAN address to members of the same game lobby (and admins); "
+             "user lists and logs become admin-only",
     )
     parser.add_argument("--access-mode", choices=list(ACCESS_MODES), default=None,
                         help="Who may log in: open (default), approve (unknown players wait for operator approval), "

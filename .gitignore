@@ -5,3 +5,4 @@ data/
 server_gui.json
 build/
 dist/
+.venv/

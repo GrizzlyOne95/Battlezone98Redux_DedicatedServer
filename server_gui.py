@@ -64,6 +64,7 @@ DEFAULTS = {
     "admin_ids": "",
     "max_lobbies": 500,
     "retain_empty_lobbies": False,
+    "redact_addresses": False,
     "log_level": "INFO",
     "access_mode": "open",
     "pin_ips": False,
@@ -245,6 +246,8 @@ class ServerGUI:
         label("Log level", row)
         ttk.Combobox(settings, textvariable=var("log_level"), values=["DEBUG", "INFO", "WARNING", "ERROR"], width=9, state="readonly").grid(row=row, column=1, sticky="w")
         ttk.Checkbutton(settings, text="Keep empty lobbies", variable=var("retain_empty_lobbies", tk.BooleanVar)).grid(row=row, column=2, columnspan=2, sticky="w")
+        row += 1
+        ttk.Checkbutton(settings, text="Hide player IPs outside their game", variable=var("redact_addresses", tk.BooleanVar)).grid(row=row, column=2, columnspan=2, sticky="w")
         row += 1
 
         python_var = var("python")
@@ -561,6 +564,8 @@ class ServerGUI:
                 "--pin-ips" if v["pin_ips"] else "--no-pin-ips"]
         if v["retain_empty_lobbies"]:
             cmd.append("--retain-empty-lobbies")
+        if v["redact_addresses"]:
+            cmd.append("--redact-addresses")
         if v["motd"].strip():
             cmd += ["--motd", v["motd"]]
         if v["admin_key"].strip():
