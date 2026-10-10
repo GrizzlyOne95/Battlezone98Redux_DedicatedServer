@@ -100,6 +100,46 @@ Tailscale.
     from loopback even if `--health-host` is widened. The launcher's Access tab and the Players tab's
     Approve/Kick/Ban buttons use these.
 
+#### Admin and moderation hardening
+
+Community-only controls; none of them change the messages stock clients see, and the defaults keep
+stock clients working.
+
+*   **Audit log** (`--audit-log`, default `data/audit.log`, empty disables; `--audit-log-max-bytes`
+    5000000, `--audit-log-backups` 3): append-only JSON Lines of auth accept/deny (id, name, ip,
+    authtype, clientVersion, reason, `ticketWithheld`), every `POST /access` action with its actor,
+    bans, unbans, mutes, kicks, admin WebSocket verbs (allowed or denied), admin-key failures and
+    refusals, and expiries. Tickets, passwords and admin keys are never written (credential-named
+    fields are blanked and the configured admin key is scrubbed from every value). `data/` is git-ignored.
+*   **Names**: control, bidi and zero-width characters are stripped, whitespace is collapsed and the
+    name is capped at `--name-max-length` (32; the stock client limit is not documented in this repo).
+    An empty result falls back to the id; names that match `--reserved-names` (default `SERVER, Admin,
+    Moderator, ...`, compared after case/punctuation folding) become `Player-<id tail>`. Admins are
+    exempt. Cyrillic homoglyphs are not folded. `SetPlayerData` name changes follow the same rules.
+*   **Client version** (`--client-version-policy off|log|enforce`, default `log`;
+    `--min-client-version`, `--allowed-client-versions`, `*` suffix is a prefix match): `log` admits
+    and records mismatches, `enforce` refuses with the usual failed login and close `4002`.
+*   **Chat flood** (`--chat-rate` 2/s, `--chat-burst` 8, `--chat-flood-strikes` 5 drops inside 30 s,
+    `--chat-automute-minutes` 5; `--chat-rate 0` disables): over-limit messages are dropped, the sender
+    gets a throttled server notice (same shape as the MOTD), and repeated flooding auto-mutes.
+*   **Timed bans and mutes**: `POST /access` accepts `duration` (`90`, `30m`, `2h`, `7d`) or an
+    absolute `expiresAt` (`YYYY-MM-DD HH:MM:SS` UTC or epoch seconds) with `ban` and `mute`; `unmute`
+    lifts a mute. Expired entries are pruned on check, on load and in snapshots; entries without an
+    expiry stay permanent. Muted players' chat is dropped server-side. Bans and mutes persist in the
+    state file; both appear in `GET /access` (`bannedIds`, `bannedIps`, `mutedIds`) and the launcher.
+*   **Admin key transport**: the key is compared in constant time and only elevates a session from a
+    loopback peer, a socket the server sees as TLS, or a peer in `--trusted-proxies` (IPs/CIDRs) whose
+    `X-Forwarded-Proto: https` (or `Forwarded: proto=https`) is believed. Any other forwarded request
+    is refused, including through a loopback proxy. `--allow-plain-remote-admin` is an explicit,
+    unsafe opt-in and logs a warning at startup. A refused key still admits the player, as a normal
+    user. `--admin-ids` is a claimed id and is not transport gated.
+*   **Ticket-withheld clients**: OpenShim sends the literal `withheld` as the platform ticket to
+    non-Rebellion servers. It is admitted like any non-empty ticket (an empty Steam ticket is still
+    refused), recorded as `ticket_withheld`, written to the audit log and shown as
+    `steam (ticket withheld)` in `/lobbies` and the launcher's Players tab. The wire `authType` is unchanged.
+
+Run `python admin_hardening_test.py` for the in-process checks.
+
 #### Standalone Windows package
 
 `python build_package.py` builds `dist/BZRDedicatedServer-<version>.zip` for PCs without Python.
