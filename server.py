@@ -3015,6 +3015,9 @@ class UserSession:
     # OpenShim sends the literal "withheld" instead of a platform ticket to
     # non-Rebellion servers; recorded for operators only (never on the wire).
     ticket_withheld: bool = False
+    # Read-only loopback watcher (--allow-loopback-watchers): receives public
+    # chat-room chat without joining rooms; never a lobby member.
+    is_watcher: bool = False
     # Chat flood bookkeeping (runtime only).
     chat_tokens: float | None = None
     chat_stamp: float = 0.0
@@ -3046,6 +3049,9 @@ TICKET_FIELDS = ("steamAppTicket", "gogAppTicket", "authTicket", "platformTicket
 DEFAULT_AUDIT_LOG = "data/audit.log"
 DEFAULT_RESERVED_NAMES = "SERVER,Admin,Administrator,Moderator,Mod,Console,System,Rebellion,Staff"
 LOOPBACK_NAMES = ("::1", "::ffff:127.0.0.1")
+# Everything a read-only watcher session may send; all other verbs are ignored.
+WATCHER_VERBS = frozenset({"DoEnterLounge", "DoExitLounge", "GetLobbyList", "Ping", "DoPing"})
+PUBLIC_CHAT_PREFIX = "~chat~pub~~"
 
 
 def is_loopback_ip(ip: str) -> bool:
@@ -3953,7 +3959,7 @@ class RelayRoute:
 def _is_reliable_nonfinal_fragment(data: bytes) -> bool:
     """True when a datagram is a reliable BZRNet fragment that is not the final one.
 
-    PROVEN-native flag semantics (BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md §4.1):
+    PROVEN-native flag semantics (BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md Â§4.1):
     bit 0x80 marks reliable traffic; bit 0x40 is added only on the final
     fragment (or on single-packet unreliable sends).  A bare 0x80 therefore
     identifies a middle reliable fragment.  This predicate is the ONLY packet
@@ -3969,7 +3975,7 @@ def _is_reliable_nonfinal_fragment(data: bytes) -> bool:
 class RelayFaultInjector:
     """Opt-in Phase-2 impairment hook for the UDP relay (default OFF).
 
-    Contract: BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md §4.  The single
+    Contract: BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md Â§4.  The single
     supported mode drops the k-th bare-0x80 (reliable, non-final) datagram per
     directed peer stream.  It never rewrites, reorders, reassembles, or
     retransmits anything; when inactive it is not consulted at all so the hot
@@ -4694,7 +4700,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
         # Preserve the complete datagram and packet boundary exactly. The relay
         # never rewrites sequence numbers or interprets the payload after byte 18.
         #
-        # Phase-2 instrumentation hook (work order §4): optional forensic trace
+        # Phase-2 instrumentation hook (work order Â§4): optional forensic trace
         # plus an optional single-shot reliable-midfragment drop. Both are OFF
         # unless explicitly enabled; with both off this path is identical to
         # previous behavior. The injector performs no interpretation beyond the
@@ -4832,6 +4838,7 @@ class BZRWebSocketServer:
         relay_protocol: BZRRelayProtocol | None = None,
         hardening: HardeningConfig | None = None,
         redact_addresses: bool = False,
+        allow_loopback_watchers: bool = False,
     ):
         self.state = state
         self.log = logger
@@ -4840,6 +4847,7 @@ class BZRWebSocketServer:
         self.max_lobbies = max(1, int(max_lobbies))
         self.retain_empty_lobbies = bool(retain_empty_lobbies)
         self.redact_addresses = bool(redact_addresses)
+        self.allow_loopback_watchers = bool(allow_loopback_watchers)
         self.relay_protocol = relay_protocol
         self.ws_messages_total = 0
         self.auth_total = 0
@@ -5100,6 +5108,17 @@ class BZRWebSocketServer:
         if is_loopback_ip(ip):
             return True, "loopback"
         return False, "plain ws from a remote peer"
+
+    def _watcher_allowed(self, ws: Any) -> tuple[bool, str]:
+        """Watcher role: opt-in server flag, direct loopback peers only (no proxied hops)."""
+        if not self.allow_loopback_watchers:
+            return False, "watchers disabled"
+        headers = self._ws_headers(ws)
+        if any(headers.get(n) for n in ("X-Forwarded-For", "X-Real-IP", "Forwarded")):
+            return False, "forwarded request"
+        if not is_loopback_ip(self._ws_ip(ws)):
+            return False, "not a loopback peer"
+        return True, "loopback"
 
     def check_admin_key(self, ws: Any, user_id: str, key: str, info: dict[str, Any]) -> bool:
         """Constant-time key check plus transport policy; audited; result cached in info."""
@@ -5365,7 +5384,7 @@ class BZRWebSocketServer:
         # negative via an internal wrap -- we always report the true count).
         return {
             "lobbies": self.state.serialize_lobbies(),
-            "totalUsers": len(self.state.sessions_by_user_id),
+            "totalUsers": self._member_count(),
         }
 
     async def push_lobby_changed(self, lobby: LobbyState) -> None:
@@ -5373,7 +5392,7 @@ class BZRWebSocketServer:
             "OnLobbyChanged",
             {
                 "lobbies": {str(lobby.lobby_id): self.state.serialize_lobby(lobby)},
-                "totalUsers": len(self.state.sessions_by_user_id),
+                "totalUsers": self._member_count(),
             },
         )
 
@@ -5572,6 +5591,10 @@ class BZRWebSocketServer:
         if session.is_admin and "reserved" in name_notes:
             session.name, _ = self._clean_name(raw_name, user_id, allow_reserved=True)
             session.player_name = self._clean_name(content.get("playerName") or session.name, user_id, allow_reserved=True)[0]
+        if "watcher" in content and self._coerce_bool(content.get("watcher")):
+            session.is_watcher, watcher_reason = self._watcher_allowed(ws)
+            self.state.audit.write("watcher_granted" if session.is_watcher else "watcher_refused",
+                                   id=user_id, ip=self._ws_ip(ws), reason=watcher_reason)
 
         self.state.sessions_by_ws[ws] = session
         self.state.sessions_by_user_id[user_id] = session
@@ -5603,6 +5626,8 @@ class BZRWebSocketServer:
                 "authType": session.authtype,
                 "isAdmin": session.is_admin,
                 "isBB": False,
+                # Community-only; omitted unless granted so stock clients see the upstream shape.
+                **({"isWatcher": True} if session.is_watcher else {}),
                 "isAuth": True,
                 "isInLounge": session.in_lounge,
                 "wanAddress": session.wan_address,
@@ -6059,7 +6084,7 @@ class BZRWebSocketServer:
                 target_name = parts[1].lower()
                 private_msg = parts[2]
                 for target in self.state.sessions_by_ws.values():
-                    if target.name.lower() == target_name:
+                    if target.name.lower() == target_name and not target.is_watcher:
                         whisper = dict(chat_payload)
                         whisper["text"] = private_msg
                         whisper["private"] = True
@@ -6068,11 +6093,27 @@ class BZRWebSocketServer:
                         return
 
         if lid is not None and lid in self.state.lobbies:
-            await self.broadcast_lobby(self.state.lobbies[lid], "OnChatMessage", chat_payload)
+            lobby = self.state.lobbies[lid]
+            await self.broadcast_lobby(lobby, "OnChatMessage", chat_payload)
+            await self._send_to_watchers(lobby, chat_payload)
             return
 
-        # Lounge chat fanout.
+        # Lounge chat fanout (watchers are ordinary sessions here and already included).
         await self.broadcast_all("OnChatMessage", chat_payload)
+
+    async def _send_to_watchers(self, lobby: LobbyState, chat_payload: dict[str, Any]) -> None:
+        """Copy chat from open public chat rooms to watcher sessions (which never join rooms).
+        Game lobbies and private or passworded rooms are never copied."""
+        name = str(lobby.metadata.get("name", ""))
+        if not name.startswith(PUBLIC_CHAT_PREFIX) or lobby.is_private or lobby.password:
+            return
+        for watcher in list(self.state.sessions_by_ws.values()):
+            if watcher.is_watcher and watcher.user_id not in lobby.users:
+                await self.send(watcher.ws, "OnChatMessage", chat_payload)
+
+    def _member_count(self) -> int:
+        """Connected players, not counting read-only watchers."""
+        return sum(1 for s in self.state.sessions_by_user_id.values() if not s.is_watcher)
 
     async def handle_set_lobby_data(self, session: UserSession, content: dict[str, Any]) -> None:
         lid = session.current_lobby_id
@@ -6203,6 +6244,10 @@ class BZRWebSocketServer:
             # Upstream parity (2026-08-25 evidence): pre-auth verbs are
             # silently ignored - no error frame is sent. (Older community
             # behavior replied "Authorization required"; removed for parity.)
+            return
+
+        if session.is_watcher and msg_type not in WATCHER_VERBS:
+            # Watchers are read-only: no joins, rooms, chat, metadata or signaling.
             return
 
         if msg_type in ("SetLogLevel", "AddRegex", "RemoveRegex", "SetRelay", "SetTest"):
@@ -6951,7 +6996,10 @@ async def run_server(args: argparse.Namespace) -> None:
         relay_protocol=relay_protocol,
         hardening=hardening,
         redact_addresses=args.redact_addresses,
+        allow_loopback_watchers=args.allow_loopback_watchers,
     )
+    if args.allow_loopback_watchers:
+        logger.info("Loopback watchers allowed: local sessions may read public chat rooms without joining them")
     if args.redact_addresses:
         logger.info("Address redaction on: player addresses only go to members of the same game lobby")
 
@@ -7136,6 +7184,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only send a player's WAN/LAN address to members of the same game lobby (and admins); "
              "user lists and logs become admin-only",
+    )
+    parser.add_argument(
+        "--allow-loopback-watchers",
+        action="store_true",
+        help="Let local (loopback) sessions that send watcher:true in Authorization read every open public "
+             "chat room without joining it. Watchers are read-only and left out of player counts.",
     )
     parser.add_argument("--access-mode", choices=list(ACCESS_MODES), default=None,
                         help="Who may log in: open (default), approve (unknown players wait for operator approval), "

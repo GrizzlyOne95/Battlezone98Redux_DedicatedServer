@@ -1233,6 +1233,71 @@ async def unit_test_address_redaction() -> None:
         assert _last_data(ws_c, "OnGetUserList")["users"]["PLAYER_A"]["wanAddress"] == a_wan
 
 
+async def unit_test_loopback_watcher() -> None:
+    """--allow-loopback-watchers: read-only chat-room feed without joining, local peers only."""
+    def auth(watcher: bool, uid: str) -> str:
+        content = {"authtype": "web", "id": uid, "name": uid, "wanAddress": "203.0.113.50:40000"}
+        if watcher:
+            content["watcher"] = True
+        return json.dumps({"type": "Authorization", "content": content})
+
+    state = ServerState(logging.getLogger("watcher-test.state"))
+    state.ensure_default_lobby()
+    server = BZRWebSocketServer(state, logging.getLogger("watcher-test.ws"), allow_loopback_watchers=True)
+    default = next(l for l in state.lobbies.values() if l.metadata.get("name") == ServerState.DEFAULT_LOBBY_NAME)
+
+    ws_w = FakeWS(50201)  # 127.0.0.1 -> loopback
+    await server.route_message(ws_w, auth(True, "WATCHER"))
+    assert _last_data(ws_w, "OnAuthorization").get("isWatcher") is True
+    w = state.sessions_by_ws[ws_w]
+
+    # A remote peer asking for the role is admitted as a normal user without it.
+    ws_r = FakeWS(50202)
+    ws_r.remote_address = ("198.51.100.9", 50202)
+    await server.route_message(ws_r, auth(True, "REMOTE"))
+    assert "isWatcher" not in _last_data(ws_r, "OnAuthorization")
+    assert state.sessions_by_ws[ws_r].is_watcher is False
+
+    # Players: A chats in the default room, B in a passworded chat room, C hosts a game.
+    ws_a, ws_b, ws_c = FakeWS(50203), FakeWS(50204), FakeWS(50205)
+    for ws, uid in ((ws_a, "PA"), (ws_b, "PB"), (ws_c, "PC")):
+        await server.route_message(ws, auth(False, uid))
+    a, b, c = (state.sessions_by_ws[x] for x in (ws_a, ws_b, ws_c))
+    await server.handle_join_lobby(a, {"id": default.lobby_id, "password": ""})
+    await server.handle_create_lobby(b, {"name": "~chat~pub~~secret", "password": "pw", "memberLimit": 8})
+    await server.handle_create_game(c, {"memberLimit": 8, "isPrivate": False, "password": ""})
+
+    # Read-only: joins, room creation, chat and metadata from the watcher are ignored.
+    ws_w.clear()
+    for verb, body in (("DoJoinLobby", {"id": default.lobby_id, "password": ""}),
+                       ("CreateLobby", {"name": "~chat~pub~~x"}), ("DoSendChat", "hi"),
+                       ("SetPlayerData", {"key": "name", "value": "x"})):
+        await server.route_message(ws_w, json.dumps({"type": verb, "content": body}))
+    assert w.current_lobby_id is None and w.user_id not in default.users
+    assert not any(l.metadata.get("name") == "~chat~pub~~x" for l in state.lobbies.values())
+
+    ws_w.clear()
+    await server.handle_chat(a, "hello default")
+    await server.handle_chat(b, "passworded room")
+    await server.handle_chat(c, "game lobby")
+    chats = [m["data"] for m in ws_w.by_type("OnChatMessage")]
+    assert [x["text"] for x in chats] == ["hello default"], chats
+    assert chats[0]["lobbyId"] == default.lobby_id and chats[0]["speakerId"] == "PA"
+
+    # Never a whisper target (an unmatched /t falls back to ordinary room chat), and not counted as a player.
+    ws_w.clear()
+    await server.handle_chat(a, "/t WATCHER psst")
+    assert not [m for m in ws_w.by_type("OnChatMessage") if m["data"].get("private")]
+    assert server._lobby_list_payload()["totalUsers"] == 4  # remote + three players
+
+    # Server flag off: the role is never granted.
+    state2 = ServerState(logging.getLogger("watcher-test.state2"))
+    server2 = BZRWebSocketServer(state2, logging.getLogger("watcher-test.ws2"))
+    ws_x = FakeWS(50206)
+    await server2.route_message(ws_x, auth(True, "W2"))
+    assert "isWatcher" not in _last_data(ws_x, "OnAuthorization")
+
+
 async def unit_test_opaque_relay() -> None:
     state = ServerState(logging.getLogger("relay-test.state"))
     fake_udp = FakeDatagramTransport(1339)
@@ -1294,6 +1359,9 @@ async def main_async_combined(args) -> int:
     print("== unit: address redaction ==")
     await unit_test_address_redaction()
     print("PASS - unit: address redaction")
+    print("== unit: loopback watcher ==")
+    await unit_test_loopback_watcher()
+    print("PASS - unit: loopback watcher")
     print("== unit: opaque relay forwarding ==")
     await unit_test_opaque_relay()
     print("PASS - unit: opaque relay forwarding")
