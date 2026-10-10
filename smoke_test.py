@@ -110,6 +110,10 @@ async def ws_smoke(host: str, port: int, timeout: float) -> tuple[bool, str]:
                 stdout = msg.get("data", {}).get("stdout", {})
                 log_seen = isinstance(stdout.get("history"), list)
                 break
+            # A server running --redact-addresses refuses logs to non-admins.
+            if msg.get("type") == "OnStdoutLogEntry" and "admin only" in str(msg.get("data", {}).get("message", "")):
+                log_seen = True
+                break
         if not log_seen:
             return False, "Did not receive compatible OnGetFullLog payload"
 

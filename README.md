@@ -140,6 +140,21 @@ stock clients working.
 
 Run `python admin_hardening_test.py` for the in-process checks.
 
+#### Address privacy (`--redact-addresses`)
+
+Like the official service, the server by default sends every player's WAN/LAN address to every
+connected session, so anyone watching the lounge can collect them. `--redact-addresses` (launcher:
+"Hide player IPs outside their game") sends a player's `wanAddress`/`ipAddress`/`lanAddresses`
+only to themselves, admins, and members of the same game lobby (`~chat~` lobbies, including the
+default lounge lobby, don't count). The keys are omitted for everyone else. With it on,
+`DoP2PConnect`/`DoP2PRoute` only work between members of the same game lobby, and `GetUserList`,
+`GetFullLog` and `TraceData` are admin-only.
+
+The stock client only appears to need peer addresses after joining the same game lobby
+(`OnLobbyMemberP2PConnect` carries none), but this has not yet been confirmed in a two-network
+match, so the flag is off by default. Players still see each other's addresses once in a match
+together, as with any peer-to-peer game.
+
 #### Standalone Windows package
 
 `python build_package.py` builds `dist/BZRDedicatedServer-<version>.zip` for PCs without Python.
