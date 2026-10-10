@@ -94,3 +94,16 @@ Graceful client exit and independent restoration audit passed: 128 targets,
 zero mismatch/zero games at 19:36:59 CDT. Original incomplete attempts remain
 retained. Exact timer/capture evidence lives in OpenShim netfix's
 `reverse_engineering/p2p_retry_timing_validation_20261009.md`; raw data is private.
+
+## Consolidation handoff
+
+The server tooling is consolidated in [draft #9](https://github.com/GrizzlyOne95/Battlezone98Redux_DedicatedServer/pull/9).
+Related integration work is reviewed in [OpenShim draft #419](https://github.com/GrizzlyOne95/Battlezone98Redux_Shim/pull/419)
+and [Campaign Reimagined draft #173](https://github.com/GrizzlyOne95/Battlezone98Redux_CampaignReimagined/pull/173).
+The [master source and deployment map](https://github.com/GrizzlyOne95/Battlezone98Redux_Shim/blob/agent/gog-ui-network-catchup/Docs/NETWORK_UI_INTEGRATION_20261009.md)
+records the matching client/campaign/server sources and deployment handoff.
+
+GOG UI and deployment verification were completed separately. Historical
+native-health and retry-timer qualification gates remain open; the combined
+client/campaign integration requires new native gameplay qualification.
+These links do not replace those gates or publish the private raw evidence.
