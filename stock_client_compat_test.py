@@ -261,7 +261,7 @@ class ServerHandle:
 
 
 @contextlib.asynccontextmanager
-async def spawned_server(args):
+async def spawned_server(args, extra: tuple[str, ...] = ()):
     tmp = Path(tempfile.mkdtemp(prefix="bzr_compat_"))
     state_file = tmp / "state.json"
     ws_port, udp_port, http_port = free_port(), free_udp_port(), free_port()
@@ -280,6 +280,7 @@ async def spawned_server(args):
     ]
     if args.retain_empty:
         cmd.append("--retain-empty-lobbies")
+    cmd.extend(extra)
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     try:
         # Wait for readiness.
@@ -940,11 +941,54 @@ async def scenario_default_lobby_near_match(args) -> None:
         await c.close()
 
 
+async def scenario_address_redaction(args) -> None:
+    """--redact-addresses over real sockets: lounge observer never sees game members' addresses."""
+    async with spawned_server(args, extra=("--redact-addresses",)) as srv:
+        host = await BZRClient.connect("127.0.0.1", srv.ws_port, "host")
+        peer = await BZRClient.connect("127.0.0.1", srv.ws_port, "peer")
+        obs = await BZRClient.connect("127.0.0.1", srv.ws_port, "obs")
+        await auth_monitor(obs, "Watcher")
+        await wait_authorized(obs)
+        await enter_lounge_bool(obs)
+        await auth_stock(host, "Hoster", uid="U_rhost")
+        await wait_authorized(host)
+        await enter_lounge_bool(host)
+        await auth_stock(peer, "Peer", uid="U_rpeer")
+        await wait_authorized(peer)
+        await enter_lounge_bool(peer)
+
+        cm = len(host.inbox)
+        await create_game_minimal(host)
+        msgs = await host.wait_for({"OnLobbyCreated"}, since=cm)
+        lid = last_of(msgs, "OnLobbyCreated")["data"]["id"]
+        jm = len(peer.inbox)
+        await peer.send("DoJoinLobby", {"id": lid, "password": ""})
+        msgs = await peer.wait_for({"OnLobbyJoined"}, since=jm)
+        users = last_of(msgs, "OnLobbyJoined")["data"]["lobby"]["users"]
+        record(users.get("U_rhost", {}).get("wanAddress") == "198.51.100.7:3658",
+               "redaction: game lobby member still receives the host's address")
+
+        hm = len(host.inbox)
+        await peer.send("DoUpdateWAN", {"wanAddress": "203.0.113.99:40000"})
+        msgs = await host.wait_for({"OnWANUpdated"}, since=hm)
+        record(last_of(msgs, "OnWANUpdated")["data"].get("wanAddress") == "203.0.113.99:40000",
+               "redaction: WAN update reaches the same-lobby host")
+
+        await asyncio.sleep(0.5)
+        seen = json.dumps(obs.inbox)
+        leaks = [ip for ip in ("198.51.100.7", "192.168.1.7", "203.0.113.99") if ip in seen]
+        record(not leaks, "redaction: lounge observer receives no player addresses", f"leaked={leaks}")
+        for c in (host, peer, obs):
+            await c.close()
+
+
 async def main_async(args) -> int:
     print(f"== profile matrix ==")
     await scenario_profile_matrix(args)
     print(f"== multi-client lobby scenarios ==")
     await scenario_multi_client_lobby(args)
+    print(f"== address redaction ==")
+    await scenario_address_redaction(args)
     print(f"== lifecycle scenarios ==")
     await scenario_lifecycle(args)
     print(f"== restart persistence ==")
@@ -1117,6 +1161,75 @@ async def unit_test_stock_ws_contracts() -> None:
     assert "relayReason" in failure
 
 
+async def unit_test_address_redaction() -> None:
+    """--redact-addresses: addresses reach only self, admins and same-game-lobby members."""
+    a_wan, b_wan, b_wan_new = "203.0.113.10:41001", "198.51.100.20:42002", "198.51.100.77:42002"
+    a_lan, b_lan = "10.10.0.10:41001", "10.20.0.20:42002"
+    private = [x.split(":")[0] for x in (a_wan, b_wan, b_wan_new, a_lan, b_lan)]
+
+    def leaked(ws: FakeWS) -> list[str]:
+        text = json.dumps(ws.messages)
+        return [ip for ip in private if ip in text]
+
+    for redact in (True, False):
+        state = ServerState(logging.getLogger("redact-test.state"))
+        state.ensure_default_lobby()
+        server = BZRWebSocketServer(state, logging.getLogger("redact-test.ws"), redact_addresses=redact)
+        ws_a, ws_b, ws_c = FakeWS(50101), FakeWS(50102), FakeWS(50103)
+        a = UserSession("PLAYER_A", name="A", wan_address=a_wan, lan_addresses=[a_lan], ws=ws_a)
+        b = UserSession("PLAYER_B", name="B", wan_address=b_wan, lan_addresses=[b_lan], ws=ws_b)
+        c = UserSession("PLAYER_C", name="C", wan_address="192.0.2.30:43003", ws=ws_c)
+        for s in (a, b, c):
+            _attach_session(state, s)
+        default = next(l for l in state.lobbies.values() if l.metadata.get("name") == ServerState.DEFAULT_LOBBY_NAME)
+
+        # Everyone starts in the shared chat lobby, like stock clients do; C stays there watching.
+        for s in (a, b, c):
+            await server._broadcast_session_addresses(s)
+            await server.handle_join_lobby(s, {"id": default.lobby_id, "password": ""})
+        await server.handle_create_game(a, {"memberLimit": 8, "isPrivate": False, "password": ""})
+        lobby = state.lobbies[a.current_lobby_id]
+        await server.handle_join_lobby(b, {"id": lobby.lobby_id, "password": ""})
+        await server.route_message(ws_c, json.dumps({"type": "GetLobbyList", "content": 1}))
+        await server.route_message(ws_b, json.dumps({"type": "DoUpdateWAN", "content": {"wanAddress": b_wan_new}}))
+
+        if not redact:
+            assert leaked(ws_c), "without redaction the lounge observer sees addresses (upstream behavior)"
+            continue
+
+        assert leaked(ws_c) == [], f"observer saw private addresses: {leaked(ws_c)}"
+        joined = _last_data(ws_b, "OnLobbyJoined")
+        assert joined["lobby"]["users"]["PLAYER_A"]["wanAddress"] == a_wan
+        assert joined["lobby"]["users"]["PLAYER_A"]["lanAddresses"] == [a_lan]
+        assert _last_data(ws_a, "OnWANUpdated")["wanAddress"] == b_wan_new  # same game lobby
+        assert _last_data(ws_b, "OnWANUpdated")["wanAddress"] == b_wan_new  # own echo
+        assert not [m for m in ws_c.by_type("OnWANUpdated") if m["data"].get("userId") != "PLAYER_C"]
+
+        # Signaling across lobbies is refused without reaching the target or leaking its address.
+        ws_a.clear()
+        await server.route_message(ws_c, json.dumps({"type": "DoP2PConnect", "content": {"player": "PLAYER_A"}}))
+        assert _last_data(ws_c, "OnLobbyMemberP2PConnect")["success"] is False
+        assert not ws_a.messages
+        assert leaked(ws_c) == []
+
+        # Inside the game lobby it still works and carries the source address.
+        ws_b.clear()
+        await server.route_message(ws_a, json.dumps({"type": "DoP2PConnect", "content": {"player": "PLAYER_B"}}))
+        to_b = _last_data(ws_b, "OnLobbyMemberP2PConnect")
+        assert to_b["success"] is True and to_b["player"] == "PLAYER_A"
+        assert to_b["sourceWanAddress"] == a_wan
+
+        # User lists and logs are admin-only.
+        ws_c.clear()
+        for verb in ("GetUserList", "GetFullLog", "TraceData"):
+            await server.route_message(ws_c, json.dumps({"type": verb, "content": {}}))
+        assert not ws_c.by_type("OnGetUserList") and not ws_c.by_type("OnGetFullLog")
+        assert leaked(ws_c) == []
+        c.is_admin = True
+        await server.route_message(ws_c, json.dumps({"type": "GetUserList", "content": {}}))
+        assert _last_data(ws_c, "OnGetUserList")["users"]["PLAYER_A"]["wanAddress"] == a_wan
+
+
 async def unit_test_opaque_relay() -> None:
     state = ServerState(logging.getLogger("relay-test.state"))
     fake_udp = FakeDatagramTransport(1339)
@@ -1175,6 +1288,9 @@ async def main_async_combined(args) -> int:
     print("== unit: stock WS contracts + relay gating ==")
     await unit_test_stock_ws_contracts()
     print("PASS - unit: stock WS contracts + relay gating")
+    print("== unit: address redaction ==")
+    await unit_test_address_redaction()
+    print("PASS - unit: address redaction")
     print("== unit: opaque relay forwarding ==")
     await unit_test_opaque_relay()
     print("PASS - unit: opaque relay forwarding")
