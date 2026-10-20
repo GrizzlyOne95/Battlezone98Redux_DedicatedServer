@@ -185,6 +185,61 @@ async def ws_smoke(host: str, port: int, timeout: float) -> tuple[bool, str]:
         return False, "Did not receive OnChatMessage"
 
 
+async def rehost_smoke(host: str, port: int, timeout: float) -> tuple[bool, str]:
+    """Create a game, mark ready/launched, create again: the new room must start clean."""
+    uid = "U_REHOST"
+    async with websockets.connect(f"ws://{host}:{port}") as ws:
+        await ws.send(json.dumps({"type": "Authorization", "content": {
+            "authtype": "web", "id": uid, "name": "RehostTester", "playerName": "RehostTester",
+            "clientVersion": "2.2.301"}}))
+        auth = await recv_until_types(ws, {"OnAuthorization"}, timeout, max_messages=10)
+        if "OnAuthorization" not in [str(m.get("type")) for m in auth]:
+            return False, "Expected OnAuthorization"
+
+        async def create_game() -> int | None:
+            await ws.send(json.dumps({"type": "CreateGame",
+                                      "content": {"isPrivate": False, "memberLimit": 8, "password": ""}}))
+            for _ in range(12):
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+                data = msg.get("data", {})
+                if msg.get("type") == "OnLobbyCreated" and data.get("success") is True:
+                    return int(data["id"])
+            return None
+
+        async def own_metadata(lid: int) -> dict[str, Any] | None:
+            await ws.send(json.dumps({"type": "GetLobbyList", "content": True}))
+            for _ in range(40):
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+                lobbies = msg.get("data", {}).get("lobbies")
+                if msg.get("type") == "OnGetLobbyList" and isinstance(lobbies, dict):
+                    lobby = lobbies.get(str(lid)) or {}
+                    return (lobby.get("users", {}).get(uid) or {}).get("metadata")
+            return None
+
+        first = await create_game()
+        if first is None:
+            return False, "First CreateGame failed"
+        for key, value in (("friendID", "S_REHOST"), ("ready", "1"), ("launched", "1"), ("team", "1")):
+            await ws.send(json.dumps({"type": "SetPlayerData", "content": {"key": key, "value": value}}))
+        meta = await own_metadata(first)
+        if not meta or meta.get("ready") != "1" or meta.get("launched") != "1":
+            return False, f"First room did not record ready/launched: {meta}"
+
+        second = await create_game()
+        if second is None or second == first:
+            return False, f"Second CreateGame failed ({second})"
+        meta = await own_metadata(second)
+        if meta is None:
+            return False, "Second room has no host member metadata"
+        stale = sorted(k for k in ("ready", "launched", "team") if k in meta)
+        if stale:
+            return False, f"Re-hosted room inherited stale member keys {stale}: {meta}"
+        if meta.get("friendID") != "S_REHOST":
+            return False, f"friendID did not survive the re-host: {meta}"
+        await ws.send(json.dumps({"type": "DoExitLobby", "content": True}))
+        return True, f"Re-host room {second} starts without stale ready/launched"
+
+
 def udp_smoke(host: str, port: int, timeout: float) -> tuple[bool, str]:
     payload = bytes.fromhex("40020000019c744772360000000000000000")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2105,6 +2160,7 @@ def decoder_smoke() -> tuple[bool, str]:
 async def main() -> int:
     args = parse_args()
     ws_ok, ws_msg = await ws_smoke(args.host, args.ws_port, args.timeout)
+    rehost_ok, rehost_msg = await rehost_smoke(args.host, args.ws_port, args.timeout)
     udp_ok, udp_msg = udp_smoke(args.host, args.udp_port, args.timeout)
     decoder_ok, decoder_msg = decoder_smoke()
     health_ok, health_msg = (True, "Skipped")
@@ -2116,12 +2172,13 @@ async def main() -> int:
         captures_ok, captures_msg = captures_smoke(args.host, args.health_port, args.timeout)
 
     print(f"WS : {'PASS' if ws_ok else 'FAIL'} - {ws_msg}")
+    print(f"RHST: {'PASS' if rehost_ok else 'FAIL'} - {rehost_msg}")
     print(f"UDP: {'PASS' if udp_ok else 'FAIL'} - {udp_msg}")
     print(f"DEC : {'PASS' if decoder_ok else 'FAIL'} - {decoder_msg}")
     print(f"HTTP: {'PASS' if health_ok else 'FAIL'} - {health_msg}")
     print(f"PROTO: {'PASS' if protocol_ok else 'FAIL'} - {protocol_msg}")
     print(f"CAP  : {'PASS' if captures_ok else 'FAIL'} - {captures_msg}")
-    return 0 if (ws_ok and udp_ok and decoder_ok and health_ok and protocol_ok and captures_ok) else 1
+    return 0 if (ws_ok and rehost_ok and udp_ok and decoder_ok and health_ok and protocol_ok and captures_ok) else 1
 
 
 if __name__ == "__main__":
