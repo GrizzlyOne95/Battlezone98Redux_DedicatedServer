@@ -5420,6 +5420,14 @@ class BZRWebSocketServer:
             if lobby and session.user_id in lobby.users:
                 lobby.users[session.user_id] = self.state.build_user_snapshot(session)
 
+    # SetPlayerData keys that describe the player rather than a lobby seat.
+    # name/playerName/clientVersion/authType never reach extra_data.
+    PERSISTENT_PLAYER_DATA_KEYS = frozenset({"friendID"})
+
+    def _clear_lobby_player_data(self, session: UserSession) -> None:
+        for key in [k for k in session.extra_data if k not in self.PERSISTENT_PLAYER_DATA_KEYS]:
+            del session.extra_data[key]
+
     def _normalize_lobby_name(self, raw_name: str) -> str:
         if not raw_name:
             return "~chat~pub~~MyLobby"
@@ -5452,6 +5460,11 @@ class BZRWebSocketServer:
             self.relay_protocol.remove_user(session.user_id, lobby_id=lid)
         session.current_lobby_id = None
         session.in_lounge = True
+        # SetPlayerData values (ready, launched, team, miniid, vehicle, ...)
+        # describe membership of one lobby. Left in place, a re-host's new room
+        # inherits the last game's ready/launched flags: the host's button shows
+        # "Not Ready" and Launch does nothing.
+        self._clear_lobby_player_data(session)
         if not lobby:
             if send_exit_ack:
                 await self.send(session.ws, ack_type, {"success": True, "id": lid})
