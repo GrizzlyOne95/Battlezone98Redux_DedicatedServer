@@ -26,6 +26,7 @@ from server import (
     AuditLog,
     BZRWebSocketServer,
     HardeningConfig,
+    LobbyState,
     ServerState,
     parse_duration,
     sanitize_display_name,
@@ -48,6 +49,14 @@ class FakeWS:
         self.request = SimpleNamespace(headers=headers or {})
         self.sent: list[dict[str, Any]] = []
         self.close_code: int | None = None
+        self.alive = True
+
+    async def ping(self) -> "asyncio.Future[float]":
+        # Live sockets answer at once; dead ones never do.
+        fut = asyncio.get_running_loop().create_future()
+        if self.alive:
+            fut.set_result(0.0)
+        return fut
 
     async def send(self, text: str) -> None:
         self.sent.append(json.loads(text))
@@ -292,23 +301,46 @@ async def test_audit_log(tmp: Path) -> None:
 
 async def test_duplicate_login(tmp: Path) -> None:
     rig = Rig(tmp)
+    rig.ws_server.DUPLICATE_PROBE_SECONDS = 0.05
     lan = ["127.0.0.1:62185", "169.254.1.2:62185", "192.168.0.63:62185", "192.168.0.102:62185"]
     old_ws, old = await rig.login("S765", "Squaw", ip="192.168.0.63", lanAddresses=lan)
-    # Same PC reconnecting through its other adapter before the old socket timed out.
+
+    # Old socket still answers pings: the second login is refused, the first is untouched.
+    dup_ws, dup = await rig.login("S765", "Squaw", ip="192.168.0.102", lanAddresses=lan)
+    check(dup is None and dup_ws.close_code == 4002 and old_ws.close_code is None
+          and rig.state.sessions_by_user_id.get("S765") is old, "duplicate of a live session is refused")
+
+    # Seat the player in a running game, then let the old socket die silently.
+    rig.state.lobbies[7] = LobbyState(lobby_id=7, owner="S765", metadata={"name": "~game~pub~~t"})
+    rig.state.lobbies[7].users["S765"] = rig.state.build_user_snapshot(old)
+    rig.state.lobbies[7].users["P2"] = {"id": "P2"}
+    old.current_lobby_id = 7
+    old.extra_data.update({"ready": "1", "team": "2"})
+    old_ws.alive = False
+    peer_ws, _ = await rig.login("P2", "Peer", ip="192.168.0.44")
+    peer_mark = len(peer_ws.sent)
+
+    # Same PC reconnecting through its other adapter before keepalive noticed.
     new_ws, new = await rig.login("S765", "Squaw", ip="192.168.0.102", lanAddresses=lan)
     await asyncio.sleep(0)
     check(new is not None and new.user_id == "S765", "same-PC reconnect keeps the id (no _xxxx suffix)")
     check(rig.state.sessions_by_user_id.get("S765") is new and old_ws not in rig.state.sessions_by_ws,
-          "stale session is replaced, not left as a ghost")
-    check(old_ws.close_code == 4002, "stale socket is closed")
+          "dead session is replaced, not left as a ghost")
+    check(new.current_lobby_id == 7 and "S765" in rig.state.lobbies[7].users and rig.state.lobbies[7].owner == "S765"
+          and new.extra_data.get("ready") == "1", "reconnect inherits the lobby seat, ownership and player data")
+    check(not any(m["type"] == "OnLobbyMemberListChanged" for m in peer_ws.sent[peer_mark:]),
+          "other players are not told the player left")
+    check(old_ws.close_code == 4002, "dead socket is closed")
     check(len(rig.events("session_superseded")) == 1, "audit records the replacement")
     await rig.ws_server.unregister(old_ws)
-    check(rig.state.sessions_by_user_id.get("S765") is new, "late cleanup of the old socket keeps the new session")
+    check(rig.state.sessions_by_user_id.get("S765") is new and "S765" in rig.state.lobbies[7].users,
+          "late cleanup of the old socket keeps the new session and seat")
 
-    # Another machine claiming the same id must not knock the owner off.
+    # A different machine claiming the id of a dead session does not get the seat.
+    new_ws.alive = False
     _, other = await rig.login("S765", "Squaw", ip="198.51.100.7", lanAddresses=["10.0.0.5:62185"])
-    check(other is not None and other.user_id.startswith("S765_") and new_ws.close_code is None,
-          "different machine gets a suffixed id; the connected owner stays")
+    check(other is not None and other.user_id.startswith("S765_") and other.current_lobby_id is None,
+          "different machine gets a suffixed id and no seat")
     # Loopback/link-local overlap alone is not proof of the same machine.
     _, other2 = await rig.login("S765", "Squaw", ip="198.51.100.8", lanAddresses=["127.0.0.1:62185", "169.254.1.2:62185"])
     check(other2 is not None and other2.user_id.startswith("S765_"), "loopback/link-local overlap is ignored")
