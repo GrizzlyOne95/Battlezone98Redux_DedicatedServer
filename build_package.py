@@ -42,6 +42,10 @@ window (Copy option), for example:
     /bzrserver=ws://192.168.0.44:1337/
 Type it in full (ws://, port and trailing /); a bare IP does not work.
 Remove it to go back to the official servers.
+Players with OpenShim need no launch option: on the Multiplayer setup
+screen they pick Custom and type this PC's address, or Local when the game
+runs on the same PC as the server. That screen only reaches the default
+ports, so leave TCP 1337 / UDP 1338 for them.
 Ports: TCP 1337 (lobby), UDP 1338 (handshake), UDP 1339 (relay).
 For three or more relayed players, enable Separate UDP port per peer pair
 and allow/forward its UDP range (1340-1369 by default). Four fully relayed

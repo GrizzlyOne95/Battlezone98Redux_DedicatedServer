@@ -75,6 +75,7 @@ DEFAULTS = {
     "public_host": "",
 }
 PUBLIC_IP_URL = "https://api.ipify.org"
+OPENSHIM_WS_PORT = 1337  # the only lobby port OpenShim's setup screen can reach
 ACCESS_CHOICES = {
     "Open (anyone)": "open",
     "Approve new players": "approve",
@@ -349,6 +350,8 @@ class ServerGUI:
         ttk.Button(conn, text="Copy", width=6, command=self.copy_wan_switch).grid(row=4, column=3, padx=(4, 0), pady=(2, 0))
         self.wan_note = ttk.Label(conn, foreground="#666", wraplength=520, justify="left")
         self.wan_note.grid(row=5, column=1, columnspan=3, sticky="w")
+        self.openshim_note = ttk.Label(conn, foreground="#666", wraplength=520, justify="left")
+        self.openshim_note.grid(row=6, column=1, columnspan=3, sticky="w", pady=(6, 0))
         self.update_lan()
 
         # Bottom: tabs.
@@ -755,6 +758,15 @@ class ServerGUI:
         self.switch_var.set(f"/bzrserver=ws://{ip or '<server-ip>'}:{ws}/")
         self.port_warn.configure(
             text="" if udp == ws + 1 else f"Handshake UDP must be lobby port + 1 ({ws + 1}) for game clients."
+        )
+        # OpenShim's multiplayer setup screen swaps only the host, so it reaches
+        # this server only on the stock ports.
+        self.openshim_note.configure(
+            text="OpenShim players need no launch option: Multiplayer setup screen, Custom, then the LAN or "
+                 "Internet address above (Local when the game runs on this PC)."
+            if ws == OPENSHIM_WS_PORT and udp == ws + 1
+            else f"OpenShim's setup screen only reaches lobby port {OPENSHIM_WS_PORT} with UDP {OPENSHIM_WS_PORT + 1}; "
+                 "on these ports players must use the launch option."
         )
         host = self.public_var.get().strip()
         for prefix in ("ws://", "http://", "https://"):

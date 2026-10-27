@@ -84,6 +84,12 @@ lobbies from the local health port. It needs no extra packages. Stop sends `stop
 are saved to `server_gui.json` (gitignored). The players/lobbies view comes from
 `GET http://127.0.0.1:8080/lobbies`, which is also usable on its own.
 
+Players with [OpenShim](https://github.com/GrizzlyOne95/Battlezone98Redux_Shim) need no launch
+option: its Multiplayer setup screen offers **Rebellion**, **Custom** (type the server's LAN or
+public address) and **Local** (`127.0.0.1`, a server on the same PC). That screen swaps only the
+host, so it reaches a server on the default ports (TCP 1337, UDP 1338) only; on other ports
+players use `/bzrserver=`. The launcher shows the matching hint under the connect options.
+
 For three or more players who may need relay fallback, enable **Separate UDP port per peer pair**
 and choose an inclusive UDP range (the launcher suggests `1340`–`1369`). Allow/forward that entire
 range as well as the lobby/probe ports. Existing saved settings keep shared relay selected until
