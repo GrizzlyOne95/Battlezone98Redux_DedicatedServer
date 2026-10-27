@@ -5321,6 +5321,46 @@ class BZRWebSocketServer:
             raise ValueError("expiresAt is in the past")
         return epoch - now
 
+    @staticmethod
+    def _routable_hosts(addresses: Any) -> set[str]:
+        """Hosts from 'ip:port' LAN entries, minus loopback and link-local."""
+        hosts: set[str] = set()
+        for entry in addresses if isinstance(addresses, list) else []:
+            if not isinstance(entry, str):
+                continue
+            host = entry.rsplit(":", 1)[0] if entry.count(":") == 1 else entry
+            try:
+                ip = ipaddress.ip_address(host.strip("[]"))
+            except ValueError:
+                continue
+            if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified):
+                hosts.add(str(ip))
+        return hosts
+
+    def _same_client_machine(self, old: UserSession, ws: Any, lan_addresses: Any) -> bool:
+        """True when a re-auth for an id that is still connected comes from the
+        same PC: same source IP, or overlapping LAN addresses (a PC with two
+        adapters on one subnet reconnects from its other address)."""
+        new_ip = self._ws_ip(ws)
+        if new_ip and new_ip == self._ws_ip(old.ws):
+            return True
+        old_hosts = self._routable_hosts(old.lan_addresses)
+        return bool(old_hosts & (self._routable_hosts(lan_addresses) | {new_ip}))
+
+    async def _supersede_session(self, old: UserSession, new_ws: Any) -> None:
+        """Retire ``old`` so a reconnect of the same identity can take its id."""
+        self.state.sessions_by_ws.pop(old.ws, None)
+        if self.state.sessions_by_user_id.get(old.user_id) is old:
+            self.state.sessions_by_user_id.pop(old.user_id, None)
+        try:
+            await self.remove_from_lobby(old, send_exit_ack=False)
+        finally:
+            self.state.record_stdout_entry("info", f"Replaced stale session {old.user_id} ({old.name}) on reconnect")
+            self.state.audit.write("session_superseded", id=old.user_id, name=old.name,
+                                   oldIp=self._ws_ip(old.ws), ip=self._ws_ip(new_ws))
+            if old.ws is not None:
+                asyncio.create_task(self._close_quietly(old.ws, 4002))
+
     async def _close_quietly(self, ws: Any, code: int) -> None:
         try:
             await ws.close(code=code)
@@ -5578,8 +5618,15 @@ class BZRWebSocketServer:
             return
 
         if user_id in self.state.sessions_by_user_id:
-            # Ensure uniqueness if duplicate ID reconnects.
-            user_id = f"{user_id}_{uuid.uuid4().hex[:4]}"
+            old = self.state.sessions_by_user_id[user_id]
+            if old.authtype == authtype and self._same_client_machine(old, ws, content.get("lanAddresses")):
+                # The client's old socket died (e.g. a dual-NIC PC switched
+                # adapters) and it reconnected before our keepalive noticed.
+                # Replace the stale session instead of leaving a ghost.
+                await self._supersede_session(old, ws)
+            else:
+                # Ensure uniqueness if duplicate ID reconnects.
+                user_id = f"{user_id}_{uuid.uuid4().hex[:4]}"
 
         session = UserSession(
             user_id=user_id,
@@ -6587,7 +6634,9 @@ class BZRWebSocketServer:
         try:
             await self.remove_from_lobby(session, send_exit_ack=False)
         finally:
-            self.state.sessions_by_user_id.pop(session.user_id, None)
+            # A reconnect may already own this id; only drop our own entry.
+            if self.state.sessions_by_user_id.get(session.user_id) is session:
+                self.state.sessions_by_user_id.pop(session.user_id, None)
             self.state.record_stdout_entry("info", f"Disconnected {session.user_id} ({session.name})")
             self.log.info("Disconnected user_id=%s name=%s", session.user_id, session.name)
 

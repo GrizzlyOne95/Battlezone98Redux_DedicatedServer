@@ -290,11 +290,36 @@ async def test_audit_log(tmp: Path) -> None:
     check(AuditLog(None).enabled is False, "audit can be disabled")
 
 
+async def test_duplicate_login(tmp: Path) -> None:
+    rig = Rig(tmp)
+    lan = ["127.0.0.1:62185", "169.254.1.2:62185", "192.168.0.63:62185", "192.168.0.102:62185"]
+    old_ws, old = await rig.login("S765", "Squaw", ip="192.168.0.63", lanAddresses=lan)
+    # Same PC reconnecting through its other adapter before the old socket timed out.
+    new_ws, new = await rig.login("S765", "Squaw", ip="192.168.0.102", lanAddresses=lan)
+    await asyncio.sleep(0)
+    check(new is not None and new.user_id == "S765", "same-PC reconnect keeps the id (no _xxxx suffix)")
+    check(rig.state.sessions_by_user_id.get("S765") is new and old_ws not in rig.state.sessions_by_ws,
+          "stale session is replaced, not left as a ghost")
+    check(old_ws.close_code == 4002, "stale socket is closed")
+    check(len(rig.events("session_superseded")) == 1, "audit records the replacement")
+    await rig.ws_server.unregister(old_ws)
+    check(rig.state.sessions_by_user_id.get("S765") is new, "late cleanup of the old socket keeps the new session")
+
+    # Another machine claiming the same id must not knock the owner off.
+    _, other = await rig.login("S765", "Squaw", ip="198.51.100.7", lanAddresses=["10.0.0.5:62185"])
+    check(other is not None and other.user_id.startswith("S765_") and new_ws.close_code is None,
+          "different machine gets a suffixed id; the connected owner stays")
+    # Loopback/link-local overlap alone is not proof of the same machine.
+    _, other2 = await rig.login("S765", "Squaw", ip="198.51.100.8", lanAddresses=["127.0.0.1:62185", "169.254.1.2:62185"])
+    check(other2 is not None and other2.user_id.startswith("S765_"), "loopback/link-local overlap is ignored")
+
+
 async def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         for i, test in enumerate((test_names, test_version_policy, test_chat_flood_and_mute, test_ban_expiry,
-                                  test_admin_key_transport, test_ticket_withheld, test_audit_log)):
+                                  test_admin_key_transport, test_ticket_withheld, test_audit_log,
+                                  test_duplicate_login)):
             await test(base / f"t{i}")
     print(f"\n{'ALL PASSED' if not _failures else str(len(_failures)) + ' FAILED: ' + '; '.join(_failures)}")
     return 0 if not _failures else 1
