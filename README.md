@@ -67,6 +67,14 @@ The server currently handles:
     python smoke_test.py
     ```
 
+#### One-click start (`StartServer.bat`)
+
+Double-click `StartServer.bat` to run the server in a console window. It installs the
+dependencies if they are missing, offers once to open TCP 1337 and UDP 1338-1369 in Windows
+Firewall (one admin prompt), prints this PC's addresses for players to enter as the custom
+server, and starts `server.py` with per-pair relay ports 1340-1369. Extra arguments are passed
+through, e.g. `StartServer.bat --log-level DEBUG`.
+
 #### Desktop launcher (`server_gui.py`)
 
 `python server_gui.py` (or double-click `ServerGUI.bat`) opens a small tkinter window that starts and
