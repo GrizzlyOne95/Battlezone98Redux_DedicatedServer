@@ -109,8 +109,23 @@ Tailscale.
     `allowlist` refuses unknown ids at once.
 *   `--pin-ips` re-asks approval when an approved id connects from a new IP.
 *   Bans by id and/or IP; `--auth-rate-limit` login attempts per IP per minute (default 20).
-*   `GET /access` shows the mode, pending, approved and banned lists; `POST /access` with
-    `{"action": "set|approve|deny|remove|kick|ban|unban", ...}` changes them. POST is accepted only
+*   `--identity-policy off|optional|required` (default `optional`, also saved in the state file):
+    community identity, trust on first use. A client may send a secret `communityKey` in
+    Authorization (OpenShim will send a per-server key; stock clients send none). The first admitted
+    login with a key binds it to that id (stored as a salted SHA-256); after that, a login as the id
+    without the same key is refused. `optional` leaves keyless ids as before, `required` refuses any
+    login without a key (except placeholder ids `0`/empty, which get a fresh server-assigned id and
+    never bind), `off` ignores keys. A key binds only when the login actually takes that id, so a
+    login refused as "already connected" or given a `_xxxx` suffix binds nothing. Trust on first use
+    still means anyone can claim an id that has never presented a key: under `optional`, a keyless
+    stock player's id can be claimed by someone else's key while they are offline, after which the
+    stock player is refused until the operator resets it. If a player loses
+    their key, the operator resets it (`{"action": "resetIdentity", "id": ...}` or the Access tab's
+    Protected identities list) and their next login with a key registers afresh. This proves "same
+    player as last time" on this server; it does not prove who the first claimant was.
+*   `GET /access` shows the mode, pending, approved, banned and protected-identity lists; `POST /access` with
+    `{"action": "set|approve|deny|remove|kick|ban|unban|resetIdentity", ...}` changes them (`set` takes
+    `mode`, `pinIps` and `identityPolicy`). POST is accepted only
     from loopback even if `--health-host` is widened. The launcher's Access tab and the Players tab's
     Approve/Kick/Ban buttons use these.
 

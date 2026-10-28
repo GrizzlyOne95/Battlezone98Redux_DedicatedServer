@@ -346,12 +346,106 @@ async def test_duplicate_login(tmp: Path) -> None:
     check(other2 is not None and other2.user_id.startswith("S765_"), "loopback/link-local overlap is ignored")
 
 
+async def test_community_identity(tmp: Path) -> None:
+    key1, key2 = "ck-" + "a" * 40, "ck-" + "b" * 40
+    rig = Rig(tmp)
+    rig.state.access.rate_limit_per_minute = 0
+
+    async def login_out(uid: str, **content: Any) -> tuple[FakeWS, Any]:
+        ws, s = await rig.login(uid, "Gina", **content)
+        if s is not None:
+            await rig.ws_server.unregister(ws)
+        return ws, s
+
+    _, s = await login_out("G1")
+    check(s is not None and "G1" not in rig.state.access.identities, "stock login without a key is admitted and unprotected")
+    _, s = await login_out("G1", communityKey=key1)
+    check(s is not None and "G1" in rig.state.access.identities and len(rig.events("identity_registered")) == 1,
+          "first login with a key registers it")
+    _, s = await login_out("G1", communityKey=key1)
+    check(s is not None, "same key is admitted again")
+    ws, s = await login_out("G1")
+    check(s is None and ws.close_code == 4002 and ws.sent[-1]["data"]["success"] is False,
+          "protected id without a key is refused like a failed login")
+    ws, s = await login_out("G1", communityKey=key2)
+    check(s is None and rig.state.access.identities["G1"].get("failedAttempts") == 1,
+          "wrong key is refused and counted")
+    _, s = await login_out("G2", communityKey="short")
+    check(s is None and "G2" not in rig.state.access.identities, "malformed key is refused")
+    ws, s = await rig.login("0", "Web", authtype="web", communityKey=key1)
+    check(s is not None and not any(k.startswith("U") for k in rig.state.access.identities),
+          "server-assigned ids never register a key")
+    await rig.ws_server.unregister(ws)
+    _, s = await login_out("0", communityKey=key1)
+    check(s is not None and "0" not in rig.state.access.identities, "gog placeholder id 0 never registers a key")
+
+    # A squatter cannot lock out a stock player by claiming their id with a key.
+    online_ws, online = await rig.login("G4", "Stock")
+    ws, s = await rig.login("G4", "Squat", ip="198.51.100.7", communityKey=key2)
+    check(s is None and "G4" not in rig.state.access.identities, "refused duplicate login binds no key")
+    online_ws.alive = False
+    _, s = await rig.login("G4", "Squat", ip="198.51.100.7", communityKey=key2)
+    check(s is not None and s.user_id.startswith("G4_") and not any(k.startswith("G4") for k in rig.state.access.identities),
+          "suffixed duplicate login binds no key")
+    await rig.ws_server.unregister(s.ws)
+    await rig.ws_server.unregister(online_ws)
+    # Two first logins racing (e.g. both waiting on approval): only the first key binds.
+    check(rig.state.access.bind_identity("G5", key1, "A") and not rig.state.access.bind_identity("G5", key2, "B"),
+          "a concurrent first login with a different key does not bind over the first")
+
+    entry = rig.state.record_protocol_event(channel="ws", direction="in", peer="203.0.113.9", msg_type="Authorization",
+                                            payload={"id": "G1", "key": "admin-secret-xyz", "communityKey": key1})
+    check("admin-secret-xyz" not in entry["preview"] and key1 not in entry["preview"],
+          "protocol history preview redacts the admin key and community key")
+
+    snap = rig.state.access.snapshot()
+    check(snap["identities"][0]["id"] == "G1" and "hash" not in snap["identities"][0]
+          and "salt" not in snap["identities"][0], "snapshot lists protected ids without salt or hash")
+    rig.state.save_state()
+    saved = (tmp / "state.json").read_text(encoding="utf-8")
+    check(key1 not in saved and key2 not in saved, "state file stores no raw key")
+    check(key1 not in rig.audit_path.read_text(encoding="utf-8") and key2 not in rig.audit_path.read_text(encoding="utf-8"),
+          "audit log never contains a community key")
+
+    rig2 = Rig(tmp)
+    rig2.state.load_state()
+    rig2.state.access.rate_limit_per_minute = 0
+    _, s = await rig2.login("G1", "Gina")
+    check(s is None, "protection survives a restart")
+    _, s = await rig2.login("G1", "Gina", ip="203.0.113.10", communityKey=key1)
+    check(s is not None, "registered key still verifies after a restart")
+    await rig2.ws_server.unregister(s.ws)
+
+    r = await rig2.ws_server.handle_access_action({"action": "resetIdentity", "id": "G1"})
+    check(r["ok"] and "G1" not in rig2.state.access.identities, "operator reset forgets the key")
+    _, s = await rig2.login("G1", "Gina", communityKey=key2)
+    check(s is not None and "G1" in rig2.state.access.identities, "after a reset a new key registers")
+    await rig2.ws_server.unregister(s.ws)
+    r = await rig2.ws_server.handle_access_action({"action": "resetIdentity", "id": "NOPE"})
+    check(not r["ok"], "resetting an unknown id reports an error")
+
+    await rig2.ws_server.handle_access_action({"action": "set", "identityPolicy": "required"})
+    _, s = await rig2.login("G3", "New")
+    check(s is None, "required policy refuses a login without a key")
+    ws, s = await rig2.login("0", "Web", authtype="web")
+    check(s is not None, "required policy still admits server-assigned ids")
+    await rig2.ws_server.unregister(ws)
+    await rig2.ws_server.handle_access_action({"action": "set", "identityPolicy": "off"})
+    _, s = await rig2.login("G1", "Gina", communityKey=key1)
+    check(s is not None, "off policy ignores keys")
+    try:
+        await rig2.ws_server.handle_access_action({"action": "set", "identityPolicy": "bogus"})
+        check(False, "bad identity policy is rejected")
+    except ValueError:
+        check(rig2.state.access.identity_policy == "off", "bad identity policy is rejected")
+
+
 async def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         for i, test in enumerate((test_names, test_version_policy, test_chat_flood_and_mute, test_ban_expiry,
                                   test_admin_key_transport, test_ticket_withheld, test_audit_log,
-                                  test_duplicate_login)):
+                                  test_duplicate_login, test_community_identity)):
             await test(base / f"t{i}")
     print(f"\n{'ALL PASSED' if not _failures else str(len(_failures)) + ' FAILED: ' + '; '.join(_failures)}")
     return 0 if not _failures else 1

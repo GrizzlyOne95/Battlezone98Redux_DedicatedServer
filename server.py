@@ -3043,7 +3043,8 @@ class LobbyState:
 
 
 SECRET_FIELD_NAMES = frozenset({"password", "token", "ticket", "authticket", "steamticket", "steamappticket",
-                                "gogappticket", "platformticket", "adminkey", "secret", "authorization"})
+                                "gogappticket", "platformticket", "adminkey", "secret", "authorization",
+                                "communitykey"})
 TICKET_WITHHELD_MARKER = "withheld"
 TICKET_FIELDS = ("steamAppTicket", "gogAppTicket", "authTicket", "platformTicket")
 DEFAULT_AUDIT_LOG = "data/audit.log"
@@ -3221,6 +3222,13 @@ class HardeningConfig:
 
 
 ACCESS_MODES = ("open", "approve", "allowlist")
+# Community identity (trust on first use): a client may send a per-host secret
+# as Authorization.communityKey. The first admitted login with a key binds it to
+# that id; later logins as the id must present the same key. Stock clients send
+# none, so "optional" only protects ids whose owners opted in.
+IDENTITY_POLICIES = ("off", "optional", "required")
+COMMUNITY_KEY_MIN_LEN = 16
+COMMUNITY_KEY_MAX_LEN = 256
 
 
 class AccessControl:
@@ -3246,6 +3254,9 @@ class AccessControl:
         self.banned_ids: dict[str, dict[str, Any]] = {}
         self.banned_ips: dict[str, dict[str, Any]] = {}
         self.muted_ids: dict[str, dict[str, Any]] = {}
+        self.identity_policy = "optional"
+        # id -> {"salt", "hash" (sha256 of salt + key), "name", "registeredAt", "lastSeen", ...}
+        self.identities: dict[str, dict[str, Any]] = {}
         self.audit: AuditLog = AuditLog()
         self.clock = time.time  # epoch seconds; replaceable in tests
         # Runtime only: players waiting for a decision.
@@ -3262,6 +3273,8 @@ class AccessControl:
             "bannedIds": self.banned_ids,
             "bannedIps": self.banned_ips,
             "mutedIds": self.muted_ids,
+            "identityPolicy": self.identity_policy,
+            "identities": self.identities,
         }
 
     def load_payload(self, payload: Any) -> None:
@@ -3275,6 +3288,11 @@ class AccessControl:
             value = payload.get(key)
             if isinstance(value, dict):
                 setattr(self, attr, {str(k): dict(v) if isinstance(v, dict) else {} for k, v in value.items()})
+        policy = str(payload.get("identityPolicy", self.identity_policy))
+        self.identity_policy = policy if policy in IDENTITY_POLICIES else "optional"
+        identities = payload.get("identities")
+        if isinstance(identities, dict):
+            self.identities = {str(k): dict(v) for k, v in identities.items() if self._valid_identity(v)}
         self.prune_expired()
 
     # ---- expiry (entries without expiresEpoch are permanent) ----
@@ -3346,6 +3364,78 @@ class AccessControl:
             ips.append(ip)
             del ips[:-8]
         self._changed()
+
+    # ---- community identity ----
+    @staticmethod
+    def _valid_identity(entry: Any) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        try:
+            digest = str(entry.get("hash", ""))
+            return len(bytes.fromhex(str(entry.get("salt", "")))) >= 16 and len(bytes.fromhex(digest)) == 32
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _key_digest(salt: str, key: str) -> str:
+        # surrogatepass: a JSON string can carry a lone surrogate, which plain utf-8 rejects.
+        return hashlib.sha256(bytes.fromhex(salt) + key.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def check_identity(self, user_id: str, key: str) -> tuple[bool, str]:
+        """Return (ok, reason) for the community key a login presented ("" for none)."""
+        if self.identity_policy == "off":
+            return True, "identity off"
+        if key and not COMMUNITY_KEY_MIN_LEN <= len(key) <= COMMUNITY_KEY_MAX_LEN:
+            return False, "malformed community key"
+        entry = self.identities.get(user_id)
+        if entry is None:
+            if not key and self.identity_policy == "required":
+                return False, "community key required"
+            return True, "unregistered"
+        if not key:
+            return False, "protected id without community key"
+        if hmac.compare_digest(self._key_digest(entry["salt"], key), entry["hash"]):
+            return True, "verified"
+        entry["failedAttempts"] = int(entry.get("failedAttempts", 0)) + 1
+        entry["lastFailedAt"] = utc_now_str()
+        self._changed()
+        return False, "community key mismatch"
+
+    def bind_identity(self, user_id: str, key: str, name: str) -> bool:
+        """After an admitted login: register the key on first use, else refresh lastSeen.
+
+        Returns False when another login registered a different key for this id
+        while this one was waiting (approval or liveness check).
+        """
+        if self.identity_policy == "off":
+            return True
+        if not key:
+            # A keyless login that waited may find the id was registered meanwhile.
+            return user_id not in self.identities
+        now = utc_now_str()
+        entry = self.identities.get(user_id)
+        if entry is None:
+            salt = os.urandom(16).hex()
+            self.identities[user_id] = {"salt": salt, "hash": self._key_digest(salt, key), "name": name,
+                                        "registeredAt": now, "lastSeen": now}
+            self.log.info("Access: community identity registered for %s (%s)", user_id, name)
+            self.audit.write("identity_registered", targetId=user_id, name=name or None)
+        elif not hmac.compare_digest(self._key_digest(entry["salt"], key), entry["hash"]):
+            return False
+        else:
+            entry["lastSeen"] = now
+            if name:
+                entry["name"] = name
+        self._changed()
+        return True
+
+    def reset_identity(self, user_id: str) -> bool:
+        """Forget an id's key (the owner lost it); the next login with a key registers afresh."""
+        if self.identities.pop(user_id, None) is None:
+            return False
+        self.log.info("Access: community identity reset for %s", user_id)
+        self._changed()
+        return True
 
     # ---- pending ----
     def add_pending(self, user_id: str, name: str, ip: str, reason: str) -> asyncio.Future:
@@ -3435,7 +3525,10 @@ class AccessControl:
         self.prune_expired()
         return False
 
-    def set_mode(self, mode: str | None = None, pin_ips: bool | None = None) -> None:
+    def set_mode(self, mode: str | None = None, pin_ips: bool | None = None,
+                 identity_policy: str | None = None) -> None:
+        if identity_policy is not None and identity_policy not in IDENTITY_POLICIES:
+            raise ValueError(f"identityPolicy must be one of {', '.join(IDENTITY_POLICIES)}")
         if mode is not None:
             if mode not in ACCESS_MODES:
                 raise ValueError(f"mode must be one of {', '.join(ACCESS_MODES)}")
@@ -3445,6 +3538,8 @@ class AccessControl:
                     self.approve(uid)  # going open admits whoever was waiting
         if pin_ips is not None:
             self.pin_ips = bool(pin_ips)
+        if identity_policy is not None:
+            self.identity_policy = identity_policy
         self._changed()
 
     def snapshot(self) -> dict[str, Any]:
@@ -3463,6 +3558,9 @@ class AccessControl:
             "bannedIds": [{"id": k, **v} for k, v in sorted(self.banned_ids.items())],
             "bannedIps": [{"ip": k, **v} for k, v in sorted(self.banned_ips.items())],
             "mutedIds": [{"id": k, **v} for k, v in sorted(self.muted_ids.items())],
+            "identityPolicy": self.identity_policy,
+            "identities": [{"id": k, **{f: x for f, x in v.items() if f not in ("salt", "hash")}}
+                           for k, v in sorted(self.identities.items())],
             "deniedTotal": self.denied_total,
         }
 
@@ -3694,7 +3792,7 @@ class ServerState:
             "direction": direction,
             "peer": peer,
             "type": msg_type,
-            "preview": compact_preview(payload),
+            "preview": compact_preview(redact_protocol_trace_payload(payload, message_type=msg_type)),
         }
         if decoder:
             entry["decoder"] = decoder
@@ -5151,7 +5249,8 @@ class BZRWebSocketServer:
         await self.send(ws, "OnAuthorization", {"type": "OnAuthorization", "time": utc_now_str(), "success": False, "id": user_id})
         await self._close_quietly(ws, 4002)
 
-    async def _admit(self, ws: Any, user_id: str, name: str, key: str, info: dict[str, Any] | None = None) -> bool:
+    async def _admit(self, ws: Any, user_id: str, name: str, key: str, info: dict[str, Any] | None = None,
+                     community_key: str = "", assigned_id: bool = False) -> bool:
         access = self.state.access
         info = info if info is not None else {}
         ip = self._ws_ip(ws)
@@ -5160,6 +5259,13 @@ class BZRWebSocketServer:
             return False
         if self.check_admin_key(ws, user_id, key, info):
             return True
+        # Server-assigned ids are fresh per login and cannot impersonate anyone,
+        # so even the "required" identity policy lets them through keyless.
+        identity_ok, identity_reason = (True, "assigned id") if assigned_id else \
+            access.check_identity(user_id, community_key)
+        if not identity_ok:
+            await self._refuse_auth(ws, user_id, identity_reason, info, name)
+            return False
         verdict, reason = access.decide(user_id, ip)
         if verdict == "pending":
             fut = access.add_pending(user_id, name, ip, reason)
@@ -5266,7 +5372,10 @@ class BZRWebSocketServer:
         if duration is None and body.get("expiresAt") not in (None, ""):
             duration = self._duration_until(body["expiresAt"], access.clock())
         if action == "set":
-            access.set_mode(body.get("mode"), body.get("pinIps"))
+            access.set_mode(body.get("mode"), body.get("pinIps"), body.get("identityPolicy"))
+        elif action == "resetIdentity" and uid:
+            if not access.reset_identity(uid):
+                return {"ok": False, "error": f"no community identity for {uid!r}"}
         elif action == "approve" and uid:
             session = self.state.sessions_by_user_id.get(uid)
             if session and not ip:
@@ -5299,10 +5408,11 @@ class BZRWebSocketServer:
             access.unmute(uid, actor)
         else:
             return {"ok": False, "error": f"bad action {action!r}"}
-        if action in ("set", "approve", "deny", "remove", "kick"):
+        if action in ("set", "approve", "deny", "remove", "kick", "resetIdentity"):
             self.state.audit.write("access_action", actor=actor, action=action, targetId=uid or None,
                                    targetIp=ip or None, mode=body.get("mode") if action == "set" else None,
-                                   pinIps=body.get("pinIps") if action == "set" else None)
+                                   pinIps=body.get("pinIps") if action == "set" else None,
+                                   identityPolicy=body.get("identityPolicy") if action == "set" else None)
         self.state.save_state()
         return {"ok": True, "access": access.snapshot()}
 
@@ -5634,10 +5744,16 @@ class BZRWebSocketServer:
                 self.state.record_stdout_entry("warn", f"Client version policy (log only) {user_id}: {why}")
                 self.state.audit.write("client_version_warning", id=user_id, ip=self._ws_ip(ws), reason=why)
 
-        if not await self._admit(ws, user_id, name, str(content.get("key", "")), info):
+        # Placeholder ids ("0"/empty; web clients get a fresh U-id) have nothing to bind a key to.
+        assigned_id = requested_id in {"", "0"}
+        community_key = "" if assigned_id else str(content.get("communityKey", "") or "").strip()
+        info["hasCommunityKey"] = bool(community_key)
+        if not await self._admit(ws, user_id, name, str(content.get("key", "")), info, community_key,
+                                 assigned_id=assigned_id):
             return
 
         inherit: UserSession | None = None
+        suffix = False
         old = self.state.sessions_by_user_id.get(user_id)
         if old is not None:
             # A socket can die at the client (e.g. a dual-NIC PC switching
@@ -5651,10 +5767,22 @@ class BZRWebSocketServer:
                 # Same PC reconnecting: take over its lobby seat silently so a
                 # match in progress does not see the player leave.
                 inherit = old
-                self._retire_session(old, ws)
             elif self.state.sessions_by_user_id.get(user_id) is not None:
-                # Ensure uniqueness if duplicate ID reconnects.
-                user_id = f"{user_id}_{uuid.uuid4().hex[:4]}"
+                suffix = True
+
+        # Bind only once the login is certain to take this exact id, so a refused
+        # or suffixed duplicate cannot claim it. bind re-checks the key because a
+        # concurrent first login may have registered it while this one waited.
+        # Runs before retiring the old session so a refusal here drops nothing.
+        if (not suffix and user_id == requested_id and not info.get("admin_key_ok")
+                and not self.state.access.bind_identity(user_id, community_key, name)):
+            await self._refuse_auth(ws, user_id, "community key mismatch", info, name)
+            return
+        if inherit is not None:
+            self._retire_session(inherit, ws)
+        elif suffix:
+            # Ensure uniqueness if duplicate ID reconnects.
+            user_id = f"{user_id}_{uuid.uuid4().hex[:4]}"
 
         session = UserSession(
             user_id=user_id,
@@ -7040,8 +7168,8 @@ async def run_server(args: argparse.Namespace) -> None:
     state.load_state(retain_empty_lobbies=args.retain_empty_lobbies)
     state.access.approval_wait_seconds = max(1, args.approval_wait_seconds)
     state.access.rate_limit_per_minute = max(0, args.auth_rate_limit)
-    if args.access_mode is not None or args.pin_ips is not None:
-        state.access.set_mode(args.access_mode, args.pin_ips)
+    if args.access_mode is not None or args.pin_ips is not None or args.identity_policy is not None:
+        state.access.set_mode(args.access_mode, args.pin_ips, args.identity_policy)
     logger.info("Access mode: %s%s", state.access.mode, " (IP pinning)" if state.access.pin_ips else "")
     state.ensure_default_lobby()
 
@@ -7287,6 +7415,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--access-mode", choices=list(ACCESS_MODES), default=None,
                         help="Who may log in: open (default), approve (unknown players wait for operator approval), "
                              "allowlist (approved players only). Overrides the mode saved in the state file.")
+    parser.add_argument("--identity-policy", choices=list(IDENTITY_POLICIES), default=None,
+                        help="Community identity keys (Authorization.communityKey, sent by OpenShim): optional "
+                             "(default; an id that registered a key must keep presenting it), required (every "
+                             "login needs a key), or off (ignore keys). Overrides the policy saved in the state file.")
     parser.add_argument("--pin-ips", action=argparse.BooleanOptionalAction, default=None,
                         help="Re-ask approval when an approved player connects from a new IP")
     parser.add_argument("--approval-wait-seconds", type=int, default=30,
