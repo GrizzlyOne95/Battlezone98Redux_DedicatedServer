@@ -72,8 +72,9 @@ this server.
    `mods\3686673790` folder to each PC: `<game>\mods\3686673790` on GOG, or
    `steamapps\workshop\content\301650\3686673790` on Steam. If the files differ, you get map or mod
    mismatches or desyncs.
-3. Launch the game. GOG copies work with or without Galaxy. Steam copies need Steam running,
-   because a Steam login without a ticket is rejected.
+3. Launch the game. GOG copies need GOG Galaxy running and signed in: the player's id is their
+   GOG Galaxy id, and without a Galaxy sign-in the game has no id to send. Steam copies need Steam
+   running, because a Steam login without a ticket is rejected.
 
 ## Playing
 
