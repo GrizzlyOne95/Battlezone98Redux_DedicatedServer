@@ -476,6 +476,14 @@ class ServerGUI:
             height=3,
             buttons=[("Unmute", lambda: self.act_selected(self.mutes_tree, "unmute"))],
         )
+        self.identities_tree = self.make_tree(
+            frame, "Protected identities (OpenShim community key)",
+            [("id", "User ID", 170), ("name", "Name", 170), ("registered", "Registered", 150), ("seen", "Last seen", 150), ("failed", "Wrong key", 80)],
+            height=3,
+            buttons=[("Reset", lambda: self.act_selected(
+                self.identities_tree, "resetIdentity",
+                confirm="Forget {n}'s key? Their next login with a key registers a new one."))],
+        )
         self.last_pending_count = 0
 
     # ---------- access actions ----------
@@ -557,6 +565,10 @@ class ServerGUI:
         self.fill_tree(self.mutes_tree, [
             (m["id"], (m["id"], m.get("name", ""), m.get("reason", ""), m.get("at", ""), m.get("expiresAt", "until unmuted")))
             for m in access.get("mutedIds", [])
+        ])
+        self.fill_tree(self.identities_tree, [
+            (i["id"], (i["id"], i.get("name", ""), i.get("registeredAt", ""), i.get("lastSeen", ""), i.get("failedAttempts", 0)))
+            for i in access.get("identities", [])
         ])
         waiting = sum(1 for p in access.get("pending", []) if p.get("waiting"))
         self.notebook.tab(self.access_frame, text=f"Access ({waiting} waiting)" if waiting else "Access")
