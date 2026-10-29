@@ -104,6 +104,7 @@ def main() -> None:
     ver = version()
     (PKG / "README.txt").write_text(README.format(version=ver), encoding="utf-8")
     shutil.copy2(HERE / "docs" / "LAN_COOP.md", PKG / "LAN_COOP.md")
+    shutil.copy2(HERE / "docs" / "LAN_DISCOVERY.md", PKG / "LAN_DISCOVERY.md")
 
     zip_path = DIST / f"{PKG_NAME}-{ver}.zip"
     zip_path.unlink(missing_ok=True)

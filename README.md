@@ -90,6 +90,10 @@ public address) and **Local** (`127.0.0.1`, a server on the same PC). That scree
 host, so it reaches a server on the default ports (TCP 1337, UDP 1338) only; on other ports
 players use `/bzrserver=`. The launcher shows the matching hint under the connect options.
 
+The LAN workstream adds opt-in `--lan-discovery` and an OpenShim-managed helper
+payload. See [LAN discovery and hosting](docs/LAN_DISCOVERY.md); existing server
+defaults keep discovery off.
+
 For three or more players who may need relay fallback, enable **Separate UDP port per peer pair**
 and choose an inclusive UDP range (the launcher suggests `1340`–`1369`). Allow/forward that entire
 range as well as the lobby/probe ports. Existing saved settings keep shared relay selected until

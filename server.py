@@ -28,6 +28,7 @@ import re
 import signal
 import socket
 import struct
+import sys
 import time
 import unicodedata
 import uuid
@@ -37,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from relay_impairment import PASS as IMPAIR_PASS, RelayImpairment, parse_spec as parse_impairment_spec
+from lan_discovery import DISCOVERY_PORT, LanDiscoveryProtocol, encoded_name
 
 websockets = None
 ConnectionClosed = Exception
@@ -7277,47 +7279,72 @@ async def run_server(args: argparse.Namespace) -> None:
         autosave_loop(stop_event, state, args.autosave_seconds, logger.getChild("autosave"))
     )
 
-    async with websockets.serve(
-        ws_server.handler,
-        args.ws_host,
-        args.ws_port,
-        ping_interval=20,
-        ping_timeout=30,
-        max_size=2**20,
-    ):
-        logger.info("WebSocket server listening on ws://%s:%d", args.ws_host, args.ws_port)
-        logger.info("UDP shim listening on %s:%d", args.udp_host, args.udp_port)
-        if relay_protocol is not None:
-            logger.info("UDP relay listening on %s:%d", args.relay_host, args.relay_port)
+    discovery_transport: asyncio.DatagramTransport | None = None
+    try:
+        async with websockets.serve(
+            ws_server.handler,
+            args.ws_host,
+            args.ws_port,
+            ping_interval=20,
+            ping_timeout=30,
+            max_size=2**20,
+        ):
+            # Advertise only after every game-facing listener is bound. In
+            # managed mode stdout is a parent/child readiness channel; ordinary
+            # service logs remain on stderr.
+            if getattr(args, "lan_discovery", False):
+                discovery_transport, _ = await loop.create_datagram_endpoint(
+                    lambda: LanDiscoveryProtocol(args.ws_port, args.lan_name),
+                    local_addr=(args.ws_host, args.lan_discovery_port),
+                    family=socket.AF_INET,
+                )
+                logger.info("LAN discovery listening on %s:%d", args.ws_host, args.lan_discovery_port)
+            logger.info("WebSocket server listening on ws://%s:%d", args.ws_host, args.ws_port)
+            logger.info("UDP shim listening on %s:%d", args.udp_host, args.udp_port)
+            if relay_protocol is not None:
+                logger.info("UDP relay listening on %s:%d", args.relay_host, args.relay_port)
+            if health_server:
+                logger.info("Health endpoint listening on http://%s:%d/health", args.health_host, args.health_port)
+            logger.info("Press Ctrl+C to stop.")
+            if getattr(args, "lan_managed", False):
+                sys.stdout.buffer.write(f"BZRLAN_READY {args.ws_port}\n".encode("ascii"))
+                sys.stdout.buffer.flush()
+            await stop_event.wait()
+    finally:
+        # Stop discovery before tearing down the advertised service. Also
+        # release these listeners if discovery/WS binding fails at startup.
+        if discovery_transport is not None:
+            discovery_transport.close()
+        state.save_state(force=True)
+        autosave_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await autosave_task
         if health_server:
-            logger.info("Health endpoint listening on http://%s:%d/health", args.health_host, args.health_port)
-        logger.info("Press Ctrl+C to stop.")
-        await stop_event.wait()
-
-    state.save_state(force=True)
-    autosave_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await autosave_task
-
-    if health_server:
-        health_server.close()
-        await health_server.wait_closed()
-
-    udp_transport.close()
-    if relay_transport is not None:
-        assert relay_protocol is not None
-        relay_protocol.close()
-    await asyncio.sleep(0.05)
-    if relay_protocol is not None and relay_protocol.trace_writer is not None:
-        relay_protocol.trace_writer.close()
-    if protocol_trace is not None:
-        protocol_trace.close()
+            health_server.close()
+            await health_server.wait_closed()
+        udp_transport.close()
+        if relay_transport is not None:
+            assert relay_protocol is not None
+            relay_protocol.close()
+        await asyncio.sleep(0.05)
+        if relay_protocol is not None and relay_protocol.trace_writer is not None:
+            relay_protocol.trace_writer.close()
+        if protocol_trace is not None:
+            protocol_trace.close()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Battlezone 98 Redux dedicated-server compatibility shim")
     parser.add_argument("--ws-host", default=DEFAULT_WS_HOST, help=f"WebSocket bind host (default: {DEFAULT_WS_HOST})")
     parser.add_argument("--ws-port", type=int, default=DEFAULT_WS_PORT, help=f"WebSocket bind port (default: {DEFAULT_WS_PORT})")
+    parser.add_argument("--lan-discovery", action="store_true",
+                        help="Advertise this lobby service to OpenShim LAN browsers (IPv4 local sources only; default off)")
+    parser.add_argument("--lan-discovery-port", type=int, default=DISCOVERY_PORT,
+                        help=f"LAN discovery UDP port (default: {DISCOVERY_PORT})")
+    parser.add_argument("--lan-name", default="Battlezone LAN",
+                        help="LAN browser label: 1-64 printable ASCII bytes")
+    parser.add_argument("--lan-managed", action="store_true",
+                        help="OpenShim helper: emit BZRLAN_READY after listeners are ready; requires discovery, stdin control, health disabled, explicit state file")
     parser.add_argument("--udp-host", default=DEFAULT_UDP_HOST, help=f"UDP bind host (default: {DEFAULT_UDP_HOST})")
     parser.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help=f"UDP bind port (default: {DEFAULT_UDP_PORT})")
     parser.add_argument("--relay-host", default=DEFAULT_RELAY_HOST, help=f"UDP relay bind host (default: {DEFAULT_RELAY_HOST})")
@@ -7436,10 +7463,22 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if (args.relay_pair_port_start, args.relay_pair_port_end) != (0, 0) and not (
             1 <= args.relay_pair_port_start <= args.relay_pair_port_end <= 65535):
         parser.error("relay pair port bounds must both be 0 (ephemeral) or an inclusive range within 1-65535")
+    if args.lan_discovery or args.lan_managed:
+        if not 1 <= args.ws_port <= 65534 or not 1 <= args.lan_discovery_port <= 65535:
+            parser.error("LAN websocket port must be 1-65534 and discovery port 1-65535")
+        try:
+            encoded_name(args.lan_name)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.lan_discovery_port in {args.udp_port, args.relay_port if not args.disable_relay else 0}:
+            parser.error("LAN discovery must use a separate UDP port")
+    if args.lan_managed and (not args.lan_discovery or not args.stdin_control or
+                             args.health_port != 0 or args.state_file == DEFAULT_STATE_FILE):
+        parser.error("--lan-managed requires --lan-discovery, --stdin-control, --health-port 0, and an explicit --state-file")
     return args
 
 

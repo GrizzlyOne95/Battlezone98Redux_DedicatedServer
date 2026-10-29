@@ -3,6 +3,12 @@
 How to play BZR multiplayer or Campaign Reimagined co-op on a home network, with one PC running
 this server.
 
+The OpenShim LAN workstream can discover a server started with
+`--lan-discovery --lan-name "My Battlezone LAN"`. See
+[LAN_DISCOVERY.md](LAN_DISCOVERY.md) for the helper payload, managed host
+lifecycle, wire contract, and validation limits. Ordinary server startup keeps
+discovery disabled.
+
 ## Server PC
 
 1. Start the server. It listens on every network interface by default:
