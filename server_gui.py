@@ -75,6 +75,9 @@ DEFAULTS = {
     "public_host": "",
 }
 PUBLIC_IP_URL = "https://api.ipify.org"
+MIN_DEFAULT_WIDTH = 1400  # wide enough that the connect panel's text wraps in few lines
+MAX_DEFAULT_HEIGHT = 950  # keep the default window inside a 1080p screen
+ACCESS_SYNC_HOLDOFF = 3.0  # seconds polls may not overwrite the access-mode combobox after a GUI change
 OPENSHIM_WS_PORT = 1337  # the only lobby port OpenShim's setup screen can reach
 ACCESS_CHOICES = {
     "Open (anyone)": "open",
@@ -137,6 +140,338 @@ def fmt_duration(seconds: int) -> str:
     return f"{h}:{m:02d}:{s:02d}"
 
 
+APP_TITLE = "BATTLEZONE 98 REDUX — DEDICATED SERVER"
+
+# ---------- theme (Battlezone vector-HUD: near-black olive, phosphor green, amber) ----------
+BG = "#0e110d"
+HEADER_BG = "#080a07"
+PANEL = "#151a13"
+FIELD = "#0a0d09"
+BORDER = "#2c3a28"
+FG = "#d4dbd0"
+MUTED = "#8a9686"
+GREEN = "#7cd36b"
+GREEN_DK = "#4caf50"
+AMBER = "#e0a030"
+RED = "#e5534b"
+GUI_BLUE = "#7fb2ff"
+SELECT_BG = "#27402a"
+FONT_FAMILY = "Segoe UI"
+MONO_FAMILY = "Consolas"
+TITLE_FAMILY = "Segoe UI"
+
+
+def apply_theme(root: tk.Misc) -> ttk.Style:
+    """Dark Battlezone look on the 'clam' base (vista/winnative cannot be recoloured)."""
+    global FONT_FAMILY, MONO_FAMILY, TITLE_FAMILY
+    from tkinter import font as tkfont
+
+    families = set(tkfont.families(root))
+    FONT_FAMILY = "Segoe UI" if "Segoe UI" in families else "TkDefaultFont"
+    MONO_FAMILY = "Consolas" if "Consolas" in families else "Courier"
+    TITLE_FAMILY = "Bahnschrift" if "Bahnschrift" in families else FONT_FAMILY
+    for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+        try:
+            tkfont.nametofont(name).configure(family=FONT_FAMILY if FONT_FAMILY != "TkDefaultFont" else "Arial", size=9)
+        except tk.TclError:
+            pass
+    root.configure(background=BG)
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    scale = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
+
+    style.configure(".", background=BG, foreground=FG, fieldbackground=FIELD, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, troughcolor=PANEL, focuscolor=GREEN_DK,
+                    selectbackground=SELECT_BG, selectforeground=FG, insertcolor=GREEN)
+    style.map(".", foreground=[("disabled", "#5d6959")])
+    style.configure("TFrame", background=BG)
+    style.configure("TLabel", background=BG, foreground=FG)
+    style.configure("Muted.TLabel", foreground=MUTED)
+    style.configure("Warn.TLabel", foreground=AMBER)
+    style.configure("BadgeWarn.TLabel", background=AMBER, foreground="#1a1200", font=(FONT_FAMILY, 10, "bold"))
+    style.configure("BadgeOk.TLabel", background="#2f7d32", foreground="#f2fff0", font=(FONT_FAMILY, 10, "bold"))
+    style.configure("Attn.TLabel", background=RED, foreground="#ffffff", font=(FONT_FAMILY, 10, "bold"))
+    style.configure("TLabelframe", background=BG, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+    style.configure("TLabelframe.Label", background=BG, foreground=GREEN, font=(FONT_FAMILY, 9, "bold"))
+
+    style.configure("TButton", background="#1d261b", foreground=FG, bordercolor=BORDER, lightcolor="#1d261b",
+                    darkcolor="#1d261b", padding=(10, 4), focusthickness=1, relief="flat")
+    style.map("TButton",
+              background=[("disabled", "#11150f"), ("pressed", "#0f1a0d"), ("active", "#2a3a27")],
+              foreground=[("disabled", "#4f594c"), ("active", GREEN)],
+              bordercolor=[("active", GREEN_DK), ("disabled", "#1c2319")],
+              lightcolor=[("pressed", "#0f1a0d"), ("active", "#2a3a27")],
+              darkcolor=[("pressed", "#0f1a0d"), ("active", "#2a3a27")])
+    for name, base, hover, down in (("Accent", "#2f7d32", "#3a9a3e", "#256428"),
+                                    ("Danger", "#8f2d2a", "#b03a36", "#6e211f")):
+        style.configure(f"{name}.TButton", background=base, foreground="#ffffff", bordercolor=base,
+                        lightcolor=base, darkcolor=base, font=(FONT_FAMILY, 9, "bold"), padding=(14, 5))
+        style.map(f"{name}.TButton",
+                  background=[("disabled", "#1a211a"), ("pressed", down), ("active", hover)],
+                  foreground=[("disabled", "#4f594c")],
+                  bordercolor=[("disabled", "#1a211a")],
+                  lightcolor=[("disabled", "#1a211a"), ("pressed", down), ("active", hover)],
+                  darkcolor=[("disabled", "#1a211a"), ("pressed", down), ("active", hover)])
+    style.configure("Flat.TButton", background=BG, foreground=GREEN, bordercolor=BG, lightcolor=BG,
+                    darkcolor=BG, padding=(2, 3))
+    style.map("Flat.TButton", background=[("active", PANEL)], lightcolor=[("active", PANEL)],
+              darkcolor=[("active", PANEL)], bordercolor=[("active", PANEL)])
+
+    # Locked settings (server running) stay readable: disabled + selected still draws green.
+    style.configure("TCheckbutton", background=BG, foreground=FG, indicatorbackground=FIELD,
+                    indicatorforeground=GREEN, indicatorcolor=FIELD, upperbordercolor=BORDER,
+                    lowerbordercolor=BORDER)
+    style.map("TCheckbutton",
+              background=[("active", BG)],
+              foreground=[("disabled", FG)],
+              indicatorbackground=[("disabled", "selected", "#2f7d32"), ("disabled", PANEL),
+                                   ("selected", "#2f7d32"), ("pressed", PANEL)],
+              indicatorcolor=[("disabled", "selected", "#2f7d32"), ("disabled", PANEL),
+                              ("selected", "#2f7d32"), ("pressed", PANEL)],
+              indicatorforeground=[("disabled", "selected", "#f2fff0"), ("selected", "#f2fff0")])
+
+    for widget in ("TEntry", "TSpinbox", "TCombobox"):
+        style.configure(widget, fieldbackground=FIELD, foreground=FG, insertcolor=GREEN, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, arrowcolor=GREEN, padding=3)
+        style.map(widget,
+                  fieldbackground=[("disabled", PANEL), ("readonly", PANEL if widget != "TCombobox" else FIELD)],
+                  foreground=[("disabled", MUTED), ("readonly", FG)],
+                  bordercolor=[("focus", GREEN_DK)],
+                  arrowcolor=[("disabled", "#4f594c")],
+                  selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", FG)])
+    style.configure("TSpinbox", arrowsize=int(12 * scale))
+    style.configure("TCombobox", arrowsize=int(14 * scale))
+    root.option_add("*TCombobox*Listbox.background", FIELD)
+    root.option_add("*TCombobox*Listbox.foreground", FG)
+    root.option_add("*TCombobox*Listbox.selectBackground", SELECT_BG)
+    root.option_add("*TCombobox*Listbox.selectForeground", GREEN)
+
+    style.configure("TNotebook", background=BG, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                    tabmargins=(2, 4, 2, 0))
+    style.configure("TNotebook.Tab", background=PANEL, foreground=MUTED, padding=(16, 6),
+                    bordercolor=BORDER, lightcolor=PANEL, darkcolor=PANEL, font=(FONT_FAMILY, 9, "bold"))
+    style.map("TNotebook.Tab",
+              background=[("selected", SELECT_BG), ("active", "#1d261b")],
+              foreground=[("selected", GREEN), ("active", FG)],
+              lightcolor=[("selected", GREEN_DK)], bordercolor=[("selected", GREEN_DK)],
+              padding=[("selected", (16, 8))], expand=[("selected", (0, 0, 0, 2))])
+
+    style.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=FG, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, rowheight=int(22 * scale))
+    style.map("Treeview", background=[("selected", SELECT_BG)], foreground=[("selected", GREEN)])
+    style.configure("Treeview.Heading", background=PANEL, foreground=GREEN, bordercolor=BORDER,
+                    lightcolor=PANEL, darkcolor=PANEL, relief="flat", font=(FONT_FAMILY, 9, "bold"), padding=(6, 4))
+    style.map("Treeview.Heading", background=[("active", "#1d261b")])
+
+    for orient in ("Vertical", "Horizontal"):
+        style.configure(f"{orient}.TScrollbar", background="#2a3527", troughcolor=PANEL, bordercolor=PANEL,
+                        lightcolor="#2a3527", darkcolor="#2a3527", arrowcolor=GREEN)
+        style.map(f"{orient}.TScrollbar", background=[("active", "#3b5236"), ("pressed", GREEN_DK)],
+                  lightcolor=[("active", "#3b5236")], darkcolor=[("active", "#3b5236")])
+    return style
+
+
+# ---------- pure helpers (unit-tested) ----------
+def clean_host(text: str) -> str:
+    """Bare host from a pasted address: strips scheme, path and port."""
+    host = text.strip()
+    for prefix in ("ws://", "http://", "https://"):
+        if host.lower().startswith(prefix):
+            host = host[len(prefix):]
+    return host.split("/")[0].split(":")[0]
+
+
+def access_badge(mode: str) -> tuple[str, str]:
+    """(badge text, style level) for an access mode id ('open'/'approve'/'allowlist') or its label."""
+    mode = ACCESS_CHOICES.get(mode, mode)
+    label = next((k for k, v in ACCESS_CHOICES.items() if v == mode), "Open (anyone)")
+    if mode not in ACCESS_CHOICES.values():
+        mode = "open"
+    return f"Access: {label}", ("warn" if mode == "open" else "ok")
+
+
+def pending_texts(count: int) -> tuple[str, str]:
+    """(Access tab label, Server panel banner) for N players waiting for approval."""
+    if count <= 0:
+        return "Access", ""
+    noun = "player" if count == 1 else "players"
+    return f"Access ({count} pending)", f"{count} {noun} waiting for approval → Access tab"
+
+
+def tcp_probe(host: str, port: int, timeout: float = 3.0) -> dict:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return {"ok": True, "error": ""}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc) or exc.__class__.__name__}
+
+
+def mask_command(cmd: list[str]) -> list[str]:
+    """Copy of cmd with the admin key hidden, for logging."""
+    out = []
+    for i, a in enumerate(cmd):
+        if i > 0 and cmd[i - 1] == "--admin-key":
+            out.append("***")
+        elif a.startswith("--admin-key="):
+            out.append("--admin-key=***")
+        else:
+            out.append(a)
+    return out
+
+
+def reachability_report(f: dict) -> list[tuple[str, str]]:
+    """Turn a dict of facts into [(level, message)]; level is ok / warn / error / info.
+
+    Keys (all optional): running, bind, pair_enabled, pair_start, pair_end, public_ip, ws_port,
+    tcp ({'ok': bool, 'error': str} or None), status (the /status dict or None).
+    """
+    out: list[tuple[str, str]] = []
+    running = bool(f.get("running"))
+    ws = f.get("ws_port", 1337)
+    out.append(("ok", "Server is running.") if running else ("error", "Server is not running. Press Start first."))
+
+    bind = str(f.get("bind", ""))
+    if bind.startswith("127."):
+        out.append(("error", "Listening on 127.0.0.1 only: nobody else can connect. Set 'Listen on' to All interfaces."))
+    else:
+        out.append(("ok", f"Listening on all interfaces ({bind or '0.0.0.0'})."))
+
+    start, end = int(f.get("pair_start") or 0), int(f.get("pair_end") or 0)
+    if not f.get("pair_enabled"):
+        out.append(("warn", "Pair mode is off: only one relayed peer per player. Turn it on for 3+ players."))
+    elif start <= 0 or end < start:
+        out.append(("warn", "Pair mode is on but no fixed UDP range is set; ephemeral ports only work on this PC."))
+    else:
+        out.append(("ok", f"Pair mode on, UDP range {start}-{end} ({end - start + 1} ports): forward this range too."))
+
+    ip = str(f.get("public_ip") or "").strip()
+    tcp = f.get("tcp")
+    if not ip:
+        out.append(("warn", "Public IP unknown. Press Detect (or enter your DDNS name) first."))
+    elif tcp is None:
+        out.append(("info", f"Public address {ip}: TCP test skipped (server not running)."))
+    elif tcp.get("ok"):
+        out.append(("ok", f"TCP {ip}:{ws} connected: reachable (or your router does hairpin NAT)."))
+    else:
+        out.append(("warn", (
+            f"TCP {ip}:{ws} failed ({tcp.get('error', 'no answer')}). From inside the LAN this is inconclusive: "
+            "many routers don't support hairpin NAT. Ask a friend to run "
+            f"Test-NetConnection {ip} -Port {ws}, or use an online port checker.")))
+
+    status = f.get("status")
+    if running and not status:
+        out.append(("warn", "Could not read /status from the local status port."))
+    elif status:
+        relay = status.get("relay") or {}
+        if not relay.get("enabled", True):
+            out.append(("warn", "Relay is disabled in the server, so UDP traffic is never relayed."))
+        else:
+            out.append(("info", f"Relay packets: {relay.get('packetsRxTotal', 0)} in / {relay.get('packetsTxTotal', 0)} out."))
+            rng = relay.get("pairPortRange")
+            out.append(("info", f"pairPortRange: {rng[0]}-{rng[1]}" if rng else "pairPortRange: none (shared relay)"))
+            for key, level, hint in (
+                ("pairPortAllocationFailuresTotal", "error", "range exhausted or ports busy/blocked"),
+                ("ambiguousDropsTotal", "warn", "enable pair mode with an open UDP range"),
+                ("unmappedDropsTotal", "warn", "packets from unknown senders"),
+            ):
+                n = relay.get(key)
+                if n is None:
+                    continue
+                out.append((level if n else "ok", f"{key}: {n}" + (f" ({hint})" if n else "")))
+    out.append(("info", "UDP can't be tested from inside. When a friend connects, the log shows 'UDP RX' from their public IP."))
+    return out
+
+
+# ---------- setup guide (tag, text) ----------
+# Tags: h1/h2 headings, p body, b bold, li bullet, code = selectable command (gets a Copy button).
+GUIDE: list[tuple[str, str]] = [
+    ("h1", "Setup guide: LAN and internet play\n"),
+    ("p", "Follow the numbered steps. Select any text, or use the Copy buttons next to commands.\n"),
+
+    ("h2", "1. Start the server\n"),
+    ("p", "Tick "), ("b", "Separate UDP port per peer pair"), ("p", ", set the range "), ("b", "1340"), ("p", " through "),
+    ("b", "1369"), ("p", ", set "), ("b", "Listen on"), ("p", " to All interfaces, pick a state file, then press "),
+    ("b", "Start"), ("p", ".\n"),
+
+    ("h2", "2. Find this PC's LAN IP\n"),
+    ("p", "It is shown under \"Players connect with\" (or run ipconfig). Give this PC a DHCP address reservation in the "
+          "router so it never changes. TP-Link: Advanced > Network > DHCP Server > Address Reservation.\n"),
+
+    ("h2", "3. Windows Firewall\n"),
+    ("p", "In an administrator PowerShell. The network profile must be Private.\n"),
+    ("code", 'New-NetFirewallRule -DisplayName "BZR server TCP" -Direction Inbound -Protocol TCP -LocalPort 1337 -Action Allow -Profile Private'),
+    ("code", 'New-NetFirewallRule -DisplayName "BZR server UDP" -Direction Inbound -Protocol UDP -LocalPort 1338-1369 -Action Allow -Profile Private'),
+    ("p", "Match the UDP range to your pair-port range.\n"),
+
+    ("h2", "4. LAN players: launch option\n"),
+    ("p", "Use exactly (with ws://, the port and the trailing slash):\n"),
+    ("code", "/bzrserver=ws://<LAN-IP>:1337/"),
+    ("li", "Steam: Properties > Launch Options.\n"),
+    ("li", "GOG Galaxy: Manage installation > Configure > Additional executables, or a desktop shortcut.\n"),
+    ("li", "OpenShim players: Multiplayer setup screen > Custom (or net.ini [OpenShimSocket] "
+           "MatchmakingRedirectAddress=<IP>, IP only).\n"),
+    ("p", "Use the LAN IP even on the server PC, not 127.0.0.1.\n"),
+
+    ("h2", "5. Same mods, launcher running\n"),
+    ("p", "Everyone runs the same mod builds. GOG needs GOG Galaxy running and signed in; Steam needs Steam running.\n"),
+
+    ("h2", "6. Playing\n"),
+    ("p", "Multiplayer > Internet > Create Game / Join Game; the host clicks Launch when everyone is in. Match the map's "
+          "player count (for example Tapping The Core is 2 players). CR co-op needs everyone to start together.\n"),
+
+    ("h2", "7. Over the internet\n"),
+    ("li", "(a) The router's WAN IP must equal your public IP (press Detect). If not, you are behind CGNAT: use Tailscale.\n"),
+    ("li", "(b) Port-forward TCP 1337 and UDP 1338-1369 to this PC's LAN IP, same port numbers. TP-Link: Advanced > "
+           "NAT Forwarding > Port Forwarding > Add, choose Port Range for UDP. "),
+    ("b", "NEVER forward 8080"), ("p", " (the status/admin page).\n"),
+    ("li", "(c) Send friends the Internet line:\n"), ("code", "/bzrserver=ws://<public-ip>:1337/"),
+    ("p", "People in your house keep the LAN line.\n"),
+    ("li", "(d) Set Access to \"Approve new players\" or \"Allowlist\" before friends connect. The server can't verify "
+           "Steam/GOG tickets, so anyone who finds the port can claim any ID. Consider disabling the forwards between sessions.\n"),
+
+    ("h2", "8. Verify\n"),
+    ("li", "Press \"Check internet reachability\".\n"),
+    ("li", "From outside, a friend runs:\n"),
+    ("code", "Test-NetConnection <public-ip> -Port 1337"),
+    ("li", "The log shows UDP RX from the friend's IP, and relay packet counts rise in a game.\n"),
+    ("li", "If stuck connecting, check pairPortRange / pairPortAllocationFailuresTotal / ambiguousDropsTotal / "
+           "unmappedDropsTotal on:\n"),
+    ("code", "http://127.0.0.1:8080/status"),
+
+    ("h2", "9. Alternative: Tailscale\n"),
+    ("p", "Everyone joins your tailnet and uses the Tailscale/VPN address shown in \"Players connect with\". No port "
+          "forwarding, and it works behind CGNAT.\n"),
+
+    ("h2", "10. Troubleshooting\n"),
+    ("li", "Lobby list empty / connection failed: server running? IP and launch option exact? Network profile Private? "
+           "Test-NetConnection to 1337.\n"),
+    ("li", "Stale full game listed: restart the server.\n"),
+    ("li", "Stuck after Launch / desync: UDP 1338-1369 blocked, pair range exhausted, or mod files differ.\n"),
+    ("li", "Disconnected at login: the client is still pointed at the official servers.\n"),
+    ("li", "Pair ports needed: n(n-1)/2 per fully relayed lobby (4 players = 6). The 30-port range is shared across lobbies.\n"),
+]
+
+
+def render_guide(text: tk.Text, segments: list[tuple[str, str]], copy) -> None:
+    """Fill a Text widget from GUIDE segments, then make it read-only (still selectable)."""
+    text.tag_configure("h1", font=(TITLE_FAMILY, 15, "bold"), foreground=GREEN, spacing3=6)
+    text.tag_configure("h2", font=(FONT_FAMILY, 11, "bold"), foreground=AMBER, spacing1=10, spacing3=2)
+    text.tag_configure("p", foreground=FG)
+    text.tag_configure("b", font=(FONT_FAMILY, 10, "bold"), foreground=GREEN)
+    text.tag_configure("li", foreground=FG, lmargin1=18, lmargin2=34)
+    text.tag_configure("code", font=(MONO_FAMILY, 10), foreground=GREEN, background="#162015",
+                       lmargin1=34, lmargin2=34, spacing1=3, spacing3=3)
+    text.configure(state="normal")
+    for tag, value in segments:
+        text.insert("end", value, tag)
+        if tag == "code":
+            btn = ttk.Button(text, text="Copy", width=6, command=lambda v=value: copy(v))
+            text.insert("end", "  ")
+            text.window_create("end", window=btn)
+            text.insert("end", "\n")
+    text.configure(state="disabled")
+
+
 class ServerGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -146,23 +481,26 @@ class ServerGUI:
         self.poll_lock = threading.Lock()
         self.stopping = False
         self.started_at = 0.0
+        self._access_dirty_until = 0.0
 
         root.title("BZR Dedicated Server")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self.first_run = not CONFIG_FILE.exists()
         self.cfg = dict(DEFAULTS)
         self.cfg.update(self.load_config())
         self.vars: dict[str, tk.Variable] = {}
         self.build_ui()
         # Size from content so Windows display scaling never pushes the tabs off-screen.
         root.update_idletasks()
-        w = min(root.winfo_reqwidth() + 16, root.winfo_screenwidth() - 40)
-        h = min(root.winfo_reqheight() + 16, root.winfo_screenheight() - 80)
+        w = min(max(root.winfo_reqwidth() + 16, MIN_DEFAULT_WIDTH), root.winfo_screenwidth() - 40)
+        h = min(root.winfo_reqheight() + 16, root.winfo_screenheight() - 80, MAX_DEFAULT_HEIGHT)
         root.geometry(f"{w}x{h}")
         root.minsize(min(w, root.winfo_reqwidth()), min(h, root.winfo_reqheight()))
         for key in ("ws_port", "udp_port", "relay_port", "relay_pair_ports", "relay_pair_port_start",
                     "relay_pair_port_end", "bind", "public_host"):
             self.vars[key].trace_add("write", lambda *_: self.update_switch())
+        self.update_access_badge()
         self.refresh_buttons()
 
         threading.Thread(target=self.poll_loop, name="poll", daemon=True).start()
@@ -178,7 +516,10 @@ class ServerGUI:
     def save_config(self) -> None:
         data = {}
         for key, var in self.vars.items():
-            value = var.get()
+            try:
+                value = var.get()
+            except tk.TclError:  # blank/invalid spinbox: keep the previous saved value
+                continue
             if key == "bind":
                 value = BIND_CHOICES.get(value, value)
             elif key == "access_mode":
@@ -192,113 +533,137 @@ class ServerGUI:
 
     # ---------- layout ----------
     def build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=8)
+        outer = ttk.Frame(self.root)
         outer.pack(fill="both", expand=True)
 
-        top = ttk.Frame(outer)
-        top.pack(fill="x")
+        header = tk.Frame(outer, bg=HEADER_BG)
+        header.pack(fill="x")
+        tk.Label(header, text=APP_TITLE, bg=HEADER_BG, fg=GREEN, anchor="w",
+                 font=(TITLE_FAMILY, 15, "bold")).pack(side="left", padx=14, pady=8)
+        tk.Label(header, text="LAN / internet lobby + UDP relay", bg=HEADER_BG, fg=MUTED,
+                 font=(FONT_FAMILY, 9)).pack(side="right", padx=14)
+        tk.Frame(outer, height=2, bg=GREEN_DK).pack(fill="x")
 
-        left = ttk.Frame(top)
-        left.pack(side="left", fill="both", expand=True)
-        settings = ttk.LabelFrame(left, text="Settings", padding=8)
-        settings.pack(fill="x")
-        self.settings_frame = settings
+        body = ttk.Frame(outer, padding=8)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=0)  # settings: fixed width
+        body.columnconfigure(1, weight=1)  # tabs + log take the rest
+        body.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="ns")
+        self.settings_frame = left
+        self.settings_hint = ttk.Label(left, text="", style="Warn.TLabel")
+        self.settings_hint.pack(fill="x", pady=(0, 4))
 
         def var(key: str, kind=tk.StringVar):
             v = kind(value=self.cfg.get(key, DEFAULTS[key]))
             self.vars[key] = v
             return v
 
-        row = 0
+        def group(title: str) -> ttk.LabelFrame:
+            g = ttk.LabelFrame(left, text=title, padding=8)
+            g.pack(fill="x", pady=(0, 8))
+            return g
 
-        def label(text: str, r: int, c: int = 0) -> None:
-            ttk.Label(settings, text=text).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=2)
+        def label(parent: tk.Widget, text: str, r: int, c: int = 0) -> None:
+            ttk.Label(parent, text=text).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=2)
 
-        label("Listen on", row)
+        def spin(parent: tk.Widget, key: str, r: int, c: int, lo: int = 1, hi: int = 65535) -> None:
+            ttk.Spinbox(parent, from_=lo, to=hi, textvariable=var(key, tk.IntVar), width=7).grid(row=r, column=c, sticky="w", pady=2)
+
+        # Network / ports
+        net = group("Network / ports")
+        label(net, "Listen on", 0)
         bind_label = next((k for k, v in BIND_CHOICES.items() if v == self.cfg.get("bind")), self.cfg.get("bind"))
         bind_var = tk.StringVar(value=bind_label)
         self.vars["bind"] = bind_var
-        ttk.Combobox(settings, textvariable=bind_var, values=list(BIND_CHOICES), width=30).grid(
-            row=row, column=1, columnspan=3, sticky="we", pady=2
-        )
-        row += 1
+        ttk.Combobox(net, textvariable=bind_var, values=list(BIND_CHOICES), width=30).grid(
+            row=0, column=1, columnspan=3, sticky="w", pady=2)
+        label(net, "Lobby TCP", 1)
+        spin(net, "ws_port", 1, 1)
+        label(net, "Handshake UDP", 1, 2)
+        spin(net, "udp_port", 1, 3)
+        label(net, "Status port", 2)
+        spin(net, "health_port", 2, 1, lo=0)
 
-        label("Lobby TCP", row)
-        ttk.Spinbox(settings, from_=1, to=65535, textvariable=var("ws_port", tk.IntVar), width=7).grid(row=row, column=1, sticky="w")
-        label("Handshake UDP", row, 2)
-        ttk.Spinbox(settings, from_=1, to=65535, textvariable=var("udp_port", tk.IntVar), width=7).grid(row=row, column=3, sticky="w")
-        row += 1
+        # Relay
+        rel = group("Relay")
+        ttk.Checkbutton(rel, text="Relay enabled", variable=var("relay_enabled", tk.BooleanVar)).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        label(rel, "Relay UDP", 0, 2)
+        spin(rel, "relay_port", 0, 3)
+        ttk.Checkbutton(rel, text="Separate UDP port per peer pair (3+ relayed players)",
+                        variable=var("relay_pair_ports", tk.BooleanVar)).grid(row=1, column=0, columnspan=4, sticky="w")
+        label(rel, "Pair UDP from", 2)
+        spin(rel, "relay_pair_port_start", 2, 1, lo=0)
+        label(rel, "through", 2, 2)
+        spin(rel, "relay_pair_port_end", 2, 3, lo=0)
 
-        label("Relay UDP", row)
-        ttk.Spinbox(settings, from_=1, to=65535, textvariable=var("relay_port", tk.IntVar), width=7).grid(row=row, column=1, sticky="w")
-        ttk.Checkbutton(settings, text="Relay enabled", variable=var("relay_enabled", tk.BooleanVar)).grid(row=row, column=2, columnspan=2, sticky="w")
-        row += 1
-
-        ttk.Checkbutton(settings, text="Separate UDP port per peer pair (3+ relayed players)",
-                        variable=var("relay_pair_ports", tk.BooleanVar)).grid(row=row, column=0, columnspan=4, sticky="w")
-        row += 1
-        label("Pair UDP from", row)
-        ttk.Spinbox(settings, from_=0, to=65535, textvariable=var("relay_pair_port_start", tk.IntVar), width=7).grid(row=row, column=1, sticky="w")
-        label("through", row, 2)
-        ttk.Spinbox(settings, from_=0, to=65535, textvariable=var("relay_pair_port_end", tk.IntVar), width=7).grid(row=row, column=3, sticky="w")
-        row += 1
-
-        label("Status port", row)
-        ttk.Spinbox(settings, from_=0, to=65535, textvariable=var("health_port", tk.IntVar), width=7).grid(row=row, column=1, sticky="w")
-        label("Max lobbies", row, 2)
-        ttk.Spinbox(settings, from_=1, to=100000, textvariable=var("max_lobbies", tk.IntVar), width=7).grid(row=row, column=3, sticky="w")
-        row += 1
-
-        label("State file", row)
-        sf = ttk.Frame(settings)
-        sf.grid(row=row, column=1, columnspan=3, sticky="we")
-        ttk.Entry(sf, textvariable=var("state_file")).pack(side="left", fill="x", expand=True)
+        # Server / state
+        srv = group("Server / state")
+        label(srv, "State file", 0)
+        sf = ttk.Frame(srv)
+        sf.grid(row=0, column=1, columnspan=3, sticky="w")
+        ttk.Entry(sf, textvariable=var("state_file"), width=30).pack(side="left")
         ttk.Button(sf, text="…", width=3, command=self.browse_state).pack(side="left", padx=(4, 0))
-        row += 1
+        label(srv, "Max lobbies", 1)
+        spin(srv, "max_lobbies", 1, 1, hi=100000)
+        ttk.Checkbutton(srv, text="Keep empty lobbies", variable=var("retain_empty_lobbies", tk.BooleanVar)).grid(
+            row=1, column=2, columnspan=2, sticky="w")
 
-        label("MOTD", row)
-        ttk.Entry(settings, textvariable=var("motd")).grid(row=row, column=1, columnspan=3, sticky="we", pady=2)
-        row += 1
+        # Logging / privacy
+        logg = group("Logging")
+        label(logg, "Log level", 0)
+        ttk.Combobox(logg, textvariable=var("log_level"), values=["DEBUG", "INFO", "WARNING", "ERROR"],
+                     width=9, state="readonly").grid(row=0, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(logg, text="Hide player IPs outside their game",
+                        variable=var("redact_addresses", tk.BooleanVar)).grid(row=1, column=0, columnspan=4, sticky="w")
 
-        label("Admin key", row)
-        ttk.Entry(settings, textvariable=var("admin_key"), show="•").grid(row=row, column=1, sticky="we", pady=2)
-        label("Admin IDs", row, 2)
-        ttk.Entry(settings, textvariable=var("admin_ids"), width=16).grid(row=row, column=3, sticky="we", pady=2)
-        row += 1
-
-        label("Log level", row)
-        ttk.Combobox(settings, textvariable=var("log_level"), values=["DEBUG", "INFO", "WARNING", "ERROR"], width=9, state="readonly").grid(row=row, column=1, sticky="w")
-        ttk.Checkbutton(settings, text="Keep empty lobbies", variable=var("retain_empty_lobbies", tk.BooleanVar)).grid(row=row, column=2, columnspan=2, sticky="w")
-        row += 1
-        ttk.Checkbutton(settings, text="Hide player IPs outside their game", variable=var("redact_addresses", tk.BooleanVar)).grid(row=row, column=2, columnspan=2, sticky="w")
-        row += 1
-
+        # Advanced (collapsed by default)
+        adv_box = ttk.Frame(left)
+        adv_box.pack(fill="x")
+        self.adv_open = False
+        self.adv_toggle = ttk.Button(adv_box, text="▸ Advanced", command=self.toggle_advanced, style="Flat.TButton")
+        self.adv_toggle.pack(anchor="w")
+        self.adv_frame = ttk.Frame(adv_box, padding=(0, 4, 0, 0))
+        label(self.adv_frame, "Admin key", 0)
+        ttk.Entry(self.adv_frame, textvariable=var("admin_key"), show="•", width=30).grid(row=0, column=1, sticky="w", pady=2)
+        label(self.adv_frame, "Admin IDs", 1)
+        ttk.Entry(self.adv_frame, textvariable=var("admin_ids"), width=30).grid(row=1, column=1, sticky="w", pady=2)
+        label(self.adv_frame, "MOTD", 2)
+        ttk.Entry(self.adv_frame, textvariable=var("motd"), width=30).grid(row=2, column=1, sticky="w", pady=2)
         python_var = var("python")
+        nxt = 3
         if not FROZEN:
-            label("Python", row)
-            pf = ttk.Frame(settings)
-            pf.grid(row=row, column=1, columnspan=3, sticky="we")
-            ttk.Entry(pf, textvariable=python_var).pack(side="left", fill="x", expand=True)
+            label(self.adv_frame, "Python", nxt)
+            pf = ttk.Frame(self.adv_frame)
+            pf.grid(row=nxt, column=1, sticky="w")
+            ttk.Entry(pf, textvariable=python_var, width=26).pack(side="left")
             ttk.Button(pf, text="…", width=3, command=self.browse_python).pack(side="left", padx=(4, 0))
-            row += 1
+            nxt += 1
+        label(self.adv_frame, "Extra args", nxt)
+        ttk.Entry(self.adv_frame, textvariable=var("extra_args"), width=30).grid(row=nxt, column=1, sticky="w", pady=2)
 
-        label("Extra args", row)
-        ttk.Entry(settings, textvariable=var("extra_args")).grid(row=row, column=1, columnspan=3, sticky="we", pady=2)
-        settings.columnconfigure(1, weight=1)
-        settings.columnconfigure(3, weight=1)
+        # Right: controls + live + connect info above, tabs below.
+        right = ttk.Frame(body, padding=(10, 0, 0, 0))
+        right.grid(row=0, column=1, sticky="nsew")
+        top = ttk.Frame(right)
+        top.pack(fill="x")
+        top.columnconfigure(2, weight=1)
 
-        # Right column: controls + live status.
-        right = ttk.Frame(top, padding=(8, 0, 0, 0))
-        right.pack(side="left", fill="y")
-
-        controls = ttk.LabelFrame(right, text="Server", padding=8)
-        controls.pack(fill="x")
-        self.state_label = ttk.Label(controls, text="Stopped", font=("Segoe UI", 12, "bold"), foreground="#a33")
+        controls = ttk.LabelFrame(top, text="Server", padding=8)
+        controls.grid(row=0, column=0, sticky="nsew")
+        self.state_label = ttk.Label(controls, text="Stopped", font=(FONT_FAMILY, 12, "bold"), foreground=RED)
         self.state_label.pack(anchor="w")
+        self.access_badge = ttk.Label(controls, text="", style="BadgeWarn.TLabel", padding=(8, 2))
+        self.access_badge.pack(anchor="w", pady=(4, 0))
+        self.pending_banner = ttk.Label(controls, text="", style="Attn.TLabel", padding=(8, 3), cursor="hand2")
+        self.pending_banner.bind("<Button-1>", lambda _e: self.show_access_tab())
         btns = ttk.Frame(controls)
-        btns.pack(fill="x", pady=(6, 0))
-        self.start_btn = ttk.Button(btns, text="Start", command=self.start)
-        self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop)
+        btns.pack(fill="x", pady=(8, 0))
+        self.start_btn = ttk.Button(btns, text="Start", command=self.start, style="Accent.TButton")
+        self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop, style="Danger.TButton")
         self.restart_btn = ttk.Button(btns, text="Restart", command=self.restart)
         for b in (self.start_btn, self.stop_btn, self.restart_btn):
             b.pack(side="left", padx=(0, 4))
@@ -307,8 +672,8 @@ class ServerGUI:
         ttk.Button(btns2, text="Status page", command=self.open_status).pack(side="left", padx=(0, 4))
         ttk.Button(btns2, text="State folder", command=self.open_state_folder).pack(side="left")
 
-        stats = ttk.LabelFrame(right, text="Live", padding=8)
-        stats.pack(fill="x", pady=(8, 0))
+        stats = ttk.LabelFrame(top, text="Live", padding=8)
+        stats.grid(row=0, column=1, sticky="nsew", padx=8)
         self.stat_vars: dict[str, tk.StringVar] = {}
         for i, (key, text) in enumerate(
             [
@@ -320,14 +685,13 @@ class ServerGUI:
                 ("relaypk", "Relay packets"),
             ]
         ):
-            ttk.Label(stats, text=text).grid(row=i, column=0, sticky="w", padx=(0, 10))
+            ttk.Label(stats, text=text, style="Muted.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 10))
             v = tk.StringVar(value="–")
             self.stat_vars[key] = v
             ttk.Label(stats, textvariable=v).grid(row=i, column=1, sticky="w")
 
-        # Under the settings: what players put in their launch options.
-        conn = ttk.LabelFrame(left, text="Players connect with", padding=8)
-        conn.pack(fill="x", pady=(8, 0))
+        conn = ttk.LabelFrame(top, text="Players connect with", padding=8)
+        conn.grid(row=0, column=2, sticky="nsew")
         conn.columnconfigure(1, weight=1)
         self.lan_var = tk.StringVar()
         self.switch_var = tk.StringVar()
@@ -338,8 +702,9 @@ class ServerGUI:
         ttk.Label(conn, text="LAN").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Entry(conn, textvariable=self.switch_var, state="readonly").grid(row=0, column=1, columnspan=2, sticky="we")
         ttk.Button(conn, text="Copy", width=6, command=self.copy_switch).grid(row=0, column=3, padx=(4, 0))
-        ttk.Label(conn, textvariable=self.lan_var, foreground="#666").grid(row=1, column=1, columnspan=3, sticky="w")
-        self.port_warn = ttk.Label(conn, foreground="#b80")
+        self.lan_var_label = ttk.Label(conn, textvariable=self.lan_var, style="Muted.TLabel", wraplength=430, justify="left")
+        self.lan_var_label.grid(row=1, column=1, columnspan=3, sticky="we")
+        self.port_warn = ttk.Label(conn, style="Warn.TLabel")
         self.port_warn.grid(row=2, column=1, columnspan=3, sticky="w")
 
         ttk.Label(conn, text="Internet").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
@@ -348,18 +713,41 @@ class ServerGUI:
         self.detect_btn.grid(row=3, column=2, padx=(4, 0), pady=(6, 0))
         ttk.Entry(conn, textvariable=self.wan_switch_var, state="readonly").grid(row=4, column=1, columnspan=2, sticky="we", pady=(2, 0))
         ttk.Button(conn, text="Copy", width=6, command=self.copy_wan_switch).grid(row=4, column=3, padx=(4, 0), pady=(2, 0))
-        self.wan_note = ttk.Label(conn, foreground="#666", wraplength=520, justify="left")
-        self.wan_note.grid(row=5, column=1, columnspan=3, sticky="w")
-        self.openshim_note = ttk.Label(conn, foreground="#666", wraplength=520, justify="left")
-        self.openshim_note.grid(row=6, column=1, columnspan=3, sticky="w", pady=(6, 0))
+        self.wan_note = ttk.Label(conn, style="Muted.TLabel", wraplength=430, justify="left")
+        self.wan_note.grid(row=5, column=1, columnspan=3, sticky="we")
+        self.openshim_note = ttk.Label(conn, style="Muted.TLabel", wraplength=430, justify="left")
+        self.openshim_note.grid(row=6, column=1, columnspan=3, sticky="we", pady=(6, 0))
+        wrapped = (self.lan_var_label, self.wan_note, self.openshim_note)
+
+        def _rewrap(event: tk.Event) -> None:
+            wl = max(200, event.width - 90)
+            for lbl in wrapped:
+                lbl.configure(wraplength=wl)
+        conn.bind("<Configure>", _rewrap)
+        self.diag_btn = ttk.Button(conn, text="Check internet reachability", command=self.check_reachability)
+        self.diag_btn.grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        diag_frame = ttk.Frame(conn)
+        diag_frame.grid(row=8, column=0, columnspan=4, sticky="we", pady=(4, 0))
+        diag_frame.columnconfigure(0, weight=1)
+        self.diag_text = tk.Text(diag_frame, height=6, width=1, wrap="word", font=(MONO_FAMILY, 9), state="disabled",
+                                 background=FIELD, foreground=FG, relief="flat", borderwidth=0, padx=6, pady=4)
+        diag_scroll = ttk.Scrollbar(diag_frame, orient="vertical", command=self.diag_text.yview)
+        self.diag_text.configure(yscrollcommand=diag_scroll.set)
+        self.diag_text.grid(row=0, column=0, sticky="we")
+        diag_scroll.grid(row=0, column=1, sticky="ns")
+        for tag, colour in (("ok", GREEN), ("warn", AMBER), ("error", RED), ("info", MUTED)):
+            self.diag_text.tag_configure(tag, foreground=colour)
         self.update_lan()
 
-        # Bottom: tabs.
-        nb = ttk.Notebook(outer)
+        # Tabs.
+        nb = ttk.Notebook(right)
         nb.pack(fill="both", expand=True, pady=(8, 0))
+        self.notebook = nb
 
         log_frame = ttk.Frame(nb)
-        self.log_text = tk.Text(log_frame, wrap="none", height=12, font=("Consolas", 9), state="disabled", background="#111", foreground="#ddd", insertbackground="#ddd")
+        self.log_text = tk.Text(log_frame, wrap="none", height=12, font=(MONO_FAMILY, 9), state="disabled",
+                                background=FIELD, foreground=FG, insertbackground=GREEN, relief="flat",
+                                selectbackground=SELECT_BG)
         ys = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         xs = ttk.Scrollbar(log_frame, orient="horizontal", command=self.log_text.xview)
         self.log_text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -368,15 +756,17 @@ class ServerGUI:
         xs.grid(row=1, column=0, sticky="ew")
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
-        self.log_text.tag_configure("warn", foreground="#e6c35c")
-        self.log_text.tag_configure("error", foreground="#ff6b6b")
-        self.log_text.tag_configure("gui", foreground="#7fb2ff")
+        self.log_text.tag_configure("warn", foreground=AMBER)
+        self.log_text.tag_configure("error", foreground=RED)
+        self.log_text.tag_configure("gui", foreground=GUI_BLUE)
         lb = ttk.Frame(log_frame)
         lb.grid(row=2, column=0, columnspan=2, sticky="ew", pady=2)
         self.autoscroll = tk.BooleanVar(value=True)
         ttk.Checkbutton(lb, text="Auto-scroll", variable=self.autoscroll).pack(side="left")
         ttk.Button(lb, text="Clear", command=self.clear_log).pack(side="left", padx=4)
         nb.add(log_frame, text="Log")
+
+        self.build_guide_tab(nb)
 
         self.lobby_tree = self.make_tree(
             nb, "Lobbies",
@@ -395,6 +785,44 @@ class ServerGUI:
             ],
         )
         self.build_access_tab(nb)
+        if self.first_run:
+            nb.select(self.guide_frame)
+
+    def toggle_advanced(self) -> None:
+        self.adv_open = not self.adv_open
+        if self.adv_open:
+            self.adv_frame.pack(fill="x", pady=(4, 0))
+        else:
+            self.adv_frame.pack_forget()
+        self.adv_toggle.configure(text="▾ Advanced" if self.adv_open else "▸ Advanced")
+        # Grow the window (within the screen) so the expanded fields are not clipped.
+        self.root.update_idletasks()
+        short = self.settings_frame.winfo_reqheight() - self.settings_frame.winfo_height()
+        if short > 0:
+            self.root.geometry(f"{self.root.winfo_width()}x{min(self.root.winfo_height() + short, self.root.winfo_screenheight() - 80)}")
+
+    def show_access_tab(self) -> None:
+        self.notebook.select(self.access_frame)
+
+    def build_guide_tab(self, nb: ttk.Notebook) -> None:
+        frame = ttk.Frame(nb)
+        self.guide_frame = frame
+        text = tk.Text(frame, wrap="word", height=12, font=(FONT_FAMILY, 10), background=FIELD, foreground=FG,
+                       relief="flat", padx=14, pady=10, cursor="arrow", selectbackground=SELECT_BG,
+                       spacing1=2, spacing3=2)
+        ys = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=ys.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        render_guide(text, GUIDE, self.copy_text)
+        self.guide_text = text
+        nb.add(frame, text="Setup Guide")
+
+    def copy_text(self, value: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(value)
 
     def make_tree(self, parent: tk.Widget, title: str, cols: list[tuple[str, str, int]], *,
                   buttons: list | None = None, height: int = 8) -> ttk.Treeview:
@@ -424,7 +852,6 @@ class ServerGUI:
     def build_access_tab(self, nb: ttk.Notebook) -> None:
         frame = ttk.Frame(nb, padding=4)
         nb.add(frame, text="Access")
-        self.notebook = nb
         self.access_frame = frame
         top = ttk.Frame(frame)
         top.pack(fill="x", pady=(0, 4))
@@ -439,7 +866,7 @@ class ServerGUI:
         self.vars["pin_ips"] = self.pin_var
         ttk.Checkbutton(top, text="Re-approve players who connect from a new IP", variable=self.pin_var,
                         command=self.apply_access_settings).pack(side="left")
-        ttk.Label(frame, foreground="#666", wraplength=900, justify="left", text=(
+        ttk.Label(frame, style="Muted.TLabel", wraplength=900, justify="left", text=(
             "Players are recognised by the ID their game reports. Steam/GOG logins cannot be verified without "
             "the publisher's keys, so this keeps strangers out but cannot stop someone copying a friend's public "
             "Steam ID. In Approve mode an unknown player's login waits here for 30 s; approve later and their "
@@ -490,8 +917,13 @@ class ServerGUI:
     def apply_access_settings(self) -> None:
         mode = ACCESS_CHOICES.get(self.access_mode_var.get(), "open")
         self.cfg["access_mode"], self.cfg["pin_ips"] = mode, bool(self.pin_var.get())
-        self.save_config()
+        self.update_access_badge()
+        try:
+            self.save_config()
+        except tk.TclError as exc:
+            self.append_log(f"[gui] could not save settings: {exc}\n")
         if self.running():
+            self._access_dirty_until = time.time() + ACCESS_SYNC_HOLDOFF
             self.post_access({"action": "set", "mode": mode, "pinIps": bool(self.pin_var.get())})
 
     def act_selected(self, tree: ttk.Treeview, action: str, confirm: str = "", **extra) -> None:
@@ -549,33 +981,51 @@ class ServerGUI:
         self.fill_tree(self.pending_tree, [
             (p["id"], (p["id"], p.get("name", ""), p.get("ip", ""), p.get("reason", ""),
                        p.get("since", "") + ("" if p.get("waiting") else "  (refused, will retry)")))
-            for p in access.get("pending", [])
+            for p in access.get("pending", []) if p.get("id")
         ])
         self.fill_tree(self.approved_tree, [
             (a["id"], (a["id"], a.get("name", ""), ", ".join(a.get("ips", [])), a.get("lastSeen", ""), a.get("approvedAt", "")))
-            for a in access.get("approved", [])
+            for a in access.get("approved", []) if a.get("id")
         ])
         self.fill_tree(self.bans_tree, [
             (f"id:{b['id']}", (b["id"], "ID", b.get("name", ""), b.get("reason", ""), b.get("at", ""), b.get("expiresAt", "never")))
-            for b in access.get("bannedIds", [])
+            for b in access.get("bannedIds", []) if b.get("id")
         ] + [
             (f"ip:{b['ip']}", (b["ip"], "IP", b.get("name", ""), b.get("reason", ""), b.get("at", ""), b.get("expiresAt", "never")))
-            for b in access.get("bannedIps", [])
+            for b in access.get("bannedIps", []) if b.get("ip")
         ])
         self.fill_tree(self.mutes_tree, [
             (m["id"], (m["id"], m.get("name", ""), m.get("reason", ""), m.get("at", ""), m.get("expiresAt", "until unmuted")))
-            for m in access.get("mutedIds", [])
+            for m in access.get("mutedIds", []) if m.get("id")
         ])
         self.fill_tree(self.identities_tree, [
             (i["id"], (i["id"], i.get("name", ""), i.get("registeredAt", ""), i.get("lastSeen", ""), i.get("failedAttempts", 0)))
-            for i in access.get("identities", [])
+            for i in access.get("identities", []) if i.get("id")
         ])
+        live_mode = access.get("mode")
+        if live_mode in ACCESS_CHOICES.values() and time.time() >= self._access_dirty_until:
+            self.access_mode_var.set(next(k for k, v in ACCESS_CHOICES.items() if v == live_mode))
+        self.update_access_badge()
         waiting = sum(1 for p in access.get("pending", []) if p.get("waiting"))
-        self.notebook.tab(self.access_frame, text=f"Access ({waiting} waiting)" if waiting else "Access")
+        self.show_pending(waiting)
         if waiting > self.last_pending_count:
             self.root.bell()
             self.append_log(f"[gui] {waiting} player(s) waiting for approval (Access tab)\n", "gui")
         self.last_pending_count = waiting
+
+    def update_access_badge(self) -> None:
+        text, level = access_badge(self.access_mode_var.get())
+        self.access_badge.configure(text=text, style="BadgeWarn.TLabel" if level == "warn" else "BadgeOk.TLabel")
+
+    def show_pending(self, waiting: int) -> None:
+        tab_text, banner = pending_texts(waiting)
+        self.notebook.tab(self.access_frame, text=tab_text)
+        if banner:
+            self.pending_banner.configure(text=banner)
+            if not self.pending_banner.winfo_manager():
+                self.pending_banner.pack(anchor="w", pady=(6, 0), after=self.access_badge)
+        else:
+            self.pending_banner.pack_forget()
 
     # ---------- actions ----------
     def browse_state(self) -> None:
@@ -652,7 +1102,7 @@ class ServerGUI:
         state_dir =Path(self.vars["state_file"].get()).expanduser().parent
         state_dir.mkdir(parents=True, exist_ok=True)
 
-        shown = [("***" if i > 0 and cmd[i - 1] == "--admin-key" else a) for i, a in enumerate(cmd)]
+        shown = mask_command(cmd)
         self.append_log("[gui] " + subprocess.list2cmdline(shown) + "\n", "gui")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
@@ -780,11 +1230,7 @@ class ServerGUI:
             else f"OpenShim's setup screen only reaches lobby port {OPENSHIM_WS_PORT} with UDP {OPENSHIM_WS_PORT + 1}; "
                  "on these ports players must use the launch option."
         )
-        host = self.public_var.get().strip()
-        for prefix in ("ws://", "http://", "https://"):
-            if host.lower().startswith(prefix):
-                host = host[len(prefix):]
-        host = host.split("/")[0].split(":")[0]
+        host = clean_host(self.public_var.get())
         self.wan_switch_var.set(f"/bzrserver=ws://{host}:{ws}/" if host else "enter or detect the public address")
         try:
             relay = int(self.vars["relay_port"].get())
@@ -870,20 +1316,98 @@ class ServerGUI:
         self.restart_btn.state(["!disabled"] if running and not self.stopping else ["disabled"])
         for child in self.settings_frame.winfo_children():
             self.set_enabled(child, not running)
+        self.settings_hint.configure(text="Stop the server to change settings" if running else "")
         if self.stopping and running:
-            self.state_label.configure(text="Stopping…", foreground="#b80")
+            self.state_label.configure(text="Stopping…", foreground=AMBER)
         elif running:
-            self.state_label.configure(text=f"Running  (PID {self.proc.pid})", foreground="#2a7")
+            self.state_label.configure(text=f"Running  (PID {self.proc.pid})", foreground=GREEN)
         else:
-            self.state_label.configure(text="Stopped", foreground="#a33")
+            self.state_label.configure(text="Stopped", foreground=RED)
 
     def set_enabled(self, widget: tk.Widget, enabled: bool) -> None:
+        """Lock/unlock a settings widget. Locked inputs are read-only (not greyed out) so the
+        values stay legible; checkbuttons use the themed disabled+selected look."""
+        if widget is self.adv_toggle:
+            return
         try:
-            widget.state(["!disabled"] if enabled else ["disabled"])  # type: ignore[attr-defined]
+            if isinstance(widget, ttk.Entry):  # also Combobox and Spinbox
+                if enabled:
+                    free = getattr(widget, "_free_state", None)
+                    if free:
+                        widget.configure(state=free)
+                    rng = getattr(widget, "_free_range", None)
+                    if rng:
+                        widget.configure(from_=rng[0], to=rng[1])
+                        del widget._free_range  # type: ignore[attr-defined]
+                else:
+                    if not hasattr(widget, "_free_state") or str(widget.cget("state")) != "readonly":
+                        widget._free_state = str(widget.cget("state"))  # type: ignore[attr-defined]
+                    widget.configure(state="readonly")
+                    if isinstance(widget, ttk.Spinbox) and not hasattr(widget, "_free_range"):
+                        # readonly Spinbox arrows still step the value; pin the range to the current value.
+                        widget._free_range = (widget.cget("from"), widget.cget("to"))  # type: ignore[attr-defined]
+                        try:
+                            cur = float(widget.get() or widget._free_range[0])  # type: ignore[attr-defined]
+                            widget.configure(from_=cur, to=cur)
+                        except ValueError:
+                            pass
+            elif isinstance(widget, (ttk.Checkbutton, ttk.Button)):
+                widget.state(["!disabled"] if enabled else ["disabled"])
         except (AttributeError, tk.TclError):
             pass
         for child in widget.winfo_children():
             self.set_enabled(child, enabled)
+
+    # ---------- reachability check ----------
+    def check_reachability(self) -> None:
+        def num(key: str) -> int:
+            try:
+                return int(self.vars[key].get())
+            except (tk.TclError, ValueError):
+                return 0
+
+        facts = {
+            "running": self.running(),
+            "bind": BIND_CHOICES.get(self.vars["bind"].get(), self.vars["bind"].get()).strip(),
+            "pair_enabled": bool(self.vars["relay_pair_ports"].get()),
+            "pair_start": num("relay_pair_port_start"),
+            "pair_end": num("relay_pair_port_end"),
+            "public_ip": clean_host(self.public_var.get()),
+            "ws_port": num("ws_port"),
+        }
+        health = num("health_port")
+        self.diag_btn.state(["disabled"])
+        self.show_diag([("info", "Checking…")])
+
+        def _work() -> None:
+            try:
+                if facts["running"] and facts["public_ip"]:
+                    facts["tcp"] = tcp_probe(facts["public_ip"], facts["ws_port"], 3.0)
+                if facts["running"] and health:
+                    try:
+                        facts["status"] = self.fetch(health, "/status")
+                    except Exception:
+                        facts["status"] = None
+                findings = reachability_report(facts)
+            except Exception as exc:  # never leave the button disabled
+                findings = [("error", f"Check failed: {exc}")]
+            for level, msg in findings:
+                self.log_queue.put(f"[gui] reachability [{level}] {msg}\n")
+            self.root.after(0, lambda: self._diag_done(findings))
+
+        threading.Thread(target=_work, name="reachability", daemon=True).start()
+
+    def _diag_done(self, findings: list[tuple[str, str]]) -> None:
+        self.diag_btn.state(["!disabled"])
+        self.show_diag(findings)
+
+    def show_diag(self, findings: list[tuple[str, str]]) -> None:
+        marks = {"ok": "[ OK ]", "warn": "[WARN]", "error": "[FAIL]", "info": "[ .. ]"}
+        self.diag_text.configure(state="normal")
+        self.diag_text.delete("1.0", "end")
+        for level, msg in findings:
+            self.diag_text.insert("end", f"{marks.get(level, '')} {msg}\n", level)
+        self.diag_text.configure(state="disabled")
 
     # ---------- polling ----------
     def poll_loop(self) -> None:
@@ -935,9 +1459,9 @@ class ServerGUI:
             v.set("–")
         self.lobby_tree.delete(*self.lobby_tree.get_children())
         self.user_tree.delete(*self.user_tree.get_children())
-        for tree in (self.pending_tree, self.approved_tree, self.bans_tree):
+        for tree in (self.pending_tree, self.approved_tree, self.bans_tree, self.mutes_tree, self.identities_tree):
             tree.delete(*tree.get_children())
-        self.notebook.tab(self.access_frame, text="Access")
+        self.show_pending(0)
         self.last_pending_count = 0
 
     def show_live(self, result: dict) -> None:
@@ -1004,9 +1528,7 @@ def main() -> None:
     except Exception:
         pass
     root = tk.Tk()
-    style = ttk.Style(root)
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
+    apply_theme(root)
     ServerGUI(root)
     root.mainloop()
 
