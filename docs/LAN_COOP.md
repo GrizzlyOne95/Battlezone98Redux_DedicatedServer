@@ -59,13 +59,7 @@ this server.
      `/bzrserver=192.168.0.44` connects to nothing. The server launcher shows the line ready to copy.
      The game sends its UDP handshake to the same IP on the lobby port + 1 (1338), so keep the
      server's default ports.
-   - **OpenShim v1.0.0.9 or newer.** In the game folder, edit `net.ini`. Under `[OpenShimSocket]`, set:
-
-     ```
-     MatchmakingRedirectAddress=192.168.0.44
-     ```
-
-     Enter the IP only. Ports are fixed, and any value containing `/` is ignored.
+   - **OpenShim:** In the game's **Multiplayer setup** screen, choose **Custom** and enter this PC's LAN IP, or choose **Local** if the game runs on the server PC. The setup screen uses the default TCP 1337 / UDP 1338 ports; use the full `/bzrserver=` launch option above for nonstandard ports.
 
    Use the LAN IP on the server PC as well, not `127.0.0.1`.
 2. Every PC must run the **same build** of each mod in use. For CR, copy the server PC's
@@ -84,8 +78,7 @@ this server.
 3. The host clicks **Launch** once everyone is in. CR co-op missions need everyone to start
    together: a player who joins late means restarting the mission.
 
-To go back to official online play, remove the `/bzrserver=` launch option, or clear
-`MatchmakingRedirectAddress=` in `net.ini`.
+To go back to official online play, remove the `/bzrserver=` launch option, or select **Rebellion** in OpenShim's Multiplayer setup screen.
 
 ## Over the internet (untested)
 
@@ -121,7 +114,7 @@ CGNAT, and the game sees it as a LAN.
 
 | Symptom | Check |
 | --- | --- |
-| Lobby list empty or "connection failed" | The server is running; the IP in the launch option or `net.ini` is right (launch option needs the full `ws://IP:1337/`); the network is Private; `Test-NetConnection 192.168.0.44 -Port 1337` from the client PC succeeds |
+| Lobby list empty or "connection failed" | The server is running; the IP in the launch option or OpenShim Custom server setting is right (launch option needs the full `ws://IP:1337/`); the network is Private; `Test-NetConnection 192.168.0.44 -Port 1337` from the client PC succeeds |
 | Old full game with the same name listed | Restart the server (memberless game lobbies are dropped on load) |
 | Stuck in the lobby after Launch, or desync | UDP 1338–1339 or the configured pair-port range is blocked, the range is exhausted, shared relay has ambiguous routes, or mod files differ between PCs |
-| Disconnected right at login | The client is still pointed at the official servers (launch option missing, `net.ini` not saved, or an old OpenShim) |
+| Disconnected right at login | The client is still pointed at the official servers (launch option missing, or OpenShim still set to Rebellion) |
