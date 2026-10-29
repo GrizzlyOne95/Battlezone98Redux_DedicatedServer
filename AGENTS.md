@@ -18,8 +18,8 @@ Dedicated-server and protocol research for Battlezone 98 Redux BZRNet — WebSoc
 - Do not commit secrets (`.env`, Steam API keys, admin keys), live `data/server_state.json`, raw captures with real IPs/tokens, or transient `__pycache__`.
 
 ## Task-Specific Guidance
-- Protocol work: keep fixtures sanitized — use RFC 5737 / RFC 3849 blocks for addresses; see `README.md:116` and `API.Tests/Fixtures/Protocol/` conventions from `BZ1-GameWatcher` when cross-referencing.
-- Do not deserialise opaque relay payloads (`7a75`, `0x5f` etc.) in the relay path — forward byte-for-byte (`README.md:173`).
+- Protocol work: keep fixtures sanitized — use RFC 5737 / RFC 3849 blocks for addresses; see `PROTOCOL_CONTRACT_MATRIX.md` and `API.Tests/Fixtures/Protocol/` conventions from `BZ1-GameWatcher` when cross-referencing.
+- Do not deserialise opaque relay payloads (`7a75`, `0x5f` etc.) in the relay path — forward byte-for-byte (see `BZRNET_MULTIPLAYER_SERVER_GUIDE.md`).
 - For capture/consensus workflows, prefer `run_capture_consensus_workflow.py` / `protocol_parity_test.py` over manual pcap edits.
 
 ## GPT-6 Astra Optimization (Prompting Best Practices)
