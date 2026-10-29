@@ -136,7 +136,7 @@ def main() -> None:
     (destination / "manifest.json").write_text(json.dumps({
         "format": 1, "revision": revision, "dirty": dirty, "architecture": "win32", "discoveryProtocol": "BZRLAN1",
         "sha256": hashlib.sha256(raw).hexdigest(),
-        "bundledRuntime": notices["versions"], "licenseSha256": notice_hashes,
+        "bundledRuntime": notices["versions"], "licenses": notice_hashes,
     }, indent=2) + "\n", encoding="utf-8")
     output = HERE / "dist" / "OpenShimLAN.zip"
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
