@@ -38,6 +38,14 @@ manifest, this guide, and the project license. Extract that layout into the game
 root for OpenShim. Python is not needed on the player's PC. The existing general
 `build_package.py` launcher package remains separate.
 
+The payload also carries `tools/lan/licenses/python/LICENSE.txt`, the selected
+websockets distribution's license under `licenses/websockets/`, and PyInstaller's
+licensing terms (including its bootloader exception) under `licenses/pyinstaller/`.
+The builder copies these documents byte-for-byte from the selected x86 runtime
+and package metadata, fails if a required notice is absent, and records their
+hashes and runtime versions in the manifest. Keep this licenses subtree with
+the helper when staging or distributing it.
+
 For an already prepared portable x86 environment containing PyInstaller and
 the required websockets version, add `--existing-environment`. That path creates
 no venv and installs no packages. It supports keeping build tools entirely under
