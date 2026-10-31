@@ -58,6 +58,8 @@ Steam players need Steam running; GOG players must be signed into GOG Galaxy so 
 
 See [LAN/co-op setup](docs/LAN_COOP.md) for the full checklist.
 
+Optional LAN discovery (`--lan-discovery`, off by default) lets OpenShim browsers find a server on the local network; see [LAN discovery and hosting](docs/LAN_DISCOVERY.md). With a specific `--ws-host <ip>` on Windows it may not receive broadcasts; use `0.0.0.0` for discovery.
+
 ## Networking
 
 | Port | Protocol | Purpose |
@@ -91,7 +93,7 @@ With the server running, check its local status at `http://127.0.0.1:8080/health
 python smoke_test.py
 ```
 
-Additional checks: `python stock_client_compat_test.py`, `python protocol_parity_test.py`, and `python server_gui_test.py`. These do not replace testing with real players across different networks.
+Additional checks: `python stock_client_compat_test.py`, `python protocol_parity_test.py`, and `python server_gui_test.py`. `python lan_discovery_test.py` is a manual test (no CI runs it). These do not replace testing with real players across different networks.
 
 More detail lives in dedicated documents:
 
