@@ -13,6 +13,10 @@ The advertised lobby port is `--ws-port`, including a nondefault port.
 `--lan-discovery-port` exists for isolated tests or explicit configurations;
 ordinary OpenShim browsers use 21337.
 
+Limitation: because the responder binds the `--ws-host` address, a specific
+`--ws-host <ip>` on Windows may not receive broadcast queries. Use
+`--ws-host 0.0.0.0` when LAN browsers need to discover the server.
+
 Discovery defaults to **off**. It replies only to RFC 1918, loopback, and IPv4
 link-local sources, and sends each reply to the UDP source address and port.
 It never advertises an arbitrary address from a packet. There are per-source

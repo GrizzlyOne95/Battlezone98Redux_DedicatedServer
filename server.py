@@ -7307,6 +7307,8 @@ async def run_server(args: argparse.Namespace) -> None:
                 logger.info("Health endpoint listening on http://%s:%d/health", args.health_host, args.health_port)
             logger.info("Press Ctrl+C to stop.")
             if getattr(args, "lan_managed", False):
+                # Coupled with the OpenShim shim, which accepts only the literal
+                # "BZRLAN_READY 1337"; keep this in sync if the port handling changes.
                 sys.stdout.buffer.write(f"BZRLAN_READY {args.ws_port}\n".encode("ascii"))
                 sys.stdout.buffer.flush()
             await stop_event.wait()
