@@ -120,7 +120,9 @@ def main() -> None:
     destination.mkdir(parents=True, exist_ok=True)
     run([str(python), "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--console",
          "--name", "BZRServer", "--distpath", str(destination), "--workpath", str(build / "freeze"),
-         "--specpath", str(build), "--collect-submodules", "websockets", str(HERE / "server.py")])
+         "--specpath", str(build), "--collect-submodules", "websockets",
+         # Headless helper: leave out the launcher window that server.py --gui can open.
+         "--exclude-module", "server_gui", "--exclude-module", "tkinter", str(HERE / "server.py")])
     exe = destination / "BZRServer.exe"
     # Check the produced PE, not just the interpreter selected above.
     raw = exe.read_bytes()

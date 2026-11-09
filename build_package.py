@@ -1,68 +1,57 @@
 #!/usr/bin/env python3
-"""Build the standalone Windows package (no Python needed on the target PC).
+"""Build the one-file Windows server (no Python needed on the target PC).
 
     python build_package.py
 
-Creates build/venv with websockets + PyInstaller, freezes two executables, and
-zips them with the operator docs:
+Creates build/venv with websockets + PyInstaller and freezes one executable:
 
-    dist/BZRDedicatedServer/
-        BZRServerGUI.exe   launcher window (server_gui.py)
-        BZRServer.exe      the server itself (server.py); also usable headless
-        README.txt
-        LAN_COOP.md
-    dist/BZRDedicatedServer-<version>.zip
+    dist/BZRDedicatedServer.exe   double-click: launcher window
+                                  with arguments: headless server (--help)
+    dist/RELEASE_NOTES.md         quick start, used as the GitHub release text
+
+The release workflow (.github/workflows/release.yml) runs this on a v* tag and
+attaches the exe to the GitHub release.
 """
 
 from __future__ import annotations
 
-import shutil
+import os
 import subprocess
 import sys
 import venv
-import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BUILD = HERE / "build"
 VENV = BUILD / "venv"
 DIST = HERE / "dist"
-PKG_NAME = "BZRDedicatedServer"
-PKG = DIST / PKG_NAME
+EXE_NAME = "BZRDedicatedServer"
+REPO_URL = "https://github.com/GrizzlyOne95/Battlezone98Redux_DedicatedServer"
 
-README = """\
-Battlezone 98 Redux Dedicated Server
-=====================================
+NOTES = f"""\
+## Quick start
 
-Double-click BZRServerGUI.exe, check the settings, and press Start.
-Keep BZRServerGUI.exe and BZRServer.exe in the same folder.
+1. Download **{EXE_NAME}.exe** below and put it in its own folder (settings and
+   `data\\server_state.json` are saved next to it).
+2. Double-click it, check the **Setup Guide** tab, and press **Start**.
+   Windows asks to allow it through the firewall the first time: allow Private networks.
+3. Players with OpenShim pick **Custom** on the Multiplayer setup screen and type
+   this PC's address. Without OpenShim they use the launch option the window shows
+   (Copy option), e.g. `/bzrserver=ws://192.168.0.44:1337/`.
 
-Players point their game at this PC with the launch option shown in the
-window (Copy option), for example:
-    /bzrserver=ws://192.168.0.44:1337/
-Type it in full (ws://, port and trailing /); a bare IP does not work.
-Remove it to go back to the official servers.
-Players with OpenShim need no launch option: on the Multiplayer setup
-screen they pick Custom and type this PC's address, or Local when the game
-runs on the same PC as the server. That screen only reaches the default
-ports, so leave TCP 1337 / UDP 1338 for them.
-Ports: TCP 1337 (lobby), UDP 1338 (handshake), UDP 1339 (relay).
-For three or more relayed players, enable Separate UDP port per peer pair
-and allow/forward its UDP range (1340-1369 by default). Four fully relayed
-players use six ports; the 30-port pool is shared across all active lobbies.
-Windows will ask to allow BZRServer.exe through the firewall the first
-time; allow it on Private networks. See LAN_COOP.md for setting up the
-game PCs to use this server.
+Ports: TCP 1337 (lobby), UDP 1338 (handshake), UDP 1339 (relay); with
+*Separate UDP port per peer pair* also UDP 1340-1369. Forward them for internet play.
 
-Settings are saved in server_gui.json next to the exe. The default state
-file is data\\server_state.json in this folder.
+Headless (no window), e.g. as a service or in a terminal:
 
-Headless (no window):
-    BZRServer.exe --state-file data\\server_state.json
-    BZRServer.exe --help        lists every option
-Status page while running: http://127.0.0.1:8080/status
+    {EXE_NAME}.exe --state-file data\\server_state.json
+    {EXE_NAME}.exe --help
+    {EXE_NAME}.exe --headless     (default settings, no window)
 
-Build: {version}
+Status page while running: http://127.0.0.1:8080/status.
+Game PC setup: [LAN co-op guide]({REPO_URL}/blob/main/docs/LAN_COOP.md).
+
+Build: {{version}}
 """
 
 
@@ -74,7 +63,7 @@ def run(cmd: list[str], **kw) -> None:
 def version() -> str:
     try:
         out = subprocess.run(
-            ["git", "describe", "--always", "--dirty"], cwd=HERE, capture_output=True, text=True, check=True
+            ["git", "describe", "--tags", "--always", "--dirty"], cwd=HERE, capture_output=True, text=True, check=True
         )
         return out.stdout.strip()
     except (OSError, subprocess.CalledProcessError):
@@ -88,30 +77,24 @@ def main() -> None:
     if not py.exists():
         print(f"Creating {VENV}")
         venv.EnvBuilder(with_pip=True).create(VENV)
-    run([str(py), "-m", "pip", "install", "-q", "-r", str(HERE / "requirements.txt"), "pyinstaller"])
+    run([str(py), "-m", "pip", "install", "-q", "-r", str(HERE / "requirements.txt"), "pyinstaller>=6.10,<7"])
 
-    if PKG.exists():
-        shutil.rmtree(PKG)
-    PKG.mkdir(parents=True)
+    DIST.mkdir(exist_ok=True)
+    exe = DIST / f"{EXE_NAME}.exe"
+    exe.unlink(missing_ok=True)
     work = BUILD / "pyinstaller"
-    common = ["--noconfirm", "--clean", "--onefile", "--distpath", str(PKG), "--workpath", str(work), "--specpath", str(work)]
-
-    # server.py imports websockets lazily inside run_server(), so name it explicitly.
-    run([str(py), "-m", "PyInstaller", *common, "--console", "--name", "BZRServer",
-         "--collect-submodules", "websockets", str(HERE / "server.py")])
-    run([str(py), "-m", "PyInstaller", *common, "--windowed", "--name", "BZRServerGUI", str(HERE / "server_gui.py")])
+    # Console exe so the headless mode prints to a terminal; on a double-click
+    # the window reopens itself detached so that console closes. server.py imports websockets inside
+    # run_server() and server_gui only for --gui, so name both explicitly.
+    run([str(py), "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--console",
+         "--name", EXE_NAME, "--distpath", str(DIST), "--workpath", str(work), "--specpath", str(work),
+         "--collect-submodules", "websockets", "--hidden-import", "server_gui", str(HERE / "server.py")])
 
     ver = version()
-    (PKG / "README.txt").write_text(README.format(version=ver), encoding="utf-8")
-    shutil.copy2(HERE / "docs" / "LAN_COOP.md", PKG / "LAN_COOP.md")
-    shutil.copy2(HERE / "docs" / "LAN_DISCOVERY.md", PKG / "LAN_DISCOVERY.md")
-
-    zip_path = DIST / f"{PKG_NAME}-{ver}.zip"
-    zip_path.unlink(missing_ok=True)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in sorted(PKG.rglob("*")):
-            zf.write(f, Path(PKG_NAME) / f.relative_to(PKG))
-    print(f"\nPackage: {PKG}\nZip:     {zip_path} ({zip_path.stat().st_size / 1e6:.1f} MB)")
+    (DIST / "RELEASE_NOTES.md").write_text(NOTES.format(version=ver), encoding="utf-8")
+    print(f"\nExe: {exe} ({exe.stat().st_size / 1e6:.1f} MB), build {ver}")
+    # Smoke check: the frozen exe parses its arguments headless.
+    run([str(exe), "--help"], stdout=subprocess.DEVNULL, env=dict(os.environ, PYTHONIOENCODING="utf-8"))
 
 
 if __name__ == "__main__":

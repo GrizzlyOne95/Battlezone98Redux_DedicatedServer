@@ -5,9 +5,11 @@ Starts/stops server.py as a child process, shows its log, and polls the local
 health port (/status, /lobbies) for players and lobbies. Uses only the standard
 library (tkinter), so it runs with any Python that can run server.py.
 
-    python server_gui.py        (or pythonw server_gui.py for no console)
+    python server.py --gui      (or pythonw server.py --gui for no console;
+                                 python server_gui.py also works)
 
-Settings are saved to server_gui.json next to this file.
+The packaged BZRDedicatedServer.exe opens this window when double-clicked.
+Settings are saved to server_gui.json next to this file (or the exe).
 """
 
 from __future__ import annotations
@@ -27,9 +29,10 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 FROZEN = getattr(sys, "frozen", False)
-# Packaged build (build_package.py): BZRServerGUI.exe runs BZRServer.exe beside it.
+# Packaged build (build_package.py): one exe holds both the window and the
+# server, so the window starts another copy of itself with server arguments.
 HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
-SERVER_SCRIPT = HERE / ("BZRServer.exe" if FROZEN else "server.py")
+SERVER_SCRIPT = Path(sys.executable).resolve() if FROZEN else HERE / "server.py"
 CONFIG_FILE = HERE / "server_gui.json"
 POLL_SECONDS = 2.0
 MAX_LOG_LINES = 5000
@@ -1106,6 +1109,10 @@ class ServerGUI:
         self.append_log("[gui] " + subprocess.list2cmdline(shown) + "\n", "gui")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+        # Let the packaged server reuse this window's onefile extraction (it lives
+        # no longer than the window) instead of unpacking a new copy on every Start.
+        env.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+        env.pop("BZR_GUI_RELAUNCHED", None)
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=str(HERE), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1176,7 +1183,7 @@ class ServerGUI:
                 proc.wait(timeout=8)
             except subprocess.TimeoutExpired:
                 self.log_queue.put("[gui] server did not stop in time; killing it\n")
-                proc.kill()
+                kill_tree(proc)
                 proc.wait()
             if then:
                 self.root.after(0, then)
@@ -1514,13 +1521,50 @@ class ServerGUI:
             self.root.destroy()
 
 
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the server and its children: the packaged exe is a onefile
+    bootloader whose child process is the actual server."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    proc.kill()
+
+
+def relaunch_without_console() -> bool:
+    """Reopen the window detached from a console it got by a double-click.
+
+    The packaged exe is a console program so it can also run headless in a
+    terminal. Started from Explorer it gets a console of its own, shared only
+    by the onefile bootloader and this process (Windows Terminal may host it,
+    so it cannot simply be hidden). Start a detached copy and let this one
+    exit, which closes that console. Started from a terminal, keep it.
+    """
+    # The relaunched copy has a console of its own too (hidden), so it must not
+    # relaunch again.
+    if os.name != "nt" or os.environ.get("BZR_GUI_RELAUNCHED"):
+        return False
+    try:
+        import ctypes
+        procs = (ctypes.c_uint32 * 4)()
+        if not 0 < ctypes.windll.kernel32.GetConsoleProcessList(procs, 4) <= 2:
+            return False
+        # CREATE_NO_WINDOW: the copy and its onefile child share a hidden console.
+        # DETACHED_PROCESS would make the child open a new visible one.
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        # Fresh onefile extraction: this process's temp dir goes when it exits.
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1", BZR_GUI_RELAUNCHED="1")
+        subprocess.Popen([sys.executable, "--gui"], cwd=str(HERE), env=env, creationflags=flags,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
-    if not SERVER_SCRIPT.exists():
-        msg = f"{SERVER_SCRIPT.name} not found in {HERE}"
-        if FROZEN:
-            tk.Tk().withdraw()
-            messagebox.showerror("BZR Dedicated Server", msg + "\n\nKeep both exe files in the same folder.")
-        raise SystemExit(msg)
+    if not FROZEN and not SERVER_SCRIPT.exists():
+        raise SystemExit(f"{SERVER_SCRIPT.name} not found in {HERE}")
+    if FROZEN and relaunch_without_console():
+        return
     try:
         if os.name == "nt":
             import ctypes

@@ -1,7 +1,7 @@
 @echo off
-rem Opens the dedicated-server launcher window.
+rem Opens the dedicated-server launcher window (same as: python server.py --gui).
 if exist "%~dp0.venv\Scripts\pythonw.exe" (
-  start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0server_gui.py"
+  start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0server.py" --gui
 ) else (
-  start "" pythonw "%~dp0server_gui.py"
+  start "" pythonw "%~dp0server.py" --gui
 )

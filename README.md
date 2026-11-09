@@ -6,7 +6,11 @@ This is a **matchmaking/relay server**, not a game simulation host: gameplay sti
 
 ## Getting started
 
-### Windows: graphical launcher
+### Windows: one-file download (no Python)
+
+Download `BZRDedicatedServer.exe` from the [latest release](https://github.com/GrizzlyOne95/Battlezone98Redux_DedicatedServer/releases/latest), put it in its own folder, and double-click it. It opens the launcher window described below; started with arguments (`BZRDedicatedServer.exe --help`) it runs headless instead.
+
+### Windows: graphical launcher from source
 
 1. Install Python 3 (3.12 recommended), then install dependencies from the repository directory:
 
@@ -14,12 +18,12 @@ This is a **matchmaking/relay server**, not a game simulation host: gameplay sti
    python -m pip install -r requirements.txt
    ```
 
-2. Double-click `ServerGUI.bat`, or run `python server_gui.py`.
+2. Double-click `ServerGUI.bat`, or run `python server.py --gui`.
 3. Review the **Setup Guide** and **Access** tabs, choose your relay ports, and click **Start**. The launcher shows the address players should use, live lobbies, connected players, and logs.
 
 For a console-only one-click start, use `StartServer.bat`. It installs missing dependencies, offers to configure Windows Firewall, and enables separate UDP relay ports `1340–1369`.
 
-A standalone Windows package can also be built with `python build_package.py`. It produces `BZRServerGUI.exe` and `BZRServer.exe` without requiring Python on the destination PC.
+`python build_package.py` builds the same one-file `dist/BZRDedicatedServer.exe` locally. Pushing a `v*` tag (`git tag v0.2.0 && git push origin v0.2.0`) makes the Release workflow build it and attach it to a GitHub release.
 
 ### Command line
 

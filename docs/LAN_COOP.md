@@ -22,7 +22,7 @@ discovery disabled.
    (separate relay peer pairs). The 8080 status page stays
    local-only (http://127.0.0.1:8080/status) and clients never use it.
 
-   Or double-click `ServerGUI.bat` (same as `pythonw server_gui.py`) for a window with
+   Or double-click `ServerGUI.bat` (same as `pythonw server.py --gui`) for a window with
    Start/Stop/Restart, the live log, connected players, open lobbies, and the LAN address players
    should use. Enable **Separate UDP port per peer pair**, set its range to 1340–1369 (or your chosen
    accessible range), and set the state file there once. Settings are remembered in `server_gui.json`.
