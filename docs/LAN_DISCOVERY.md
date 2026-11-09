@@ -40,7 +40,7 @@ The build checks both interpreter architecture and the resulting i386 PE.
 `dist/OpenShimLAN.zip` contains `tools/lan/BZRServer.exe`, a source revision/hash
 manifest, this guide, and the project license. Extract that layout into the game
 root for OpenShim. Python is not needed on the player's PC. The existing general
-`build_package.py` launcher package remains separate.
+`build_package.py` one-file package (`BZRDedicatedServer.exe`, with the launcher window) remains separate; this helper is built without it.
 
 The payload also carries `tools/lan/licenses/python/LICENSE.txt`, the selected
 websockets distribution's license under `licenses/websockets/`, and PyInstaller's

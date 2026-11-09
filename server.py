@@ -7336,7 +7336,11 @@ async def run_server(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Battlezone 98 Redux dedicated-server compatibility shim")
+    parser = argparse.ArgumentParser(description="Battlezone 98 Redux dedicated-server compatibility shim",
+                                     epilog="--gui opens the launcher window instead (the packaged exe does "
+                                            "this when started with no arguments; --headless keeps it a console server).")
+    parser.add_argument("--headless", action="store_true",
+                        help="No-op flag so the packaged exe runs the server with otherwise default settings")
     parser.add_argument("--ws-host", default=DEFAULT_WS_HOST, help=f"WebSocket bind host (default: {DEFAULT_WS_HOST})")
     parser.add_argument("--ws-port", type=int, default=DEFAULT_WS_PORT, help=f"WebSocket bind port (default: {DEFAULT_WS_PORT})")
     parser.add_argument("--lan-discovery", action="store_true",
@@ -7484,7 +7488,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def launch_gui(argv: list[str]) -> bool:
+    """Open the launcher window instead of running headless; True if it ran.
+
+    `--gui` always asks for it. The packaged exe with no arguments (a
+    double-click) also opens it, unless the build left the GUI out, as the
+    headless OpenShim LAN helper does.
+    """
+    if "--gui" not in argv and not (getattr(sys, "frozen", False) and not argv):
+        return False
+    try:
+        import server_gui
+    except ImportError:
+        if "--gui" in argv:
+            raise
+        return False
+    server_gui.main()
+    return True
+
+
 def main() -> None:
+    if launch_gui(sys.argv[1:]):
+        return
     args = parse_args()
     try:
         asyncio.run(run_server(args))

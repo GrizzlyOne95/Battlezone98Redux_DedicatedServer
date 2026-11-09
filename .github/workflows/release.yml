@@ -1,0 +1,51 @@
+# Builds the one-file Windows server and publishes it as a GitHub release.
+#   git tag v0.2.0 && git push origin v0.2.0
+# A manual run (Actions > Release > Run workflow) only builds and keeps the exe
+# as a workflow artifact, for testing before tagging.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # git describe --tags names the build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: GUI settings tests
+        run: |
+          python -m pip install -q -r requirements.txt
+          python server_gui_test.py
+
+      - name: Build exe
+        run: python build_package.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BZRDedicatedServer
+          path: dist/BZRDedicatedServer.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/BZRDedicatedServer.exe --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/BZRDedicatedServer.exe \
+              --title "BZR Dedicated Server $GITHUB_REF_NAME" --notes-file dist/RELEASE_NOTES.md
+          fi
