@@ -1,12 +1,13 @@
 # Builds the one-file Windows server and publishes it as a GitHub release.
 #   git tag v0.2.0 && git push origin v0.2.0
-# A manual run (Actions > Release > Run workflow) only builds and keeps the exe
-# as a workflow artifact, for testing before tagging.
+# Pull requests and manual runs (Actions > Release > Run workflow) only build
+# the exe, check that it runs (--help) and keep it as a workflow artifact.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
