@@ -87,7 +87,7 @@ def main() -> None:
     # the window reopens itself detached so that console closes. server.py imports websockets inside
     # run_server() and server_gui only for --gui, so name both explicitly.
     run([str(py), "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--console",
-         "--name", EXE_NAME, "--distpath", str(DIST), "--workpath", str(work), "--specpath", str(work),
+         "--name", EXE_NAME, "--icon", str(HERE / "branding" / "app.ico"), "--distpath", str(DIST), "--workpath", str(work), "--specpath", str(work),
          "--collect-submodules", "websockets", "--hidden-import", "server_gui", str(HERE / "server.py")])
 
     ver = version()
