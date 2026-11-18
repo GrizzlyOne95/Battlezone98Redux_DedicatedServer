@@ -3037,7 +3037,9 @@ class UserSession:
     chat_tokens: float | None = None
     chat_stamp: float = 0.0
     chat_strikes: list[float] = field(default_factory=list)
-    chat_notice_stamp: float = 0.0
+    # -inf means "never notified": a 0.0 default suppressed the first notice
+    # whenever the monotonic clock read under 10 s (freshly booted hosts).
+    chat_notice_stamp: float = float("-inf")
     chat_dropped: int = 0
 
 
