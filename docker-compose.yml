@@ -11,7 +11,8 @@ services:
       - "${BZR_WS_PORT:-1337}:1337/tcp"
       - "${BZR_UDP_PORT:-1338}:1338/udp"
       - "${BZR_RELAY_PORT:-1339}:1339/udp"
-      - "${BZR_HEALTH_PORT:-8080}:8080/tcp"
+      # Status/admin port: published on the host's loopback only. Never expose it.
+      - "127.0.0.1:${BZR_HEALTH_PORT:-8080}:8080/tcp"
     volumes:
       - ./data:/app/data
     command:
@@ -41,7 +42,6 @@ services:
       - "${BZR_ADMIN_IDS:-}"
       - --max-lobbies
       - "${BZR_MAX_LOBBIES:-500}"
-      - --retain-empty-lobbies
       - --log-level
       - "${BZR_LOG_LEVEL:-INFO}"
     healthcheck:

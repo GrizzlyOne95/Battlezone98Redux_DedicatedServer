@@ -14,12 +14,16 @@ Settings are saved to server_gui.json next to this file (or the exe).
 
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 9):  # pragma: no cover
+    sys.exit("The launcher needs Python 3.9 or newer (3.12 recommended): https://www.python.org/")
+
 import json
 import os
 import queue
 import socket
 import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
@@ -76,6 +80,7 @@ DEFAULTS = {
     "pin_ips": False,
     "extra_args": "",
     "public_host": "",
+    "lan_discovery": False,
 }
 PUBLIC_IP_URL = "https://api.ipify.org"
 MIN_DEFAULT_WIDTH = 1400  # wide enough that the connect panel's text wraps in few lines
@@ -301,6 +306,28 @@ def pending_texts(count: int) -> tuple[str, str]:
     return f"Access ({count} pending)", f"{count} {noun} waiting for approval → Access tab"
 
 
+def split_extra_args(text: str, *, windows: bool | None = None) -> list[str]:
+    """Split the Extra args box like a shell would.
+
+    Windows keeps backslashes in paths (non-POSIX mode), but non-POSIX shlex
+    also keeps the quote characters, so strip one matching pair per token:
+    --lan-name "My LAN" must reach the server as My LAN.
+    """
+    import shlex
+    windows = os.name == "nt" if windows is None else windows
+    if not windows:
+        return shlex.split(text)
+    lexer = shlex.shlex(text, posix=False)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    out = []
+    for token in lexer:
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+            token = token[1:-1]
+        out.append(token)
+    return out
+
+
 def tcp_probe(host: str, port: int, timeout: float = 3.0) -> dict:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -336,8 +363,10 @@ def reachability_report(f: dict) -> list[tuple[str, str]]:
     bind = str(f.get("bind", ""))
     if bind.startswith("127."):
         out.append(("error", "Listening on 127.0.0.1 only: nobody else can connect. Set 'Listen on' to All interfaces."))
-    else:
+    elif bind in ("", "0.0.0.0", "::"):
         out.append(("ok", f"Listening on all interfaces ({bind or '0.0.0.0'})."))
+    else:
+        out.append(("info", f"Listening only on {bind}: players must use that address (or a forward to it)."))
 
     start, end = int(f.get("pair_start") or 0), int(f.get("pair_end") or 0)
     if not f.get("pair_enabled"):
@@ -359,7 +388,8 @@ def reachability_report(f: dict) -> list[tuple[str, str]]:
         out.append(("warn", (
             f"TCP {ip}:{ws} failed ({tcp.get('error', 'no answer')}). From inside the LAN this is inconclusive: "
             "many routers don't support hairpin NAT. Ask a friend to run "
-            f"Test-NetConnection {ip} -Port {ws}, or use an online port checker.")))
+            f"Test-NetConnection {ip} -Port {ws} (Windows PowerShell) or nc -vz {ip} {ws} (macOS/Linux), "
+            "or use an online port checker.")))
 
     status = f.get("status")
     if running and not status:
@@ -387,72 +417,117 @@ def reachability_report(f: dict) -> list[tuple[str, str]]:
 
 # ---------- setup guide (tag, text) ----------
 # Tags: h1/h2 headings, p body, b bold, li bullet, code = selectable command (gets a Copy button).
-GUIDE: list[tuple[str, str]] = [
-    ("h1", "Setup guide: LAN and internet play\n"),
-    ("p", "Follow the numbered steps. Select any text, or use the Copy buttons next to commands.\n"),
+def _platform_kind(platform: str) -> str:
+    if platform.startswith("win"):
+        return "windows"
+    return "mac" if platform == "darwin" else "linux"
 
-    ("h2", "1. Start the server\n"),
-    ("p", "Tick "), ("b", "Separate UDP port per peer pair"), ("p", ", set the range "), ("b", "1340"), ("p", " through "),
-    ("b", "1369"), ("p", ", set "), ("b", "Listen on"), ("p", " to All interfaces, pick a state file, then press "),
-    ("b", "Start"), ("p", ".\n"),
 
-    ("h2", "2. Find this PC's LAN IP\n"),
-    ("p", "It is shown under \"Players connect with\" (or run ipconfig). Give this PC a DHCP address reservation in the "
-          "router so it never changes. TP-Link: Advanced > Network > DHCP Server > Address Reservation.\n"),
+def guide_ip_hint(kind: str) -> str:
+    return {"windows": "run ipconfig", "mac": "run ipconfig getifaddr en0",
+            "linux": "run ip -4 addr or hostname -I"}[kind]
 
-    ("h2", "3. Windows Firewall\n"),
-    ("p", "In an administrator PowerShell. The network profile must be Private.\n"),
-    ("code", 'New-NetFirewallRule -DisplayName "BZR server TCP" -Direction Inbound -Protocol TCP -LocalPort 1337 -Action Allow -Profile Private'),
-    ("code", 'New-NetFirewallRule -DisplayName "BZR server UDP" -Direction Inbound -Protocol UDP -LocalPort 1338-1369 -Action Allow -Profile Private'),
-    ("p", "Match the UDP range to your pair-port range.\n"),
 
-    ("h2", "4. LAN players: launch option\n"),
-    ("p", "Use exactly (with ws://, the port and the trailing slash):\n"),
-    ("code", "/bzrserver=ws://<LAN-IP>:1337/"),
-    ("li", "Steam: Properties > Launch Options.\n"),
-    ("li", "GOG Galaxy: Manage installation > Configure > Additional executables, or a desktop shortcut.\n"),
-    ("li", "OpenShim players: Multiplayer setup screen > Custom (or net.ini [OpenShimSocket] "
-           "MatchmakingRedirectAddress=<IP>, IP only).\n"),
-    ("p", "Use the LAN IP even on the server PC, not 127.0.0.1.\n"),
+def guide_firewall(kind: str) -> list[tuple[str, str]]:
+    if kind == "windows":
+        return [
+            ("h2", "3. Windows Firewall\n"),
+            ("p", "In an administrator PowerShell. The network profile must be Private.\n"),
+            ("code", 'New-NetFirewallRule -DisplayName "BZR server TCP" -Direction Inbound -Protocol TCP -LocalPort 1337 -Action Allow -Profile Private'),
+            ("code", 'New-NetFirewallRule -DisplayName "BZR server UDP" -Direction Inbound -Protocol UDP -LocalPort 1338-1369 -Action Allow -Profile Private'),
+            ("p", "Match the UDP range to your pair-port range. (StartServer.bat offers to add these same rules.)\n"),
+        ]
+    if kind == "mac":
+        return [
+            ("h2", "3. macOS firewall\n"),
+            ("p", "If System Settings > Network > Firewall is on, allow incoming connections for Python when macOS asks "
+                  "(or add it under Options). The built-in firewall works per app, so no port list is needed.\n"),
+        ]
+    return [
+        ("h2", "3. Linux firewall\n"),
+        ("p", "Only needed if a firewall is active. With ufw:\n"),
+        ("code", "sudo ufw allow 1337/tcp && sudo ufw allow 1338:1369/udp"),
+        ("p", "With firewalld:\n"),
+        ("code", "sudo firewall-cmd --permanent --add-port=1337/tcp --add-port=1338-1369/udp && sudo firewall-cmd --reload"),
+        ("p", "Match the UDP range to your pair-port range.\n"),
+    ]
 
-    ("h2", "5. Same mods, launcher running\n"),
-    ("p", "Everyone runs the same mod builds. GOG needs GOG Galaxy running and signed in; Steam needs Steam running.\n"),
 
-    ("h2", "6. Playing\n"),
-    ("p", "Multiplayer > Internet > Create Game / Join Game; the host clicks Launch when everyone is in. Match the map's "
-          "player count (for example Tapping The Core is 2 players). CR co-op needs everyone to start together.\n"),
+def guide_port_test(kind: str) -> str:
+    return "Test-NetConnection <public-ip> -Port 1337" if kind == "windows" else "nc -vz <public-ip> 1337"
 
-    ("h2", "7. Over the internet\n"),
-    ("li", "(a) The router's WAN IP must equal your public IP (press Detect). If not, you are behind CGNAT: use Tailscale.\n"),
-    ("li", "(b) Port-forward TCP 1337 and UDP 1338-1369 to this PC's LAN IP, same port numbers. TP-Link: Advanced > "
-           "NAT Forwarding > Port Forwarding > Add, choose Port Range for UDP. "),
-    ("b", "NEVER forward 8080"), ("p", " (the status/admin page).\n"),
-    ("li", "(c) Send friends the Internet line:\n"), ("code", "/bzrserver=ws://<public-ip>:1337/"),
-    ("p", "People in your house keep the LAN line.\n"),
-    ("li", "(d) Set Access to \"Approve new players\" or \"Allowlist\" before friends connect. The server can't verify "
-           "Steam/GOG tickets, so anyone who finds the port can claim any ID. Consider disabling the forwards between sessions.\n"),
 
-    ("h2", "8. Verify\n"),
-    ("li", "Press \"Check internet reachability\".\n"),
-    ("li", "From outside, a friend runs:\n"),
-    ("code", "Test-NetConnection <public-ip> -Port 1337"),
-    ("li", "The log shows UDP RX from the friend's IP, and relay packet counts rise in a game.\n"),
-    ("li", "If stuck connecting, check pairPortRange / pairPortAllocationFailuresTotal / ambiguousDropsTotal / "
-           "unmappedDropsTotal on:\n"),
-    ("code", "http://127.0.0.1:8080/status"),
+def build_guide(platform: str = sys.platform) -> list[tuple[str, str]]:
+    """Setup guide segments with commands for the operator's own OS."""
+    kind = _platform_kind(platform)
+    return [
+        ("h1", "Setup guide: LAN and internet play\n"),
+        ("p", "Follow the numbered steps. Select any text, or use the Copy buttons next to commands.\n"),
 
-    ("h2", "9. Alternative: Tailscale\n"),
-    ("p", "Everyone joins your tailnet and uses the Tailscale/VPN address shown in \"Players connect with\". No port "
-          "forwarding, and it works behind CGNAT.\n"),
+        ("h2", "1. Start the server\n"),
+        ("p", "Tick "), ("b", "Separate UDP port per peer pair"), ("p", ", set the range "), ("b", "1340"), ("p", " through "),
+        ("b", "1369"), ("p", ", set "), ("b", "Listen on"), ("p", " to All interfaces, pick a state file, then press "),
+        ("b", "Start"), ("p", ".\n"),
 
-    ("h2", "10. Troubleshooting\n"),
-    ("li", "Lobby list empty / connection failed: server running? IP and launch option exact? Network profile Private? "
-           "Test-NetConnection to 1337.\n"),
-    ("li", "Stale full game listed: restart the server.\n"),
-    ("li", "Stuck after Launch / desync: UDP 1338-1369 blocked, pair range exhausted, or mod files differ.\n"),
-    ("li", "Disconnected at login: the client is still pointed at the official servers.\n"),
-    ("li", "Pair ports needed: n(n-1)/2 per fully relayed lobby (4 players = 6). The 30-port range is shared across lobbies.\n"),
-]
+        ("h2", "2. Find this PC's LAN IP\n"),
+        ("p", f"It is shown under \"Players connect with\" (or {guide_ip_hint(kind)}). Give this PC a DHCP address reservation in the "
+              "router so it never changes. TP-Link: Advanced > Network > DHCP Server > Address Reservation.\n"),
+
+        *guide_firewall(kind),
+
+        ("h2", "4. LAN players: launch option\n"),
+        ("p", "Use exactly (with ws://, the port and the trailing slash):\n"),
+        ("code", "/bzrserver=ws://<LAN-IP>:1337/"),
+        ("li", "Steam: Properties > Launch Options.\n"),
+        ("li", "GOG Galaxy: Manage installation > Configure > Additional executables, or a desktop shortcut.\n"),
+        ("li", "OpenShim players: Multiplayer setup screen > Custom (or net.ini [OpenShimSocket] "
+               "MatchmakingRedirectAddress=<IP>, IP only).\n"),
+        ("p", "Use the LAN IP even on the server PC, not 127.0.0.1.\n"),
+
+        ("h2", "5. Same mods, launcher running\n"),
+        ("p", "Everyone runs the same mod builds. GOG needs GOG Galaxy running and signed in; Steam needs Steam running.\n"),
+
+        ("h2", "6. Playing\n"),
+        ("p", "Multiplayer > Internet > Create Game / Join Game; the host clicks Launch when everyone is in. Match the map's "
+              "player count (for example Tapping The Core is 2 players). CR co-op needs everyone to start together.\n"),
+
+        ("h2", "7. Over the internet\n"),
+        ("li", "(a) The router's WAN IP must equal your public IP (press Detect). If not, you are behind CGNAT: use Tailscale.\n"),
+        ("li", "(b) Port-forward TCP 1337 and UDP 1338-1369 to this PC's LAN IP, same port numbers. TP-Link: Advanced > "
+               "NAT Forwarding > Port Forwarding > Add, choose Port Range for UDP. "),
+        ("b", "NEVER forward 8080"), ("p", " (the status/admin page).\n"),
+        ("li", "(c) Send friends the Internet line:\n"), ("code", "/bzrserver=ws://<public-ip>:1337/"),
+        ("p", "People in your house keep the LAN line.\n"),
+        ("li", "(d) Set Access to \"Approve new players\" or \"Allowlist\" before friends connect. The server can't verify "
+               "Steam/GOG tickets, so anyone who finds the port can claim any ID. Consider disabling the forwards between sessions.\n"),
+
+        ("h2", "8. Verify\n"),
+        ("li", "Press \"Check internet reachability\".\n"),
+        ("li", "From outside, a friend runs this "
+               + ("in PowerShell (on macOS/Linux: nc -vz <public-ip> 1337):\n" if kind == "windows"
+                  else "in a terminal (on Windows PowerShell: Test-NetConnection <public-ip> -Port 1337):\n")),
+        ("code", guide_port_test(kind)),
+        ("li", "The log shows UDP RX from the friend's IP, and relay packet counts rise in a game.\n"),
+        ("li", "If stuck connecting, check pairPortRange / pairPortAllocationFailuresTotal / ambiguousDropsTotal / "
+               "unmappedDropsTotal on:\n"),
+        ("code", "http://127.0.0.1:8080/status"),
+
+        ("h2", "9. Alternative: Tailscale\n"),
+        ("p", "Everyone joins your tailnet and uses the Tailscale/VPN address shown in \"Players connect with\". No port "
+              "forwarding, and it works behind CGNAT.\n"),
+
+        ("h2", "10. Troubleshooting\n"),
+        ("li", "Lobby list empty / connection failed: server running? IP and launch option exact? Firewall open"
+               + (" (network profile Private)? " if kind == "windows" else "? ")
+               + "Port test (step 8) to 1337.\n"),
+        ("li", "Stale full game listed: restart the server.\n"),
+        ("li", "Stuck after Launch / desync: UDP 1338-1369 blocked, pair range exhausted, or mod files differ.\n"),
+        ("li", "Disconnected at login: the client is still pointed at the official servers.\n"),
+        ("li", "Pair ports needed: n(n-1)/2 per fully relayed lobby (4 players = 6). The 30-port range is shared across lobbies.\n"),
+    ]
+
+
+GUIDE: list[tuple[str, str]] = build_guide()
 
 
 def render_guide(text: tk.Text, segments: list[tuple[str, str]], copy) -> None:
@@ -480,6 +555,13 @@ class ServerGUI:
         self.root = root
         self.proc: subprocess.Popen[str] | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
+        # Worker threads never touch Tk directly: they queue callables that
+        # pump() runs on the UI thread.
+        self.ui_queue: queue.Queue = queue.Queue()
+        self._after_stop: list = []
+        self._lan_busy = False
+        self._starting = False
+        self.closed = False
         self.poll_result: dict | None = None
         self.poll_lock = threading.Lock()
         self.stopping = False
@@ -491,6 +573,10 @@ class ServerGUI:
 
         self.first_run = not CONFIG_FILE.exists()
         self.cfg = dict(DEFAULTS)
+        if self.first_run:
+            # New installs start in the mode the Setup Guide recommends; existing
+            # configs without the key keep the shared relay they ran with.
+            self.cfg.update(relay_pair_ports=True)
         self.cfg.update(self.load_config())
         self.vars: dict[str, tk.Variable] = {}
         self.build_ui()
@@ -512,9 +598,15 @@ class ServerGUI:
     # ---------- config ----------
     def load_config(self) -> dict:
         try:
-            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
+        if not isinstance(data, dict):
+            return {}
+        # Drop values of the wrong type (hand edits) so they fall back to defaults.
+        return {k: v for k, v in data.items()
+                if k not in DEFAULTS or isinstance(v, type(DEFAULTS[k])) or
+                (isinstance(DEFAULTS[k], int) and isinstance(v, int))}
 
     def save_config(self) -> None:
         data = {}
@@ -588,7 +680,9 @@ class ServerGUI:
         label(net, "Handshake UDP", 1, 2)
         spin(net, "udp_port", 1, 3)
         label(net, "Status port", 2)
-        spin(net, "health_port", 2, 1, lo=0)
+        spin(net, "health_port", 2, 1)
+        ttk.Checkbutton(net, text="Advertise to OpenShim LAN browsers", variable=var("lan_discovery", tk.BooleanVar)).grid(
+            row=3, column=0, columnspan=4, sticky="w")
 
         # Relay
         rel = group("Relay")
@@ -768,6 +862,7 @@ class ServerGUI:
         ttk.Checkbutton(lb, text="Auto-scroll", variable=self.autoscroll).pack(side="left")
         ttk.Button(lb, text="Clear", command=self.clear_log).pack(side="left", padx=4)
         nb.add(log_frame, text="Log")
+        self.log_frame = log_frame
 
         self.build_guide_tab(nb)
 
@@ -781,6 +876,8 @@ class ServerGUI:
             buttons=[
                 ("Approve", lambda: self.act_selected(self.user_tree, "approve")),
                 ("Kick", lambda: self.act_selected(self.user_tree, "kick")),
+                ("Ban 1 h", lambda: self.act_selected(self.user_tree, "ban", duration="1h", reason="kicked for 1 hour",
+                                                      confirm="Ban {n} for one hour?")),
                 ("Ban", lambda: self.act_selected(self.user_tree, "ban", confirm="Ban {n}?")),
                 ("Ban + IP", lambda: self.act_selected(self.user_tree, "ban", withIp=True, confirm="Ban {n} and their IP?")),
                 ("Mute 15 min", lambda: self.act_selected(self.user_tree, "mute", duration="15m")),
@@ -942,10 +1039,16 @@ class ServerGUI:
             if confirm and not messagebox.askyesno("Access", confirm.format(n=name or iid)):
                 continue
             self.post_access({"action": action, "id": iid, "name": name, **extra})
+        if action == "kick" and ACCESS_CHOICES.get(self.access_mode_var.get(), "open") == "open":
+            self.append_log("[gui] Kicked. In Open mode the game reconnects by itself within seconds; "
+                            "use Ban 1 h (or Approve/Allowlist mode) to keep someone out.\n", "gui")
 
     def unban_selected(self) -> None:
         if not self.running():
             messagebox.showinfo("Access", "Start the server to manage bans.")
+            return
+        if not self.bans_tree.selection():
+            messagebox.showinfo("Access", "Select a ban first.")
             return
         for iid in self.bans_tree.selection():
             kind, _, value = iid.partition(":")
@@ -962,7 +1065,7 @@ class ServerGUI:
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                self.root.after(0, lambda: self.show_access(data.get("access") or {}))
+                self.call_main(lambda: self.show_access(data.get("access") or {}))
             except Exception as exc:
                 self.log_queue.put(f"[gui] access action {body.get('action')} failed: {exc}\n")
 
@@ -970,15 +1073,23 @@ class ServerGUI:
 
     @staticmethod
     def fill_tree(tree: ttk.Treeview, rows: list[tuple[str, tuple]]) -> None:
-        """Replace rows keyed by iid, keeping the operator's selection."""
-        selected = set(tree.selection())
-        tree.delete(*tree.get_children())
+        """Update rows keyed by iid in place: selection, scroll position and
+        order survive the 2-second refresh."""
+        wanted: dict[str, tuple] = {}
         for iid, values in rows:
-            if not tree.exists(iid):
-                tree.insert("", "end", iid=iid, values=values)
-        keep = [i for i in selected if tree.exists(i)]
-        if keep:
-            tree.selection_set(keep)
+            wanted.setdefault(str(iid), values)
+        for iid in tree.get_children():
+            if iid not in wanted:
+                tree.delete(iid)
+        for index, (iid, values) in enumerate(wanted.items()):
+            values = tuple("" if v is None else v for v in values)
+            if tree.exists(iid):
+                if tuple(str(x) for x in tree.item(iid, "values")) != tuple(str(x) for x in values):
+                    tree.item(iid, values=values)
+                if tree.index(iid) != index:
+                    tree.move(iid, "", index)
+            else:
+                tree.insert("", index, iid=iid, values=values)
 
     def show_access(self, access: dict) -> None:
         self.fill_tree(self.pending_tree, [
@@ -1042,7 +1153,8 @@ class ServerGUI:
             self.vars["state_file"].set(path)
 
     def browse_python(self) -> None:
-        path = filedialog.askopenfilename(title="Python interpreter", filetypes=[("Python", "python*.exe"), ("All", "*.*")])
+        types = [("Python", "python*.exe"), ("All", "*.*")] if os.name == "nt" else [("All files", "*")]
+        path = filedialog.askopenfilename(title="Python interpreter (python3 or .venv/bin/python)", filetypes=types)
         if path:
             self.vars["python"].set(path)
 
@@ -1050,12 +1162,19 @@ class ServerGUI:
         v = {k: var.get() for k, var in self.vars.items()}
         bind = BIND_CHOICES.get(v["bind"], v["bind"]).strip() or "0.0.0.0"
         launcher = [str(SERVER_SCRIPT)] if FROZEN else [v["python"], "-u", str(SERVER_SCRIPT)]
+        if not 1 <= int(v["health_port"]) <= 65535:
+            raise ValueError("Status port must be 1-65535: the launcher reads players, lobbies and access through it.")
+        state_file = str(v["state_file"]).strip()
+        if not state_file:
+            raise ValueError("Choose a state file.")
         cmd = launcher + [
             "--ws-host", bind, "--ws-port", str(v["ws_port"]),
             "--udp-host", bind, "--udp-port", str(v["udp_port"]),
             "--relay-host", bind, "--relay-port", str(v["relay_port"]),
             "--health-port", str(v["health_port"]),
-            "--state-file", v["state_file"],
+            "--state-file", state_file,
+            # Keep the audit trail beside the state it describes.
+            "--audit-log", str(Path(state_file).expanduser().parent / "audit.log"),
             "--max-lobbies", str(v["max_lobbies"]),
             "--log-level", v["log_level"],
             "--stdin-control",
@@ -1077,6 +1196,8 @@ class ServerGUI:
             cmd.append("--retain-empty-lobbies")
         if v["redact_addresses"]:
             cmd.append("--redact-addresses")
+        if v.get("lan_discovery"):
+            cmd.append("--lan-discovery")
         if v["motd"].strip():
             cmd += ["--motd", v["motd"]]
         if v["admin_key"].strip():
@@ -1084,15 +1205,14 @@ class ServerGUI:
         if v["admin_ids"].strip():
             cmd += ["--admin-ids", v["admin_ids"]]
         if v["extra_args"].strip():
-            import shlex
-            cmd += shlex.split(v["extra_args"], posix=os.name != "nt")
+            cmd += split_extra_args(v["extra_args"])
         return cmd
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
     def start(self) -> None:
-        if self.running():
+        if self.running() or self.stopping or getattr(self, "_starting", False):
             return
         try:
             cmd = self.build_command()
@@ -1100,11 +1220,85 @@ class ServerGUI:
             messagebox.showerror("Invalid setting", str(exc))
             return
         self.save_config()
-        if not FROZEN and not self.check_python(cmd[0]):
+        state_dir = Path(self.vars["state_file"].get()).expanduser().parent
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("State folder", f"Cannot create the state folder:\n{state_dir}\n\n{exc}\n\n"
+                                                 "Choose a state file in a folder you can write to.")
             return
-        state_dir =Path(self.vars["state_file"].get()).expanduser().parent
-        state_dir.mkdir(parents=True, exist_ok=True)
+        if FROZEN:
+            self._launch(cmd)
+            return
+        # Checking (and possibly installing) dependencies can take a while:
+        # do it off the UI thread so the window stays responsive.
+        self._starting = True
+        self.start_btn.state(["disabled"])
+        self.append_log("[gui] checking Python and dependencies…\n", "gui")
+        threading.Thread(target=self._check_then_launch, args=(cmd,), name="check-python", daemon=True).start()
 
+    def _check_then_launch(self, cmd: list[str]) -> None:
+        python = cmd[0]
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            probe = subprocess.run([python, "-c", "import sys, websockets; assert sys.version_info >= (3, 9)"],
+                                   capture_output=True, timeout=30, creationflags=flags)
+            ok = probe.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            # Build the text now: `exc` is unbound once this block ends.
+            message = f"{python}\n\n{exc}\n\nPick a Python interpreter under Advanced."
+            self.call_main(lambda: self._start_failed("Python not usable", message))
+            return
+        if ok:
+            self.call_main(lambda: self._launch(cmd))
+        else:
+            self.call_main(lambda: self._offer_install(cmd))
+
+    def _start_failed(self, title: str, message: str) -> None:
+        self._starting = False
+        self.refresh_buttons()
+        messagebox.showerror(title, message)
+
+    def _offer_install(self, cmd: list[str]) -> None:
+        python = cmd[0]
+        if not messagebox.askyesno(
+            "Missing dependency",
+            f"{python}\ncannot run the server: it needs Python 3.9+ with the 'websockets' package.\n\n"
+            "Install the requirements now with pip install -r requirements.txt?\n"
+            "(Or choose No and pick a Python/venv that has it under Advanced.)",
+        ):
+            self._starting = False
+            self.refresh_buttons()
+            return
+        self.append_log("[gui] installing requirements… (the window stays usable)\n", "gui")
+
+        def _install() -> None:
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            try:
+                res = subprocess.run([python, "-m", "pip", "install", "-r", str(HERE / "requirements.txt")],
+                                     capture_output=True, text=True, creationflags=flags, timeout=600)
+                output, code = res.stdout + res.stderr, res.returncode
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                output, code = f"{exc}\n", 1
+            self.log_queue.put(output)
+            if code == 0:
+                self.call_main(lambda: self._launch(cmd))
+                return
+            hint = ""
+            if "externally-managed-environment" in output:
+                hint = ("\n\nThis Python is managed by the operating system. Create a virtual environment:\n"
+                        f"  python3 -m venv {HERE / '.venv'}\n"
+                        f"  {HERE / '.venv' / 'bin' / 'pip'} install -r requirements.txt\n"
+                        "then pick .venv/bin/python under Advanced (or start with ServerGUI.sh, which does this).")
+            self.call_main(lambda: self._start_failed("pip failed", "See the Log tab for details." + hint))
+
+        threading.Thread(target=_install, name="pip-install", daemon=True).start()
+
+    def _launch(self, cmd: list[str]) -> None:
+        self._starting = False
+        if self.running():
+            self.refresh_buttons()
+            return
         shown = mask_command(cmd)
         self.append_log("[gui] " + subprocess.list2cmdline(shown) + "\n", "gui")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -1120,39 +1314,13 @@ class ServerGUI:
             )
         except OSError as exc:
             self.proc = None
-            messagebox.showerror("Could not start server", f"{exc}\n\nCheck the Python path in Settings.")
+            self.refresh_buttons()
+            messagebox.showerror("Could not start server", f"{exc}\n\nCheck the Python path under Advanced.")
             return
         self.started_at = time.time()
         self.stopping = False
         threading.Thread(target=self.read_output, args=(self.proc,), name="server-stdout", daemon=True).start()
         self.refresh_buttons()
-
-    def check_python(self, python: str) -> bool:
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        try:
-            ok = subprocess.run([python, "-c", "import websockets"], capture_output=True, timeout=20, creationflags=flags).returncode == 0
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            messagebox.showerror("Python not usable", f"{python}\n\n{exc}\n\nPick a Python interpreter in Settings.")
-            return False
-        if ok:
-            return True
-        if messagebox.askyesno(
-            "Missing dependency",
-            f"{python}\ncannot import 'websockets', which the server needs.\n\n"
-            "Install it now with pip install -r requirements.txt?\n"
-            "(Or choose No and pick a Python/venv that has it.)",
-        ):
-            self.append_log("[gui] installing requirements…\n", "gui")
-            self.root.update_idletasks()
-            res = subprocess.run(
-                [python, "-m", "pip", "install", "-r", str(HERE / "requirements.txt")],
-                capture_output=True, text=True, creationflags=flags,
-            )
-            self.append_log(res.stdout + res.stderr)
-            if res.returncode == 0:
-                return True
-            messagebox.showerror("pip failed", "See the log tab for details.")
-        return False
 
     def read_output(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stdout is not None
@@ -1167,6 +1335,10 @@ class ServerGUI:
             if then:
                 then()
             return
+        if then:
+            self._after_stop.append(then)
+        if self.stopping:
+            return  # a stop is already under way; it runs `then` when done
         self.stopping = True
         self.refresh_buttons()
         self.append_log("[gui] stopping (saving state)…\n", "gui")
@@ -1177,7 +1349,7 @@ class ServerGUI:
                 proc.stdin.write("stop\n")
                 proc.stdin.flush()
                 proc.stdin.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
             try:
                 proc.wait(timeout=8)
@@ -1185,36 +1357,61 @@ class ServerGUI:
                 self.log_queue.put("[gui] server did not stop in time; killing it\n")
                 kill_tree(proc)
                 proc.wait()
-            if then:
-                self.root.after(0, then)
+            self.call_main(self._run_after_stop)
 
         threading.Thread(target=_stop, name="stopper", daemon=True).start()
+
+    def _run_after_stop(self) -> None:
+        callbacks, self._after_stop = self._after_stop, []
+        for callback in callbacks:
+            callback()
 
     def restart(self) -> None:
         self.stop(then=self.start)
 
     def open_status(self) -> None:
-        port = self.vars["health_port"].get()
+        try:
+            port = int(self.cfg.get("health_port") if self.running() else self.vars["health_port"].get())
+        except (tk.TclError, TypeError, ValueError):
+            return
         if port:
             webbrowser.open(f"http://127.0.0.1:{port}/status")
 
     def open_state_folder(self) -> None:
-        folder = Path(self.vars["state_file"].get()).expanduser().parent
-        folder.mkdir(parents=True, exist_ok=True)
-        if os.name == "nt":
-            os.startfile(folder)  # type: ignore[attr-defined]
-        else:
-            webbrowser.open(folder.as_uri())
+        folder = Path(self.vars["state_file"].get()).expanduser().resolve().parent
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            open_in_file_manager(folder)
+        except OSError as exc:
+            messagebox.showerror("State folder", f"Cannot open {folder}:\n{exc}")
 
     def update_lan(self) -> None:
+        self.root.after(15000, self.update_lan)
         bind = BIND_CHOICES.get(self.vars["bind"].get(), self.vars["bind"].get())
         if bind.startswith("127."):
             self.lan_var.set("Addresses: 127.0.0.1 (this PC only)")
-        else:
-            addrs = lan_addresses()
-            self.lan_var.set(("Addresses: " + ", ".join(map(describe_address, addrs))) if addrs else "no LAN address found")
-        self.update_switch()
-        self.root.after(15000, self.update_lan)
+            self.update_switch()
+            return
+        if self._lan_busy:
+            return
+        self._lan_busy = True
+
+        def _lookup() -> None:
+            # Hostname lookups can stall for seconds (notably on macOS); never on the UI thread.
+            try:
+                addrs = lan_addresses()
+            except Exception:
+                addrs = []
+            text = ("Addresses: " + ", ".join(map(describe_address, addrs))) if addrs else "no LAN address found"
+
+            def _apply() -> None:
+                self._lan_busy = False
+                if not BIND_CHOICES.get(self.vars["bind"].get(), self.vars["bind"].get()).startswith("127."):
+                    self.lan_var.set(text)
+                self.update_switch()
+            self.call_main(_apply)
+
+        threading.Thread(target=_lookup, name="lan-addresses", daemon=True).start()
 
     def update_switch(self) -> None:
         # Stock clients take the full lobby URL via /bzrserver= and send the UDP
@@ -1282,7 +1479,7 @@ class ServerGUI:
                 result = ("ok", ip)
             except Exception as exc:
                 result = ("err", str(exc))
-            self.root.after(0, lambda: self._detected(*result))
+            self.call_main(lambda: self._detected(*result))
 
         threading.Thread(target=_fetch, name="public-ip", daemon=True).start()
 
@@ -1318,7 +1515,7 @@ class ServerGUI:
 
     def refresh_buttons(self) -> None:
         running = self.running()
-        self.start_btn.state(["disabled"] if running or self.stopping else ["!disabled"])
+        self.start_btn.state(["disabled"] if running or self.stopping or self._starting else ["!disabled"])
         self.stop_btn.state(["!disabled"] if running and not self.stopping else ["disabled"])
         self.restart_btn.state(["!disabled"] if running and not self.stopping else ["disabled"])
         for child in self.settings_frame.winfo_children():
@@ -1400,7 +1597,7 @@ class ServerGUI:
                 findings = [("error", f"Check failed: {exc}")]
             for level, msg in findings:
                 self.log_queue.put(f"[gui] reachability [{level}] {msg}\n")
-            self.root.after(0, lambda: self._diag_done(findings))
+            self.call_main(lambda: self._diag_done(findings))
 
         threading.Thread(target=_work, name="reachability", daemon=True).start()
 
@@ -1439,7 +1636,24 @@ class ServerGUI:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=1.5) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def call_main(self, fn) -> None:
+        """Run fn on the Tk thread (safe to call from any thread)."""
+        self.ui_queue.put(fn)
+
     def pump(self) -> None:
+        while True:
+            try:
+                fn = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as exc:  # keep the UI loop alive
+                if self.closed:
+                    return
+                self.append_log(f"[gui] internal error: {exc}\n", "error")
+            if self.closed:
+                return  # a callback closed the window
         lines = 0
         while lines < 500:
             try:
@@ -1450,10 +1664,19 @@ class ServerGUI:
             lines += 1
 
         if self.proc is not None and not self.running():
+            code = self.proc.returncode
+            unexpected = not self.stopping
             self.proc = None
             self.stopping = False
             self.clear_live()
             self.refresh_buttons()
+            if unexpected:
+                # Crashed or refused to start (e.g. a port already in use): show why.
+                self.notebook.select(self.log_frame)
+                messagebox.showerror(
+                    "Server stopped",
+                    f"The server exited unexpectedly (code {code}).\n\n"
+                    "The Log tab shows the reason, for example a port that another program already uses.")
 
         with self.poll_lock:
             result, self.poll_result = self.poll_result, None
@@ -1486,16 +1709,17 @@ class ServerGUI:
             self.stat_vars["relaypk"].set("–")
 
         data = result.get("lobbies") or {}
-        self.lobby_tree.delete(*self.lobby_tree.get_children())
+        lobby_rows = []
         for lob in data.get("lobbies", []):
             flags = [f for f, on in (("private", lob.get("isPrivate")), ("locked", lob.get("isLocked")), ("persistent", lob.get("persistent"))) if on]
             members = ", ".join(u.get("name") or u.get("id", "") for u in lob.get("users", []))
             limit = lob.get("memberLimit")
             count = f"{len(lob.get('users', []))}/{limit}" if limit and limit < 1000 else str(len(lob.get("users", [])))
-            self.lobby_tree.insert("", "end", values=(
+            lobby_rows.append((str(lob.get("id")), (
                 lob.get("id"), lob.get("name") or "(unnamed)", lob.get("ownerName") or lob.get("owner", ""),
                 count, " ".join(flags), members,
-            ))
+            )))
+        self.fill_tree(self.lobby_tree, lobby_rows)
         rows = []
         for u in data.get("users", []):
             name = u.get("playerName") if u.get("playerName") not in (None, "", "Unknown") else u.get("name", "")
@@ -1516,9 +1740,23 @@ class ServerGUI:
         if self.running():
             if not messagebox.askyesno("Stop server?", "The server is running. Stop it and exit?"):
                 return
-            self.stop(then=self.root.destroy)
+            self.stop(then=self._destroy)
         else:
-            self.root.destroy()
+            self._destroy()
+
+    def _destroy(self) -> None:
+        self.closed = True
+        self.root.destroy()
+
+
+def open_in_file_manager(folder: Path) -> None:
+    """Show a folder in Explorer / Finder / the desktop's file manager."""
+    if os.name == "nt":
+        os.startfile(folder)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(folder)])
+    else:
+        subprocess.Popen(["xdg-open", str(folder)])
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -1571,9 +1809,31 @@ def main() -> None:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
-    root = tk.Tk()
-    apply_theme(root)
-    ServerGUI(root)
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        raise SystemExit(f"Cannot open the launcher window ({exc}). On a machine without a display, "
+                         "run the server headless instead: python server.py --help")
+    try:
+        apply_theme(root)
+        ServerGUI(root)
+    except Exception:
+        # Under pythonw / the packaged exe there is no console, so a startup
+        # failure would otherwise vanish without a trace.
+        import traceback
+        details = traceback.format_exc()
+        log = HERE / "server_gui_error.log"
+        try:
+            log.write_text(details, encoding="utf-8")
+        except OSError:
+            log = None
+        try:
+            messagebox.showerror("BZR Dedicated Server", "The launcher could not start.\n\n"
+                                 + details.strip().splitlines()[-1]
+                                 + (f"\n\nDetails were saved to {log}" if log else ""))
+        finally:
+            root.destroy()
+        raise SystemExit(1)
     root.mainloop()
 
 

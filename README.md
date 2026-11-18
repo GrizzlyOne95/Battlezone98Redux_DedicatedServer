@@ -21,7 +21,16 @@ Download `BZRDedicatedServer.exe` from the [latest release](https://github.com/G
 2. Double-click `ServerGUI.bat`, or run `python server.py --gui`.
 3. Review the **Setup Guide** and **Access** tabs, choose your relay ports, and click **Start**. The launcher shows the address players should use, live lobbies, connected players, and logs.
 
-For a console-only one-click start, use `StartServer.bat`. It installs missing dependencies, offers to configure Windows Firewall, and enables separate UDP relay ports `1340–1369`.
+For a console-only one-click start, use `StartServer.bat`. It installs missing dependencies, offers once to configure Windows Firewall (Private networks), and enables separate UDP relay ports `1340–1369`.
+
+### Linux and macOS
+
+Install Python 3.9+ (3.12 recommended). For the launcher window you also need Tk: `sudo apt install python3-tk python3-venv` on Debian/Ubuntu, `sudo dnf install python3-tkinter` on Fedora, or the python.org installer on macOS.
+
+- `./ServerGUI.sh` opens the launcher window. On macOS you can double-click `ServerGUI.command` in Finder.
+- `./StartServer.sh` runs the console server with separate UDP relay ports `1340–1369`, like `StartServer.bat`.
+
+Both scripts put the dependencies in a private `.venv/` folder the first time if your Python lacks them, so they work on distributions that block `pip install` into the system Python. The launcher's **Setup Guide** shows firewall and port-test commands for the system it runs on.
 
 `python build_package.py` builds the same one-file `dist/BZRDedicatedServer.exe` locally. Pushing a `v*` tag (`git tag v0.2.0 && git push origin v0.2.0`) makes the Release workflow build it and attach it to a GitHub release.
 
@@ -43,7 +52,7 @@ docker compose -f docker-compose.yml -f docker-compose.pair-ports.yml up -d --bu
 
 Edit `.env` before starting. The extra Compose file enables separate relay ports and publishes the configured range (`1340–1369` by default). The base `docker-compose.yml` alone uses shared relay. State is kept in `./data`.
 
-**Do not expose HTTP port 8080 to the internet.** The Compose configuration publishes it by default; restrict it with a host firewall or bind it to a trusted interface.
+The status port (8080) is published on the host's `127.0.0.1` only. **Do not expose it to the internet.** Its `/access`, `/lobbies` and `/captures` pages show player addresses and bans, so the server answers them only for loopback callers. From the Docker host the request arrives from the bridge network, so add that network to `--health-detail-hosts` (for example `172.16.0.0/12`) if you need those pages there.
 
 ## Connecting players
 
@@ -85,7 +94,8 @@ The official relay association protocol and strict/symmetric-NAT behavior are no
 - The GUI's **Access** tab supports open, approval, and allowlist modes, along with bans, mutes, and player management. The CLI equivalents include `--access-mode approve|allowlist` and `--pin-ips`.
 - `--identity-policy optional|required|off` controls optional trust-on-first-use community identity keys. Stock clients do not supply these keys; `optional` is the default.
 - `--redact-addresses` limits player address visibility to their own match, themselves, and admins. It is off by default pending wider network compatibility testing.
-- Lobby metadata and moderation state are saved in `data/server_state.json`; active client connections are not restored after restart. Audit logs and GUI settings are stored locally.
+- Lobby metadata and moderation state are saved in `data/server_state.json`; active client connections are not restored after restart. Audit logs and GUI settings are stored locally. If the state file cannot be read, the server keeps it as `server_state.json.corrupt-<time>` beside the new one so bans and approvals can be restored.
+- Lobby passwords stay on the server: lobby lists show `*` for a passworded lobby, and joins are checked against the real password.
 
 **Security limitation:** Steam/GOG tickets cannot be independently verified by this community server. ID approval and IP pinning reduce casual unwanted access but do not prove identity; community keys protect continuity only after first registration. Use a private VPN for a friends-only server, and protect the state, settings, and admin credentials.
 
@@ -97,7 +107,7 @@ With the server running, check its local status at `http://127.0.0.1:8080/health
 python smoke_test.py
 ```
 
-Additional checks: `python stock_client_compat_test.py`, `python protocol_parity_test.py`, and `python server_gui_test.py`. `python lan_discovery_test.py` is a manual test (no CI runs it). These do not replace testing with real players across different networks.
+Additional checks: `python stock_client_compat_test.py`, `python protocol_parity_test.py`, `python robustness_test.py`, and `python server_gui_test.py`. The Tests workflow runs these on Windows, macOS and Linux. `python lan_discovery_test.py` is a manual test (no CI runs it). These do not replace testing with real players across different networks.
 
 More detail lives in dedicated documents:
 

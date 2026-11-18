@@ -1,0 +1,72 @@
+# Runs the offline and live test suites on all three desktop platforms the
+# server and launcher support.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        python-version: ["3.9", "3.12"]
+        exclude:
+          # The current Ubuntu runner image ships no Python 3.9 build.
+          - os: ubuntu-latest
+            python-version: "3.9"
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: python -m pip install -q -r requirements.txt
+
+      - name: Offline tests
+        run: |
+          set -e
+          for t in robustness_test.py admin_hardening_test.py protocol_parity_test.py \
+                   relay_pair_ports_test.py relay_bounded_pair_ports_test.py relay_observability_test.py \
+                   native_network_health_test.py network_capture_test.py relay_impairment_test.py \
+                   relay_faultinject_test.py; do
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done
+
+      - name: Launcher settings tests
+        run: python server_gui_test.py
+
+      - name: Live server tests
+        run: |
+          set -e
+          mkdir -p ci-data
+          python server.py --state-file ci-data/state.json --audit-log ci-data/audit.log > ci-data/server.log 2>&1 &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=1)" 2>/dev/null && break
+            sleep 1
+          done
+          status=0
+          python smoke_test.py || status=$?
+          python stock_client_compat_test.py || status=$?
+          kill $SERVER_PID || true
+          if [ $status -ne 0 ]; then cat ci-data/server.log; fi
+          exit $status

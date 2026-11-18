@@ -6,3 +6,4 @@ server_gui.json
 build/
 dist/
 .venv/
+server_gui_error.log

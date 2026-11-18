@@ -13,10 +13,18 @@ community-hosted failover scenarios.
 
 from __future__ import annotations
 
+import sys
+
+MIN_PYTHON = (3, 9)
+if sys.version_info < MIN_PYTHON:  # pragma: no cover - checked before the newer syntax below runs
+    sys.exit(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer is required (this is {sys.version.split()[0]}). "
+             "Install a current Python 3 from https://www.python.org/ (3.12 recommended).")
+
 import argparse
 import asyncio
 import collections
 import contextlib
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -28,7 +36,6 @@ import re
 import signal
 import socket
 import struct
-import sys
 import time
 import unicodedata
 import uuid
@@ -41,7 +48,13 @@ from relay_impairment import PASS as IMPAIR_PASS, RelayImpairment, parse_spec as
 from lan_discovery import DISCOVERY_PORT, LanDiscoveryProtocol, encoded_name
 
 websockets = None
-ConnectionClosed = Exception
+
+
+class _ConnectionClosedPlaceholder(Exception):
+    """Stands in for websockets' ConnectionClosed until run_server imports it."""
+
+
+ConnectionClosed: type[BaseException] = _ConnectionClosedPlaceholder
 
 
 DEFAULT_WS_HOST = "0.0.0.0"
@@ -3024,7 +3037,9 @@ class UserSession:
     chat_tokens: float | None = None
     chat_stamp: float = 0.0
     chat_strikes: list[float] = field(default_factory=list)
-    chat_notice_stamp: float = 0.0
+    # -inf means "never notified": a 0.0 default suppressed the first notice
+    # whenever the monotonic clock read under 10 s (freshly booted hosts).
+    chat_notice_stamp: float = float("-inf")
     chat_dropped: int = 0
 
 
@@ -3050,6 +3065,7 @@ SECRET_FIELD_NAMES = frozenset({"password", "token", "ticket", "authticket", "st
 TICKET_WITHHELD_MARKER = "withheld"
 TICKET_FIELDS = ("steamAppTicket", "gogAppTicket", "authTicket", "platformTicket")
 DEFAULT_AUDIT_LOG = "data/audit.log"
+LOBBY_PASSWORD_PLACEHOLDER = "*"
 DEFAULT_RESERVED_NAMES = "SERVER,Admin,Administrator,Moderator,Mod,Console,System,Rebellion,Staff"
 LOOPBACK_NAMES = ("::1", "::ffff:127.0.0.1")
 # Everything a read-only watcher session may send; all other verbs are ignored.
@@ -3328,6 +3344,9 @@ class AccessControl:
         if self.rate_limit_per_minute <= 0 or not ip:
             return False
         now = time.monotonic()
+        if len(self._attempts) > 1024:
+            # Forget addresses that have been quiet for a minute so the table stays bounded.
+            self._attempts = {k: v for k, v in self._attempts.items() if v and now - v[-1] < 60}
         window = [t for t in self._attempts.get(ip, []) if now - t < 60]
         window.append(now)
         self._attempts[ip] = window
@@ -3536,8 +3555,12 @@ class AccessControl:
                 raise ValueError(f"mode must be one of {', '.join(ACCESS_MODES)}")
             self.mode = mode
             if mode == "open":
+                # Going open admits whoever is waiting right now, without
+                # adding them to the approved list permanently.
                 for uid in list(self.pending):
-                    self.approve(uid)  # going open admits whoever was waiting
+                    pend = self.pending.pop(uid)
+                    if not pend["future"].done():
+                        pend["future"].set_result(True)
         if pin_ips is not None:
             self.pin_ips = bool(pin_ips)
         if identity_policy is not None:
@@ -3694,7 +3717,10 @@ class ServerState:
             "memberLimit": lobby.member_limit,
             "isPrivate": lobby.is_private,
             "isLocked": lobby.is_locked,
-            "password": lobby.password,
+            # Never broadcast the real password: every connected client receives
+            # this snapshot. A non-empty placeholder still marks the lobby as
+            # passworded; DoJoinLobby is checked against the stored value.
+            "password": LOBBY_PASSWORD_PLACEHOLDER if lobby.password else "",
             "userCount": len(lobby.users),
             "clientVersion": lobby.metadata.get("clientVersion", "2.2.301"),
             "users": lobby.users,
@@ -3824,6 +3850,7 @@ class ServerState:
                     version,
                     STATE_FORMAT_VERSION,
                 )
+                self._quarantine_state_file("unsupported-version")
                 return
 
             self.next_lobby_id = int(payload.get("nextLobbyId", self.next_lobby_id))
@@ -3880,6 +3907,27 @@ class ServerState:
             )
         except Exception:
             self.log.exception("Failed to load state file: %s", self.state_file)
+            # Start clean, but never let the next save overwrite the operator's
+            # bans/approvals: keep the unreadable file beside the new one.
+            self.lobbies = {}
+            self.access = AccessControl(self.log.getChild("access"), self.mark_dirty)
+            self.access.audit = self.audit
+            self._quarantine_state_file("corrupt")
+
+    def _quarantine_state_file(self, label: str) -> None:
+        """Move an unusable state file aside so the next save cannot destroy it."""
+        if not self.state_file or not self.state_file.exists():
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup = self.state_file.with_name(f"{self.state_file.name}.{label}-{stamp}")
+        try:
+            self.state_file.replace(backup)
+        except OSError:
+            self.log.exception("Could not move the unusable state file aside; state will NOT be saved this run")
+            self.state_file = None
+            return
+        self.log.error("The state file could not be used; it was kept as %s and a fresh state file will be "
+                       "written. Restore bans/approvals from that copy if needed.", backup)
 
     DEFAULT_LOBBY_NAME = "~chat~pub~~default"
 
@@ -3970,6 +4018,22 @@ class ServerState:
             self.log.exception("Failed to save state file: %s", self.state_file)
 
 
+def disable_udp_connreset(transport: Any) -> None:
+    """Windows only: stop ICMP "port unreachable" from surfacing as recv errors.
+
+    By default a Windows UDP socket reports WSAECONNRESET on the next receive
+    after sending to a closed port, which floods the log and, on some Python
+    releases, stops the asyncio endpoint from receiving at all. Peers leave
+    matches all the time, so the relay must not care.
+    """
+    if os.name != "nt" or not hasattr(socket, "SIO_UDP_CONNRESET"):
+        return
+    sock = transport.get_extra_info("socket") if transport is not None else None
+    raw = getattr(sock, "_sock", sock)  # asyncio wraps the socket in a TransportSocket
+    with contextlib.suppress(Exception):
+        raw.ioctl(socket.SIO_UDP_CONNRESET, False)
+
+
 class BZRUDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, logger: logging.Logger, state: ServerState) -> None:
         self.logger = logger
@@ -3980,6 +4044,7 @@ class BZRUDPProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
+        disable_udp_connreset(transport)
         self.logger.info("UDP shim listening on %s", transport.get_extra_info("sockname"))
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
@@ -4294,6 +4359,7 @@ class BZRPairRelayProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
+        disable_udp_connreset(transport)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         self.owner.datagram_received(data, addr, route_key=self.route_key, pair_transport=self.transport)
@@ -4463,6 +4529,7 @@ class BZRRelayProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
+        disable_udp_connreset(transport)
         sockname = transport.get_extra_info("sockname")
         if isinstance(sockname, tuple) and len(sockname) >= 2:
             try:
@@ -5718,7 +5785,7 @@ class BZRWebSocketServer:
             await self._close_quietly(ws, 4002)
             return
         requested_id = str(content.get("id", "")).strip()
-        if authtype.lower() == "gog":
+        if authtype.lower() == "gog" and requested_id not in {"", "0"}:
             # Upstream parity (2026-08-25 evidence): gog without a ticket is
             # ACCEPTED and the client-supplied id is echoed back unassigned.
             # Honor it verbatim instead of minting a replacement. (On a
@@ -6819,7 +6886,13 @@ class BZRWebSocketServer:
                     # transport for that rejection and is unchanged here.
                     await self.send_error(ws, "Binary Payload not supported")
                     continue
-                await self.route_message(ws, message)
+                try:
+                    await self.route_message(ws, message)
+                except ConnectionClosed:
+                    raise
+                except Exception:
+                    # One malformed message must not drop the player's connection.
+                    self.log.exception("Error handling a message from %s", self._ws_peer(ws))
         except ConnectionClosed:
             pass
         except Exception:
@@ -6828,8 +6901,31 @@ class BZRWebSocketServer:
             await self.unregister(ws)
 
 
+HTTP_REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+                409: "Conflict", 500: "Internal Server Error"}
+# GET endpoints that reveal player addresses, bans or raw protocol traffic.
+HEALTH_DETAIL_PATHS = frozenset({"/access", "/lobbies", "/captures", "/relay/impairment"})
+
+
+def ip_in_networks(ip: str, networks: Any) -> bool:
+    """True when ip is inside any of the given IPs/CIDRs (invalid entries are ignored)."""
+    try:
+        addr = ipaddress.ip_address(ip.split("%")[0])
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    for entry in networks:
+        try:
+            if addr in ipaddress.ip_network(str(entry).strip(), strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _http_json(status_code: int, payload: dict[str, Any]) -> bytes:
-    reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed"}.get(status_code, "OK")
+    reason = HTTP_REASONS.get(status_code, "OK")
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = [
         f"HTTP/1.1 {status_code} {reason}",
@@ -6961,6 +7057,7 @@ async def serve_health_http(
     udp_protocol: BZRUDPProtocol,
     relay_protocol: BZRRelayProtocol | None,
     started_monotonic: float,
+    detail_hosts: tuple[str, ...] = (),
 ) -> None:
     try:
         first = await asyncio.wait_for(reader.readline(), timeout=2.0)
@@ -7031,6 +7128,16 @@ async def serve_health_http(
             await writer.drain()
             return
 
+        if path in HEALTH_DETAIL_PATHS:
+            # Player addresses, bans and protocol history stay on this machine
+            # (plus any --health-detail-hosts) even when --health-host is public.
+            peer = writer.get_extra_info("peername")
+            peer_ip = str(peer[0]) if isinstance(peer, tuple) and peer else ""
+            if not (is_loopback_ip(peer_ip) or ip_in_networks(peer_ip, detail_hosts)):
+                writer.write(_http_json(403, {"ok": False, "error": f"{path} is local-only (see --health-detail-hosts)"}))
+                await writer.drain()
+                return
+
         if path == "/access":
             payload = {"ok": True, "time": utc_now_str(), "access": state.access.snapshot()}
         elif path == "/relay/impairment":
@@ -7077,7 +7184,7 @@ async def serve_health_http(
         await writer.drain()
     except Exception:
         with contextlib.suppress(Exception):
-            writer.write(_http_json(404, {"ok": False, "error": "Request failed"}))
+            writer.write(_http_json(500, {"ok": False, "error": "Request failed"}))
             await writer.drain()
     finally:
         writer.close()
@@ -7247,92 +7354,138 @@ async def run_server(args: argparse.Namespace) -> None:
     if args.stdin_control:
         start_stdin_control(loop, _request_stop, logger)
 
-    udp_transport, udp_protocol = await loop.create_datagram_endpoint(
-        lambda: BZRUDPProtocol(logger.getChild("udp"), state),
-        local_addr=(args.udp_host, args.udp_port),
-    )
-
+    udp_transport: asyncio.DatagramTransport | None = None
     relay_transport: asyncio.DatagramTransport | None = None
-    if relay_protocol is not None:
-        relay_transport, _ = await loop.create_datagram_endpoint(
-            lambda: relay_protocol,
-            local_addr=(args.relay_host, args.relay_port),
-        )
-
     health_server = None
-    if args.health_port > 0:
-        health_server = await asyncio.start_server(
-            lambda r, w: serve_health_http(
-                r,
-                w,
-                state=state,
-                ws_server=ws_server,
-                udp_protocol=udp_protocol,
-                relay_protocol=relay_protocol,
-                started_monotonic=started_monotonic,
-            ),
-            host=args.health_host,
-            port=args.health_port,
+    discovery_transport: asyncio.DatagramTransport | None = None
+    ws_listener = None
+    autosave_task: asyncio.Task | None = None
+    try:
+        udp_transport, udp_protocol = await _bind_or_explain(
+            "handshake UDP", args.udp_host, args.udp_port,
+            loop.create_datagram_endpoint(lambda: BZRUDPProtocol(logger.getChild("udp"), state),
+                                          local_addr=(args.udp_host, args.udp_port)),
+        )
+        if relay_protocol is not None:
+            relay_transport, _ = await _bind_or_explain(
+                "relay UDP", args.relay_host, args.relay_port,
+                loop.create_datagram_endpoint(lambda: relay_protocol, local_addr=(args.relay_host, args.relay_port)),
+            )
+        if args.health_port > 0:
+            health_server = await _bind_or_explain(
+                "status HTTP (TCP)", args.health_host, args.health_port,
+                asyncio.start_server(
+                    lambda r, w: serve_health_http(
+                        r,
+                        w,
+                        state=state,
+                        ws_server=ws_server,
+                        udp_protocol=udp_protocol,
+                        relay_protocol=relay_protocol,
+                        started_monotonic=started_monotonic,
+                        detail_hosts=_csv(args.health_detail_hosts),
+                    ),
+                    host=args.health_host,
+                    port=args.health_port,
+                ),
+            )
+
+        autosave_task = asyncio.create_task(
+            autosave_loop(stop_event, state, args.autosave_seconds, logger.getChild("autosave"))
         )
 
-    autosave_task = asyncio.create_task(
-        autosave_loop(stop_event, state, args.autosave_seconds, logger.getChild("autosave"))
-    )
-
-    discovery_transport: asyncio.DatagramTransport | None = None
-    try:
-        async with websockets.serve(
-            ws_server.handler,
-            args.ws_host,
-            args.ws_port,
-            ping_interval=20,
-            ping_timeout=30,
-            max_size=2**20,
-        ):
-            # Advertise only after every game-facing listener is bound. In
-            # managed mode stdout is a parent/child readiness channel; ordinary
-            # service logs remain on stderr.
-            if getattr(args, "lan_discovery", False):
-                discovery_transport, _ = await loop.create_datagram_endpoint(
+        ws_listener = await _bind_or_explain(
+            "lobby WebSocket (TCP)", args.ws_host, args.ws_port,
+            websockets.serve(
+                ws_server.handler,
+                args.ws_host,
+                args.ws_port,
+                ping_interval=20,
+                ping_timeout=30,
+                max_size=2**20,
+            ),
+        )
+        # Advertise only after every game-facing listener is bound. In
+        # managed mode stdout is a parent/child readiness channel; ordinary
+        # service logs remain on stderr.
+        if getattr(args, "lan_discovery", False):
+            discovery_transport, _ = await _bind_or_explain(
+                "LAN discovery UDP", args.ws_host, args.lan_discovery_port,
+                loop.create_datagram_endpoint(
                     lambda: LanDiscoveryProtocol(args.ws_port, args.lan_name),
                     local_addr=(args.ws_host, args.lan_discovery_port),
                     family=socket.AF_INET,
-                )
-                logger.info("LAN discovery listening on %s:%d", args.ws_host, args.lan_discovery_port)
-            logger.info("WebSocket server listening on ws://%s:%d", args.ws_host, args.ws_port)
-            logger.info("UDP shim listening on %s:%d", args.udp_host, args.udp_port)
-            if relay_protocol is not None:
-                logger.info("UDP relay listening on %s:%d", args.relay_host, args.relay_port)
-            if health_server:
-                logger.info("Health endpoint listening on http://%s:%d/health", args.health_host, args.health_port)
-            logger.info("Press Ctrl+C to stop.")
-            if getattr(args, "lan_managed", False):
-                # Coupled with the OpenShim shim, which accepts only the literal
-                # "BZRLAN_READY 1337"; keep this in sync if the port handling changes.
-                sys.stdout.buffer.write(f"BZRLAN_READY {args.ws_port}\n".encode("ascii"))
-                sys.stdout.buffer.flush()
-            await stop_event.wait()
+                ),
+            )
+            logger.info("LAN discovery listening on %s:%d", args.ws_host, args.lan_discovery_port)
+        logger.info("WebSocket server listening on ws://%s:%d", args.ws_host, args.ws_port)
+        logger.info("UDP shim listening on %s:%d", args.udp_host, args.udp_port)
+        if relay_protocol is not None:
+            logger.info("UDP relay listening on %s:%d", args.relay_host, args.relay_port)
+        if health_server:
+            logger.info("Health endpoint listening on http://%s:%d/health", args.health_host, args.health_port)
+        logger.info("Server ready. %s", "Send \"stop\" on stdin or press Ctrl+C to stop."
+                    if args.stdin_control else "Press Ctrl+C to stop.")
+        if getattr(args, "lan_managed", False):
+            # Coupled with the OpenShim shim, which accepts only the literal
+            # "BZRLAN_READY 1337"; keep this in sync if the port handling changes.
+            sys.stdout.buffer.write(f"BZRLAN_READY {args.ws_port}\n".encode("ascii"))
+            sys.stdout.buffer.flush()
+        await stop_event.wait()
     finally:
         # Stop discovery before tearing down the advertised service. Also
-        # release these listeners if discovery/WS binding fails at startup.
+        # release every listener that did bind when a later one fails.
         if discovery_transport is not None:
             discovery_transport.close()
-        state.save_state(force=True)
-        autosave_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await autosave_task
+        if ws_listener is not None:
+            ws_listener.close()
+            with contextlib.suppress(Exception):
+                await ws_listener.wait_closed()
+        if autosave_task is not None:
+            state.save_state(force=True)
+            autosave_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await autosave_task
         if health_server:
             health_server.close()
             await health_server.wait_closed()
-        udp_transport.close()
-        if relay_transport is not None:
-            assert relay_protocol is not None
+        if udp_transport is not None:
+            udp_transport.close()
+        if relay_protocol is not None:
             relay_protocol.close()
         await asyncio.sleep(0.05)
         if relay_protocol is not None and relay_protocol.trace_writer is not None:
             relay_protocol.trace_writer.close()
         if protocol_trace is not None:
             protocol_trace.close()
+
+
+class StartupError(Exception):
+    """A listener could not be opened; the message is meant for the operator."""
+
+
+def describe_bind_error(what: str, host: str, port: int, exc: OSError) -> str:
+    code = getattr(exc, "winerror", None) or exc.errno
+    where = f"{what} port {port} on {host}"
+    if code in (errno.EADDRINUSE, 10048):
+        return (f"Cannot open {where}: it is already in use. Another copy of the server (or another program) "
+                "is probably running; stop it or choose a different port.")
+    if code in (errno.EACCES, 10013):
+        hint = (" Windows can reserve port ranges (check: netsh interface ipv4 show excludedportrange protocol=udp "
+                "and protocol=tcp)." if os.name == "nt" else
+                " Ports below 1024 need administrator rights on this system.")
+        return f"Cannot open {where}: permission denied.{hint} Choose a different port."
+    if code in (errno.EADDRNOTAVAIL, 10049):
+        return (f"Cannot open {where}: {host} is not an address of this computer. "
+                "Use 0.0.0.0 (all interfaces) or one of this PC's own IPs.")
+    return f"Cannot open {where}: {exc}"
+
+
+async def _bind_or_explain(what: str, host: str, port: int, awaitable: Any) -> Any:
+    try:
+        return await awaitable
+    except OSError as exc:
+        raise StartupError(describe_bind_error(what, host, port, exc)) from exc
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -7397,6 +7550,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--relay-trace-payloads", action="store_true",
                         help="Maximum diagnostic capture: copy complete opaque datagrams to --relay-trace as hex; default OFF, adds disk/CPU load")
     parser.add_argument("--health-host", default=DEFAULT_HEALTH_HOST, help=f"Health HTTP bind host (default: {DEFAULT_HEALTH_HOST})")
+    parser.add_argument("--health-detail-hosts", default=os.getenv("BZR_HEALTH_DETAIL_HOSTS", ""),
+                        help="Comma-separated IPs/CIDRs besides loopback that may read /access, /lobbies and /captures "
+                             "(player addresses and bans). Default: loopback only (env BZR_HEALTH_DETAIL_HOSTS)")
     parser.add_argument("--health-port", type=int, default=DEFAULT_HEALTH_PORT, help=f"Health HTTP bind port, 0 to disable (default: {DEFAULT_HEALTH_PORT})")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"Path to persistent state JSON (default: {DEFAULT_STATE_FILE})")
     parser.add_argument("--autosave-seconds", type=int, default=15, help="State autosave interval in seconds")
@@ -7470,6 +7626,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Logging verbosity",
     )
     args = parser.parse_args(argv)
+    if getattr(sys, "frozen", False) and not args.lan_managed:
+        # The packaged exe keeps its data next to itself (as its release notes
+        # say), not in whatever folder a terminal happened to start it from.
+        exe_dir = Path(sys.executable).resolve().parent
+        if args.state_file == DEFAULT_STATE_FILE:
+            args.state_file = str(exe_dir / DEFAULT_STATE_FILE)
+        if args.audit_log == DEFAULT_AUDIT_LOG:
+            args.audit_log = str(exe_dir / DEFAULT_AUDIT_LOG)
     if (args.relay_pair_port_start, args.relay_pair_port_end) != (0, 0) and not (
             1 <= args.relay_pair_port_start <= args.relay_pair_port_end <= 65535):
         parser.error("relay pair port bounds must both be 0 (ephemeral) or an inclusive range within 1-65535")
@@ -7499,10 +7663,20 @@ def launch_gui(argv: list[str]) -> bool:
         return False
     try:
         import server_gui
-    except ImportError:
-        if "--gui" in argv:
-            raise
-        return False
+    except ImportError as exc:
+        if "--gui" not in argv:
+            return False
+        if getattr(exc, "name", "") in ("tkinter", "_tkinter"):
+            if sys.platform.startswith("linux"):
+                how = "Install it with your package manager, e.g. sudo apt install python3-tk (Debian/Ubuntu), " \
+                      "sudo dnf install python3-tkinter (Fedora) or sudo pacman -S tk (Arch)."
+            elif sys.platform == "darwin":
+                how = "Use the Python installer from python.org (it includes Tk), or brew install python-tk."
+            else:
+                how = "Re-run the Python installer and enable \"tcl/tk and IDLE\"."
+            sys.exit(f"The launcher window needs Python's tkinter module, which this Python lacks. {how}\n"
+                     "The server itself runs without it: python server.py --help")
+        raise
     server_gui.main()
     return True
 
@@ -7515,6 +7689,9 @@ def main() -> None:
         asyncio.run(run_server(args))
     except KeyboardInterrupt:
         pass
+    except StartupError as exc:
+        logging.getLogger("bzr-dedicated").error("%s", exc)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

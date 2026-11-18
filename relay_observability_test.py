@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -47,7 +48,10 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(self.transport.sent, [(OPAQUE, B)])
 
     def test_delayed_duplicates_keep_arrival_context(self):
-        with patch("server.time.monotonic", return_value=1000.0):
+        # Fake times must follow the real clock: a fixed value earlier than the
+        # route's creation time made the route look expired on a freshly booted host.
+        base = time.monotonic()
+        with patch("server.time.monotonic", return_value=base):
             self.relay.set_impairment("delay=50,dup=100")
             self.relay.datagram_received(OPAQUE, A)
         decision = [r for r in self.rows() if "disposition" in r][0]
@@ -55,7 +59,7 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(len(self.scheduled), 2)
         self.relay.set_impairment("")
         self.relay.routes.clear()
-        with patch("server.time.monotonic", return_value=1000.075):
+        with patch("server.time.monotonic", return_value=base + 0.075):
             for delay, callback, args in self.scheduled:
                 self.assertAlmostEqual(delay, .05)
                 callback(*args)

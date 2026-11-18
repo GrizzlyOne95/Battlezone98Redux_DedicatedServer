@@ -2,3 +2,8 @@
 # line endings. Maintained source and all other research files retain Git's
 # normal whitespace validation.
 research/decomp_evidence_20260825/** whitespace=-blank-at-eol,-blank-at-eof
+
+# cmd.exe parses LF-only batch files unreliably; shell scripts must stay LF.
+*.bat text eol=crlf
+*.sh text eol=lf
+*.command text eol=lf

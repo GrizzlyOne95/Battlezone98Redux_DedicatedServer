@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from server import parse_args
-from server_gui import DEFAULTS, GUIDE, ServerGUI, access_badge, clean_host, mask_command, pair_port_notice, pending_texts, reachability_report
+from server_gui import DEFAULTS, GUIDE, ServerGUI, build_guide, split_extra_args, access_badge, clean_host, mask_command, pair_port_notice, pending_texts, reachability_report
 import server_gui
 
 
@@ -149,10 +149,37 @@ class ServerGUIHelperTests(unittest.TestCase):
         reachability_report(self.facts(status={}))  # missing keys must not raise
 
     def test_setup_guide_has_key_content(self):
-        text = "".join(t for _, t in GUIDE)
+        text = "".join(t for _, t in build_guide("win32"))
         for needle in ("1337", "1338-1369", "NEVER forward 8080", "Tailscale", "/bzrserver=ws://<LAN-IP>:1337/",
-                       "New-NetFirewallRule", "Test-NetConnection", "unmappedDropsTotal"):
+                       "New-NetFirewallRule", "Test-NetConnection", "unmappedDropsTotal", "ipconfig"):
             self.assertIn(needle, text)
+        self.assertTrue(GUIDE)
+
+    def test_setup_guide_matches_the_operating_system(self):
+        mac = "".join(t for _, t in build_guide("darwin"))
+        linux = "".join(t for _, t in build_guide("linux"))
+        for text in (mac, linux):
+            self.assertNotIn("New-NetFirewallRule", text)
+            self.assertIn("nc -vz <public-ip> 1337", text)
+            self.assertIn("NEVER forward 8080", text)
+        self.assertIn("ufw allow 1338:1369/udp", linux)
+        self.assertIn("firewall-cmd", linux)
+        self.assertIn("ipconfig getifaddr", mac)
+
+    def test_extra_args_strip_quotes_on_windows_and_keep_backslashes(self):
+        self.assertEqual(split_extra_args('--lan-name "My LAN" --state-file C:\\bzr\\s.json', windows=True),
+                         ["--lan-name", "My LAN", "--state-file", "C:\\bzr\\s.json"])
+        self.assertEqual(split_extra_args("--motd 'hi there'", windows=False), ["--motd", "hi there"])
+
+    def test_command_rejects_disabled_status_port_and_keeps_audit_beside_state(self):
+        with self.assertRaises(ValueError):
+            ServerGUI.build_command(gui({"health_port": 0}))
+        command = ServerGUI.build_command(gui({"state_file": str(Path("somewhere") / "state.json")}))
+        self.assertEqual(command[command.index("--audit-log") + 1], str(Path("somewhere") / "audit.log"))
+
+    def test_lan_discovery_checkbox_maps_to_flag(self):
+        self.assertNotIn("--lan-discovery", ServerGUI.build_command(gui()))
+        self.assertIn("--lan-discovery", ServerGUI.build_command(gui({"lan_discovery": True})))
 
     def test_mask_command_hides_admin_key(self):
         cmd = ["x", "--admin-key", "SECRET", "--admin-key=SECRET2", "--motd", "hi"]
