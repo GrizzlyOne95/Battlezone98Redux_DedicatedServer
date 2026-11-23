@@ -366,6 +366,15 @@ async def scenario_profile_matrix(args) -> None:
         created = last_of(msgs, "OnLobbyCreated")
         record(created["data"].get("success") is True, "stock profile: minimal CreateGame accepted")
         lid = created["data"]["id"]
+        # Stock exits the prior lobby only after entering the new one; that late
+        # exit must not pull the host out of the game lobby it just created.
+        xm = len(c.inbox)
+        await c.send("DoExitLobby", default_id)
+        msgs = await c.wait_for({"OnDoExitLobby"}, since=xm, timeout=4)
+        stale = last_of(msgs, "OnDoExitLobby")
+        record(stale["data"].get("success") is False,
+               "stock profile: stale DoExitLobby for the prior lobby keeps the new lobby",
+               json.dumps(stale["data"]))
         # stock sets the friendly name afterwards via SetLobbyData
         sm = len(c.inbox)
         await c.send("SetLobbyData", {"key": "name", "value": "~game~pub~*~StockRun"})

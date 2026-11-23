@@ -6566,6 +6566,29 @@ class BZRWebSocketServer:
             return
 
         if msg_type == "DoExitLobby":
+            # The stock client joins a new lobby first and only then exits the
+            # prior one ("OnLobbyEntered, leaving prior lobby B<old>"). By then
+            # handle_join_lobby has already moved the session, so an exit that
+            # names a different lobby is stale: answer it like an exit from no
+            # lobby instead of removing the session from the room it just joined.
+            if isinstance(content, dict):
+                exit_lid = content.get("id")
+            elif isinstance(content, bool):
+                exit_lid = None
+            else:
+                exit_lid = content
+            try:
+                exit_lid = None if exit_lid is None else int(exit_lid)
+            except (TypeError, ValueError, OverflowError):
+                exit_lid = None
+            if exit_lid is not None and exit_lid != session.current_lobby_id:
+                self.log.info(
+                    "Ignoring stale DoExitLobby for lobby %s from %s (now in %s)",
+                    exit_lid, session.user_id, session.current_lobby_id,
+                )
+                await self.send(ws, "OnDoExitLobby", {"success": False, "reason": "Not in lobby"})
+                await self.push_lobby_list(ws, msg_type="OnLobbyListChanged")
+                return
             await self.remove_from_lobby(session, send_exit_ack=True, ack_type="OnDoExitLobby")
             await self.push_lobby_list(ws, msg_type="OnLobbyListChanged")
             return
