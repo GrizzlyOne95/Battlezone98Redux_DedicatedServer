@@ -3033,6 +3033,9 @@ class UserSession:
     # Read-only loopback watcher (--allow-loopback-watchers): receives public
     # chat-room chat without joining rooms; never a lobby member.
     is_watcher: bool = False
+    # One-shot stock-client ticket notice already sent (runtime only).
+    ticket_notice_sent: bool = False
+    ticket_sent: bool = False  # a non-empty platform ticket arrived (never stored)
     # Chat flood bookkeeping (runtime only).
     chat_tokens: float | None = None
     chat_stamp: float = 0.0
@@ -3079,6 +3082,67 @@ def is_loopback_ip(ip: str) -> bool:
 
 def ticket_is_withheld(content: dict[str, Any]) -> bool:
     return any(str(content.get(key, "") or "").strip().lower() == TICKET_WITHHELD_MARKER for key in TICKET_FIELDS)
+
+
+STOCK_TICKET_NOTICE = ("Server notice: your game sent its Steam/GOG sign-in ticket to this server. It was discarded, "
+                       "but stock clients send it to any server they join. Install OpenShim to keep it private.")
+BOT_AUTHTYPE = "web"  # BZ1-GameWatcher and other non-game observers (docs/PROTOCOL_CONTRACT_MATRIX.md:60)
+
+
+class BotAllowlist:
+    """Operator file of per-bot keys, stored salted+hashed like community identity keys.
+
+    One entry per line: ``name:salthex:sha256hex`` (blank lines and ``#`` comments ignored).
+    Reloaded when the file's mtime changes, so operators add bots without restarting.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path).expanduser()
+        self._mtime: float | None = None
+        self._entries: list[tuple[str, str, str]] = []
+
+    @staticmethod
+    def make_entry(name: str, key: str) -> str:
+        salt = os.urandom(16).hex()
+        return f"{name}:{salt}:{AccessControl._key_digest(salt, key)}"
+
+    def _reload(self) -> None:
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            self._mtime, self._entries = None, []  # missing file: nobody is allowlisted
+            return
+        if mtime == self._mtime:
+            return
+        entries: list[tuple[str, str, str]] = []
+        try:
+            for raw in self.path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(":")
+                if len(parts) != 3:
+                    continue
+                name, salt, digest = (x.strip() for x in parts)
+                try:
+                    if len(bytes.fromhex(salt)) >= 16 and len(bytes.fromhex(digest)) == 32:
+                        entries.append((name, salt, digest))
+                except ValueError:
+                    continue
+        except OSError:
+            entries = []
+        self._mtime, self._entries = mtime, entries
+
+    def match(self, key: str) -> str | None:
+        """Name of the bot whose key this is, else None. Compares every entry in constant time."""
+        self._reload()
+        if not key:
+            return None
+        found: str | None = None
+        for name, salt, digest in self._entries:
+            if hmac.compare_digest(AccessControl._key_digest(salt, key), digest) and found is None:
+                found = name
+        return found
 
 
 def describe_authtype(authtype: str, ticket_withheld: bool) -> str:
@@ -5006,8 +5070,12 @@ class BZRWebSocketServer:
         hardening: HardeningConfig | None = None,
         redact_addresses: bool = False,
         allow_loopback_watchers: bool = False,
+        stock_ticket_notice: bool = True,
+        bot_allowlist: BotAllowlist | None = None,
     ):
         self.state = state
+        self.stock_ticket_notice = bool(stock_ticket_notice)
+        self.bot_allowlist = bot_allowlist
         self.log = logger
         self.hardening = hardening or HardeningConfig()
         self.motd = motd.strip()
@@ -5326,6 +5394,16 @@ class BZRWebSocketServer:
         if access.rate_limited(ip):
             await self._refuse_auth(ws, user_id, "too many login attempts", info, name)
             return False
+        if self.bot_allowlist is not None and str(info.get("authtype", "")).lower() == BOT_AUTHTYPE:
+            # Web/bot connections need an allowlisted per-bot key. Game clients
+            # (steam/gog) never reach this branch. The key is not logged.
+            bot = self.bot_allowlist.match(key)
+            if bot is None:
+                await self._refuse_auth(ws, user_id, "bot not allowlisted", info, name)
+                return False
+            info["bot"] = bot
+            key = ""  # a bot key is not an admin key; skip the admin_key_failure audit
+            self.state.audit.write("bot_admitted", id=user_id, bot=bot, ip=ip)
         if self.check_admin_key(ws, user_id, key, info):
             return True
         # Server-assigned ids are fresh per login and cannot impersonate anyone,
@@ -5362,6 +5440,23 @@ class BZRWebSocketServer:
             await self.send(ws, "OnChatMessage", {
                 "author": "SERVER", "speakerId": "SERVER", "text": text, "lobbyId": None,
                 "isChat": True, "time": utc_now_str(), "system": True,
+            })
+
+    async def _stock_ticket_notice(self, session: UserSession) -> None:
+        """Private whisper (same shape as a /t whisper) telling a stock client its ticket was sent.
+
+        Once per session; never includes the ticket. OpenShim clients (ticket withheld) get nothing.
+        """
+        if (not self.stock_ticket_notice or session.ticket_notice_sent or session.ticket_withheld
+                or not session.ticket_sent
+                or session.is_watcher or session.authtype.lower() not in ("steam", "gog")):
+            return
+        session.ticket_notice_sent = True
+        self.state.audit.write("stock_ticket_notice", id=session.user_id, authtype=session.authtype)
+        with contextlib.suppress(Exception):
+            await self.send(session.ws, "OnChatMessage", {
+                "author": "SERVER", "speakerId": "SERVER", "text": STOCK_TICKET_NOTICE,
+                "lobbyId": None, "isChat": True, "time": utc_now_str(), "private": True,
             })
 
     @staticmethod
@@ -5554,6 +5649,7 @@ class BZRWebSocketServer:
     def _inherit_session(self, session: UserSession, old: UserSession) -> None:
         session.current_lobby_id = old.current_lobby_id
         session.in_lounge = old.in_lounge
+        session.ticket_notice_sent = old.ticket_notice_sent
         session.extra_data = {**old.extra_data, **session.extra_data}
         lobby = self.state.lobbies.get(old.current_lobby_id) if old.current_lobby_id is not None else None
         if lobby and session.user_id in lobby.users:
@@ -5860,6 +5956,7 @@ class BZRWebSocketServer:
             authtype=authtype,
             client_version=info["clientVersion"],
             ticket_withheld=info["ticketWithheld"],
+            ticket_sent=any(str(content.get(k, "") or "").strip() for k in TICKET_FIELDS),
             key=str(content.get("key", "")),
             lan_addresses=[str(x) for x in content.get("lanAddresses", []) if isinstance(x, str)],
             wan_address=str(content.get("wanAddress", "")),
@@ -6546,6 +6643,8 @@ class BZRWebSocketServer:
             session.in_lounge = self._coerce_bool(content)
             await self.send(ws, "OnDoEnterLounge", {"success": True, "time": utc_now_str()})
             await self.push_lobby_list(ws, msg_type="OnLobbyListChanged")
+            if session.in_lounge:
+                await self._stock_ticket_notice(session)
             return
 
         if msg_type == "GetLobbyList":
@@ -7350,7 +7449,11 @@ async def run_server(args: argparse.Namespace) -> None:
         hardening=hardening,
         redact_addresses=args.redact_addresses,
         allow_loopback_watchers=args.allow_loopback_watchers,
+        stock_ticket_notice=args.stock_ticket_notice,
+        bot_allowlist=BotAllowlist(args.bot_allowlist_file) if args.require_bot_allowlist else None,
     )
+    if args.require_bot_allowlist:
+        logger.info("Bot allowlist required: authtype 'web' connections need a key listed in %s", args.bot_allowlist_file)
     if args.allow_loopback_watchers:
         logger.info("Loopback watchers allowed: local sessions may read public chat rooms without joining them")
     if args.redact_addresses:
@@ -7624,6 +7727,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Let local (loopback) sessions that send watcher:true in Authorization read every open public "
              "chat room without joining it. Watchers are read-only and left out of player counts.",
     )
+    parser.add_argument("--stock-ticket-notice", action=argparse.BooleanOptionalAction, default=True,
+                        help="Whisper once per session to stock Steam/GOG clients (ticket not withheld) that their "
+                             "sign-in ticket was sent and discarded (default on; --no-stock-ticket-notice disables)")
+    parser.add_argument("--require-bot-allowlist", action="store_true",
+                        help="Only let authtype 'web' bot connections in when their Authorization key matches an entry "
+                             "in --bot-allowlist-file. Game clients are unaffected. Off by default.")
+    parser.add_argument("--bot-allowlist-file", default=os.getenv("BZR_BOT_ALLOWLIST", "data/bot_allowlist.txt"),
+                        help="Hashed per-bot keys, one name:salt:hash per line (default: data/bot_allowlist.txt). "
+                             "Create an entry with --make-bot-key NAME")
+    parser.add_argument("--make-bot-key", metavar="NAME", default=None,
+                        help="Print a new random bot key and its allowlist line for NAME, then exit")
     parser.add_argument("--access-mode", choices=list(ACCESS_MODES), default=None,
                         help="Who may log in: open (default), approve (unknown players wait for operator approval), "
                              "allowlist (approved players only). Overrides the mode saved in the state file.")
@@ -7708,6 +7822,13 @@ def main() -> None:
     if launch_gui(sys.argv[1:]):
         return
     args = parse_args()
+    if args.make_bot_key is not None:
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", args.make_bot_key) or "bot"
+        key = os.urandom(24).hex()
+        print(f"Bot key (give to the bot as Authorization key, shown once): {key}")
+        print(f"Add this line to {args.bot_allowlist_file}:")
+        print(BotAllowlist.make_entry(name, key))
+        return
     try:
         asyncio.run(run_server(args))
     except KeyboardInterrupt:

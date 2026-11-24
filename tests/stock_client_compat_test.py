@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
 import json
 import socket
 import struct
@@ -1309,6 +1310,108 @@ async def unit_test_loopback_watcher() -> None:
     assert "isWatcher" not in _last_data(ws_x, "OnAuthorization")
 
 
+async def unit_test_ticket_notice_and_bot_allowlist() -> None:
+    """Stock-ticket whisper (once, default on, flag-off) and the optional bot allowlist."""
+    from server import STOCK_TICKET_NOTICE, BotAllowlist, AuditLog
+
+    SECRET_TICKET = "REALSTEAMTICKET0123456789ABCDEF"
+    BOT_KEY = "bot-key-0123456789abcdef0123456789abcdef"
+    tmp = Path(tempfile.mkdtemp(prefix="bzr-notice-"))
+    audit_path = tmp / "audit.log"
+    allow_file = tmp / "bots.txt"
+    allow_file.write_text("# bots\n" + BotAllowlist.make_entry("watcher_bot", BOT_KEY) + "\n", encoding="utf-8")
+
+    def auth(authtype: str, uid: str, **extra: Any) -> str:
+        content = {"authtype": authtype, "id": uid, "name": uid, "wanAddress": "203.0.113.50:40000"}
+        content.update(extra)
+        return json.dumps({"type": "Authorization", "content": content})
+
+    def notices(ws: FakeWS) -> list[dict[str, Any]]:
+        return [m["data"] for m in ws.by_type("OnChatMessage") if m["data"].get("text") == STOCK_TICKET_NOTICE]
+
+    def make(**kw: Any) -> tuple[ServerState, BZRWebSocketServer]:
+        state = ServerState(logging.getLogger("notice-test.state"), audit=AuditLog(str(audit_path)))
+        state.ensure_default_lobby()
+        return state, BZRWebSocketServer(state, logging.getLogger("notice-test.ws"), **kw)
+
+    lounge = json.dumps({"type": "DoEnterLounge", "content": True})
+
+    # Stock steam client with a real ticket: exactly one private whisper, at lounge entry.
+    state, server = make()
+    ws = FakeWS(50301)
+    await server.route_message(ws, auth("steam", "STOCK1", steamAppTicket=SECRET_TICKET))
+    assert not notices(ws), "nothing before the client can display it"
+    await server.route_message(ws, lounge)
+    await server.route_message(ws, lounge)
+    got = notices(ws)
+    assert len(got) == 1, got
+    assert got[0]["private"] is True and got[0]["speakerId"] == "SERVER" and got[0]["lobbyId"] is None
+    assert SECRET_TICKET not in json.dumps(ws.messages)
+    # GOG stock client too.
+    ws_g = FakeWS(50302)
+    await server.route_message(ws_g, auth("gog", "STOCK2", gogAppTicket=SECRET_TICKET))
+    await server.route_message(ws_g, lounge)
+    assert len(notices(ws_g)) == 1
+    ws_n = FakeWS(50306)  # gog without any ticket: nothing was sent, so no notice
+    await server.route_message(ws_n, auth("gog", "NOTICKET"))
+    await server.route_message(ws_n, lounge)
+    assert not notices(ws_n)
+    # OpenShim (withheld) and web clients get nothing.
+    ws_o = FakeWS(50303)
+    await server.route_message(ws_o, auth("steam", "OPEN1", steamAppTicket="withheld"))
+    await server.route_message(ws_o, lounge)
+    ws_b = FakeWS(50304)
+    await server.route_message(ws_b, auth("web", "0"))
+    await server.route_message(ws_b, lounge)
+    assert not notices(ws_o) and not notices(ws_b)
+    # Disable flag.
+    _, server_off = make(stock_ticket_notice=False)
+    ws_d = FakeWS(50305)
+    await server_off.route_message(ws_d, auth("steam", "STOCK3", steamAppTicket=SECRET_TICKET))
+    await server_off.route_message(ws_d, lounge)
+    assert not notices(ws_d)
+
+    # Allowlist off (default): web bots connect with or without a key.
+    for i, extra in enumerate(({}, {"key": "anything"})):
+        ws_x = FakeWS(50310 + i)
+        await server.route_message(ws_x, auth("web", "0", **extra))
+        assert _last_data(ws_x, "OnAuthorization")["success"] is True
+
+    # Allowlist on: unknown/keyless/wrong-key bots refused (4002 close), allowlisted bot and game clients connect.
+    class ClosingWS(FakeWS):
+        closed: int | None = None
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            self.closed = code
+
+    state_a, server_a = make(bot_allowlist=BotAllowlist(str(allow_file)))
+    for i, extra in enumerate(({}, {"key": "wrong-key-0123456789"})):
+        ws_u = ClosingWS(50320 + i)
+        await server_a.route_message(ws_u, auth("web", "0", **extra))
+        assert _last_data(ws_u, "OnAuthorization")["success"] is False
+        assert ws_u.closed == 4002 and not state_a.sessions_by_ws
+    ws_ok = FakeWS(50330)
+    await server_a.route_message(ws_ok, auth("web", "0", key=BOT_KEY))
+    assert _last_data(ws_ok, "OnAuthorization")["success"] is True
+    ws_game = FakeWS(50331)
+    await server_a.route_message(ws_game, auth("steam", "STOCK4", steamAppTicket=SECRET_TICKET))
+    assert _last_data(ws_game, "OnAuthorization")["success"] is True
+    # New bots are picked up without a restart.
+    allow_file.write_text(allow_file.read_text(encoding="utf-8") + BotAllowlist.make_entry("second", "second-key-0123456789abcdef") + "\n",
+                          encoding="utf-8")
+    os.utime(allow_file, (time.time() + 5, time.time() + 5))
+    ws_2 = FakeWS(50332)
+    await server_a.route_message(ws_2, auth("web", "0", key="second-key-0123456789abcdef"))
+    assert _last_data(ws_2, "OnAuthorization")["success"] is True
+
+    # No secret in the audit log.
+    audit_text = audit_path.read_text(encoding="utf-8")
+    assert "bot not allowlisted" in audit_text and "bot_admitted" in audit_text and "stock_ticket_notice" in audit_text
+    for secret in (SECRET_TICKET, BOT_KEY, "wrong-key-0123456789", "second-key-0123456789abcdef"):
+        assert secret not in audit_text, secret
+    assert BOT_KEY not in allow_file.read_text(encoding="utf-8")
+
+
 async def unit_test_opaque_relay() -> None:
     state = ServerState(logging.getLogger("relay-test.state"))
     fake_udp = FakeDatagramTransport(1339)
@@ -1373,6 +1476,9 @@ async def main_async_combined(args) -> int:
     print("== unit: loopback watcher ==")
     await unit_test_loopback_watcher()
     print("PASS - unit: loopback watcher")
+    print("== unit: stock ticket notice + bot allowlist ==")
+    await unit_test_ticket_notice_and_bot_allowlist()
+    print("PASS - unit: stock ticket notice + bot allowlist")
     print("== unit: opaque relay forwarding ==")
     await unit_test_opaque_relay()
     print("PASS - unit: opaque relay forwarding")
