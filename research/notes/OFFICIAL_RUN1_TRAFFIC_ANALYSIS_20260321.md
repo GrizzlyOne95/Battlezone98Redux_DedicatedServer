@@ -502,7 +502,7 @@ The first clear payoff from that comparison layer is the March 21
 This comparison layer is now also usable offline against the full March 21
 `BZLogger.txt` files via:
 
-- `python analyze_bzlogger_descriptors.py --pretty <Ian BZLogger.txt> <Kateri BZLogger.txt>`
+- `python tools/analyze_bzlogger_descriptors.py --pretty <Ian BZLogger.txt> <Kateri BZLogger.txt>`
 
 Across both March 21 logs, the extractor finds 83 `peer_object_descriptor`
 packets and splits them into the same payload families seen in the live summary
@@ -1106,7 +1106,7 @@ The new raw-pcap extractor in `analyze_pcapng_udp.py` now confirms that this is
 not just a `BZLogger.txt` artifact. Running:
 
 ```bash
-python analyze_pcapng_udp.py --object npscr111_scrap --window 4 --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
+python tools/analyze_pcapng_udp.py --object npscr111_scrap --window 4 --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
 ```
 
 on the March 21, 2026 captures shows the same local transition in both raw
@@ -1142,7 +1142,7 @@ The same raw-pcap tool now also supports multiple `--object` filters, which
 lets us compare the neighboring late-burst scrap objects directly:
 
 ```bash
-python analyze_pcapng_udp.py --object npscr29_scrap --object npscr110_scrap --object npscr111_scrap --object npscr112_scrap --window 4 --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
+python tools/analyze_pcapng_udp.py --object npscr29_scrap --object npscr110_scrap --object npscr111_scrap --object npscr112_scrap --window 4 --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
 ```
 
 That comparison narrows the result further. In both raw captures:
@@ -1177,7 +1177,7 @@ Widening the same raw-pcap comparison to the other subtype-family neighbors
 sharpens that result a bit more:
 
 ```bash
-python analyze_pcapng_udp.py --object npscr24_scrap --object npscr34_scrap --object npscr35_scrap --object npscr36_scrap --object npscr110_scrap --object npscr111_scrap --object npscr112_scrap --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
+python tools/analyze_pcapng_udp.py --object npscr24_scrap --object npscr34_scrap --object npscr35_scrap --object npscr36_scrap --object npscr110_scrap --object npscr111_scrap --object npscr112_scrap --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
 ```
 
 Across both raw captures:
@@ -1206,7 +1206,7 @@ So the current best interpretation improves again:
 The raw-pcap tool now also has a subtype-wide mode:
 
 ```bash
-python analyze_pcapng_udp.py --subtype 0x0e00 --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
+python tools/analyze_pcapng_udp.py --subtype 0x0e00 --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
 ```
 
 This gives the same conclusion in a more compact form. In both raw captures:
@@ -1236,7 +1236,7 @@ So the subtype-level raw-capture answer is now explicit:
 Running the same subtype-wide view across the neighboring scrap subtype ladder:
 
 ```bash
-python analyze_pcapng_udp.py --subtype 0x0c00 --subtype 0x0d00 --subtype 0x0e00 --subtype 0x0f00 --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
+python tools/analyze_pcapng_udp.py --subtype 0x0c00 --subtype 0x0d00 --subtype 0x0e00 --subtype 0x0f00 --pretty "...\game1.pcapng" "...\Kat_PC.pcapng"
 ```
 
 now gives the cleanest March 21, 2026 subtype comparison so far:
@@ -1303,7 +1303,7 @@ To make future run-to-run comparison easier, the raw-pcap tool now also supports
 compact consensus export:
 
 ```bash
-python analyze_pcapng_udp.py --subtype 0x0c00 --subtype 0x0d00 --subtype 0x0e00 --subtype 0x0f00 --consensus-only --pretty --write subtype_consensus_20260321.json "...\game1.pcapng" "...\Kat_PC.pcapng"
+python tools/analyze_pcapng_udp.py --subtype 0x0c00 --subtype 0x0d00 --subtype 0x0e00 --subtype 0x0f00 --consensus-only --pretty --write research/captures_20260321/subtype_consensus_20260321.json "...\game1.pcapng" "...\Kat_PC.pcapng"
 ```
 
 That command writes a minimal JSON artifact containing just:
@@ -1319,7 +1319,7 @@ better baseline artifact for future capture comparisons than a full packet dump.
 I also added a small comparison tool:
 
 ```bash
-python compare_capture_consensus.py --pretty subtype_consensus_20260321.json NEW_RUN_CONSENSUS.json
+python tools/compare_capture_consensus.py --pretty research/captures_20260321/subtype_consensus_20260321.json NEW_RUN_CONSENSUS.json
 ```
 
 That comparer focuses on:
@@ -1350,7 +1350,7 @@ So the workflow for the next run is now straightforward:
 The comparison tool now also supports human-readable markdown output:
 
 ```bash
-python compare_capture_consensus.py --markdown --write subtype_consensus_20260321_compare_self.md subtype_consensus_20260321.json subtype_consensus_20260321.json
+python tools/compare_capture_consensus.py --markdown --write research/captures_20260321/subtype_consensus_20260321_compare_self.md research/captures_20260321/subtype_consensus_20260321.json research/captures_20260321/subtype_consensus_20260321.json
 ```
 
 That mode produces a short report with:
@@ -1387,7 +1387,7 @@ basic regression protection too.
 I also added a one-command workflow wrapper:
 
 ```bash
-python run_capture_consensus_workflow.py --pretty --output-prefix march21_workflow --baseline-consensus subtype_consensus_20260321.json "...\game1.pcapng" "...\Kat_PC.pcapng"
+python tools/run_capture_consensus_workflow.py --pretty --output-prefix research/captures_20260321/march21_workflow --baseline-consensus research/captures_20260321/subtype_consensus_20260321.json "...\game1.pcapng" "...\Kat_PC.pcapng"
 ```
 
 By default that wrapper uses the current scrap subtype ladder:

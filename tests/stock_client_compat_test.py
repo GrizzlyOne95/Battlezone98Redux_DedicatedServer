@@ -14,8 +14,8 @@ asserts converged internal state at the end (no ghost users, lobbies, routes,
 or leaked sessions).
 
 Usage:
-  python stock_client_compat_test.py                # spawns its own server
-  python stock_client_compat_test.py --host 127.0.0.1 --ws-port 1337 ...
+  python tests/stock_client_compat_test.py                # spawns its own server
+  python tests/stock_client_compat_test.py --host 127.0.0.1 --ws-port 1337 ...
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ try:
 except Exception as exc:  # pragma: no cover
     raise SystemExit("Missing dependency 'websockets'. Install with: pip install -r requirements.txt") from exc
 
-HERE = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
 # Client harness
@@ -266,12 +265,12 @@ async def spawned_server(args, extra: tuple[str, ...] = ()):
     state_file = tmp / "state.json"
     ws_port, udp_port, http_port = free_port(), free_udp_port(), free_port()
     cmd = [
-        sys.executable, str(HERE / "server.py"),
+        sys.executable, str(ROOT / "server.py"),
         "--ws-port" if "--ws-port" else "--ws-port",  # placeholder replaced below
     ]
     # server.py exposes port flags through parse_args; build explicitly:
     cmd = [
-        sys.executable, str(HERE / "server.py"),
+        sys.executable, str(ROOT / "server.py"),
         "--ws-port", str(ws_port),
         "--udp-port", str(udp_port),
         # Free relay port too, so the suite runs beside a live server on 1339.
@@ -701,7 +700,7 @@ async def scenario_restart_persistence(args) -> None:
     state_file = tmp / "state.json"
     ws_port, udp_port, http_port = free_port(), free_udp_port(), free_port()
     base_cmd = [
-        sys.executable, str(HERE / "server.py"),
+        sys.executable, str(ROOT / "server.py"),
         "--ws-port", str(ws_port), "--udp-port", str(udp_port),
         "--relay-port", str(free_udp_port()),
         "--health-port", str(http_port), "--state-file", str(state_file),
@@ -1028,6 +1027,9 @@ async def main_async(args) -> int:
 # ---------------------------------------------------------------------------
 
 import logging  # noqa: F401 (used by unit-test loggers)
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
 
 from server import (
     BZRRelayProtocol,

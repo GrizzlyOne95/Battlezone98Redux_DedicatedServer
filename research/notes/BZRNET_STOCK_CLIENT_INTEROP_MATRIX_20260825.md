@@ -22,7 +22,7 @@ Either outcome closes the milestone: it either opens the implementation gate con
 - Two PCs on independent network paths preferred (same LAN acceptable for non-relay cells); stock clients: GOG 2.2.301 (`8D71F56C…`) + Steam build (post-settle).
 - Server under test: current `agent/bzrnet-interoperability-research` build; `/health`, `/protocol`, `/captures` endpoints live.
 - Client redirect: hosts file `battlezone98mp.webdev.rebellion.co.uk → <server>` or launch flags `/bzrserver=<ip> /bzrnetport=1338`; logging flags `/netpktlog /netlog=3 /bzrnetlog=3` per the Phase2 capture guide.
-- Capture: Wireshark both sides (no port filter beyond `tcp port 1337 or udp`), SHA-256 recorded, raw kept private; classification via [`research/bzrnet_packet_decoder.py`](research/bzrnet_packet_decoder.py) (never heuristic labels).
+- Capture: Wireshark both sides (no port filter beyond `tcp port 1337 or udp`), SHA-256 recorded, raw kept private; classification via [`research/bzrnet_packet_decoder.py`](../bzrnet_packet_decoder.py) (never heuristic labels).
 - Independent referee where available: GameWatcher observer profile.
 
 ## 3. Matrix

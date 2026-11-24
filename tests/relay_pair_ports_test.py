@@ -15,6 +15,11 @@ import logging
 import time
 from unittest.mock import patch
 
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
+
 from server import BZRRelayProtocol, BZRWebSocketServer, ServerState, UserSession
 
 

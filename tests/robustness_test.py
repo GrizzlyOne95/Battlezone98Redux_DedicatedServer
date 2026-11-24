@@ -3,7 +3,7 @@
 
 No ports are opened except one throwaway UDP socket for the bind-error message.
 
-    python robustness_test.py
+    python tests/robustness_test.py
 """
 
 from __future__ import annotations
@@ -18,6 +18,10 @@ import tempfile
 from types import SimpleNamespace
 from typing import Any
 import unittest
+
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
 
 import server
 from server import BZRWebSocketServer, ServerState, describe_bind_error, ip_in_networks, serve_health_http

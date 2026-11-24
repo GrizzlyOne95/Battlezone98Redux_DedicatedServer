@@ -10,6 +10,10 @@ import unittest
 from unittest.mock import patch
 
 from relay_impairment_test import A, B, FakeState, make_relay
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
+
 from server import BZRRelayProtocol, RelayTraceWriter, UserSession
 
 

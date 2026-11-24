@@ -7,6 +7,10 @@ import struct
 from pathlib import Path
 from typing import Any
 
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 from server import decode_bzr_udp_datagram, summarize_protocol_history
 
 

@@ -15,7 +15,7 @@ Modes (composable):
   p2p          : DoP2PConnect/DoP2PRoute signal churn
 
 Usage:
-  python soak_test.py --clients 40 --seconds 60 --modes idle,lobby_churn,reconnect
+  python tests/soak_test.py --clients 40 --seconds 60 --modes idle,lobby_churn,reconnect
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ try:
 except Exception as exc:  # pragma: no cover
     raise SystemExit("pip install websockets") from exc
 
-HERE = Path(__file__).parent
 
 
 def free_port() -> int:
@@ -242,7 +241,7 @@ async def run(args) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="bzr_soak_"))
     ws_port, udp_port, http_port = free_port(), free_udp_port(), free_port()
     cmd = [
-        sys.executable, str(HERE / "server.py"),
+        sys.executable, str(ROOT / "server.py"),
         "--ws-port", str(ws_port), "--udp-port", str(udp_port),
         "--health-port", str(http_port), "--state-file", str(tmp / "state.json"),
         "--autosave-seconds", "5",

@@ -22,7 +22,7 @@ behavior:
       back verbatim (no generated replacement).
 
 Run:
-  python protocol_parity_test.py
+  python tests/protocol_parity_test.py
 """
 
 from __future__ import annotations
@@ -32,6 +32,10 @@ import json
 import logging
 import sys
 from typing import Any
+
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
 
 from server import BZRWebSocketServer, ServerState, UserSession
 

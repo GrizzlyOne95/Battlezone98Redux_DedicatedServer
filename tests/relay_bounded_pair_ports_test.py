@@ -21,6 +21,9 @@ import unittest
 from unittest.mock import patch
 
 from relay_pair_ports_test import FakeWS, Peer
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
+
 from server import BZRRelayProtocol, BZRWebSocketServer, RelayTraceWriter, ServerState, UserSession, parse_args
 
 

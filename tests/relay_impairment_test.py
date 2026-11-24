@@ -10,7 +10,7 @@ Covers:
   6. the relay hot path: drops, scheduled sends, trace records, live set/clear,
      and byte-exact forwarding once cleared.
 
-Run: python relay_impairment_test.py
+Run: python tests/relay_impairment_test.py
 Exits non-zero on any failure. Uses documentation-range IPs only.
 """
 
@@ -23,6 +23,10 @@ import struct
 import sys
 import tempfile
 from typing import Any
+
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
 
 from relay_impairment import ImpairmentSpec, RelayImpairment, parse_spec
 from server import BZRRelayProtocol, RelayTraceWriter, UserSession

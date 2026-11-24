@@ -3,9 +3,9 @@
 Smoke tests for the BZR dedicated-server compatibility shim.
 
 Usage:
-  python smoke_test.py
-  python smoke_test.py --host 192.168.1.50 --ws-port 1337 --udp-port 1338
-  python smoke_test.py --skip-health
+  python tests/smoke_test.py
+  python tests/smoke_test.py --host 192.168.1.50 --ws-port 1337 --udp-port 1338
+  python tests/smoke_test.py --skip-health
 """
 
 from __future__ import annotations
@@ -19,6 +19,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
 
 from analyze_pcapng_udp import build_consensus_only_summary
 from compare_capture_consensus import compare_consensus, render_markdown_report

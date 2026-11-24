@@ -8,7 +8,7 @@ Covers:
   4. relay hot-path drop/forward behavior with instrumentation ON;
   5. forensic trace schema (required fields, payload bytes never present).
 
-Run: python relay_faultinject_test.py
+Run: python tests/relay_faultinject_test.py
 Exits non-zero on any failure. Uses documentation-range IPs only.
 """
 
@@ -21,6 +21,10 @@ import struct
 import sys
 import tempfile
 from typing import Any
+
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
 
 from server import (
     BZR_TRANSPORT_HEADER_BYTES,

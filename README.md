@@ -104,16 +104,16 @@ The official relay association protocol and strict/symmetric-NAT behavior are no
 With the server running, check its local status at `http://127.0.0.1:8080/health` and run:
 
 ```bash
-python smoke_test.py
+python tests/smoke_test.py
 ```
 
-Additional checks: `python stock_client_compat_test.py`, `python protocol_parity_test.py`, `python robustness_test.py`, and `python server_gui_test.py`. The Tests workflow runs these on Windows, macOS and Linux. `python lan_discovery_test.py` is a manual test (no CI runs it). These do not replace testing with real players across different networks.
+Additional checks: `python tests/stock_client_compat_test.py`, `python tests/protocol_parity_test.py`, `python tests/robustness_test.py`, and `python tests/server_gui_test.py`. The Tests workflow runs these on Windows, macOS and Linux. `python tests/lan_discovery_test.py` is a manual test (no CI runs it). These do not replace testing with real players across different networks.
 
 More detail lives in dedicated documents:
 
 - [LAN and Campaign Reimagined co-op guide](docs/LAN_COOP.md)
-- [BZRNet architecture, ports, and protocol behavior](BZRNET_MULTIPLAYER_SERVER_GUIDE.md)
-- [Protocol message contract and evidence](PROTOCOL_CONTRACT_MATRIX.md)
-- [Community failover architecture and remaining gaps](COMMUNITY_FAILOVER_PLAN.md)
+- [BZRNet architecture, ports, and protocol behavior](docs/BZRNET_MULTIPLAYER_SERVER_GUIDE.md)
+- [Protocol message contract and evidence](docs/PROTOCOL_CONTRACT_MATRIX.md)
+- [Community failover architecture and remaining gaps](research/notes/COMMUNITY_FAILOVER_PLAN.md)
 
 Licensed under [MIT](LICENSE).

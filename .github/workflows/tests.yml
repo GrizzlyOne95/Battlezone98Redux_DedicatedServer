@@ -47,12 +47,12 @@ jobs:
                    native_network_health_test.py network_capture_test.py relay_impairment_test.py \
                    relay_faultinject_test.py; do
             echo "::group::$t"
-            python "$t"
+            python "tests/$t"
             echo "::endgroup::"
           done
 
       - name: Launcher settings tests
-        run: python server_gui_test.py
+        run: python tests/server_gui_test.py
 
       - name: Live server tests
         run: |
@@ -65,8 +65,8 @@ jobs:
             sleep 1
           done
           status=0
-          python smoke_test.py || status=$?
-          python stock_client_compat_test.py || status=$?
+          python tests/smoke_test.py || status=$?
+          python tests/stock_client_compat_test.py || status=$?
           kill $SERVER_PID || true
           if [ $status -ne 0 ]; then cat ci-data/server.log; fi
           exit $status

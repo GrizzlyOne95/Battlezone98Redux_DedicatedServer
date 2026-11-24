@@ -73,7 +73,7 @@ Privacy: raw captures, tickets, addresses, and stable identifiers were used **on
 
 ## 4. Complete WS message matrix
 
-The authoritative machine-readable version is [`protocol_contract.json`](protocol_contract.json); the human-readable disagreement table is [`PROTOCOL_CONTRACT_MATRIX.md`](PROTOCOL_CONTRACT_MATRIX.md). Summary of the most decision-relevant rows:
+The authoritative machine-readable version is [`protocol_contract.json`](../../tools/protocol_contract.json); the human-readable disagreement table is [`PROTOCOL_CONTRACT_MATRIX.md`](../../docs/PROTOCOL_CONTRACT_MATRIX.md). Summary of the most decision-relevant rows:
 
 | Message | Direction | Stock (pcap/decomp) | Official web JS | Official live 2026-08-24 | LobbyMonitor | GameWatcher | Community server | Confidence |
 |---|---|---|---|---|---|---|---|---|
