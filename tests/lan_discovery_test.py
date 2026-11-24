@@ -14,13 +14,15 @@ import sys
 import tempfile
 import unittest
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
+
 from lan_discovery import (
     LanDiscoveryProtocol, QUERY_MAGIC, QUERY_SIZE, REPLY_MAGIC,
     discovery_reply, encoded_name, local_source,
 )
 from server import parse_args
 
-HERE = Path(__file__).resolve().parent
 NONCE = b"\x00\xffNONCE!"
 QUERY = QUERY_MAGIC + NONCE + bytes(80)
 
@@ -108,7 +110,7 @@ class ManagedTests(unittest.IsolatedAsyncioTestCase):
         port = unused_port(socket.SOCK_STREAM)
         udp = unused_port(socket.SOCK_DGRAM)
         helper = os.getenv("BZR_LAN_HELPER_EXE")
-        command = [helper] if helper else [sys.executable, str(HERE / "server.py")]
+        command = [helper] if helper else [sys.executable, str(ROOT / "server.py")]
         process = await asyncio.create_subprocess_exec(
             *command,
             "--ws-host", "127.0.0.1", "--ws-port", str(port),

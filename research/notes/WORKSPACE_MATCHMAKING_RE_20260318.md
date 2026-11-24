@@ -424,7 +424,7 @@ It is already a valid phase-1 failover prototype.
 2. Start:
    - `python server.py`
 3. Validate locally:
-   - `python smoke_test.py --host 127.0.0.1`
+   - `python tests/smoke_test.py --host 127.0.0.1`
 
 ### Phase 2: Open The Required Ports
 

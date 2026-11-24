@@ -7,7 +7,7 @@ expiry, mute, admin-key transport policy, ticket-withheld marker, and that the
 audit log never contains credentials.
 
 Usage:
-  python admin_hardening_test.py
+  python tests/admin_hardening_test.py
 """
 
 from __future__ import annotations
@@ -20,6 +20,9 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
 
 import server
 from server import (

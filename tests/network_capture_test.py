@@ -11,6 +11,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
+
 from server import (BZRRelayProtocol, MAX_PROTOCOL_HISTORY, ProtocolTraceWriter,
                     RelayTraceWriter, ServerState, UserSession)
 

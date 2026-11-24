@@ -2,7 +2,7 @@
 
 How Redux multiplayer works and what it takes to run a compatible server.
 Consolidates the capture evidence (`PROTOCOL_CONTRACT_MATRIX.md`,
-`BZRNET_TRANSPORT_HEADER_20260812.md`, live captures through 2026-08-25),
+`research/notes/BZRNET_TRANSPORT_HEADER_20260812.md`, live captures through 2026-08-25),
 the OpenShim instrumentation notes, and the behavior implemented in
 `server.py`. Confidence is stated per section; unknowns are marked as such.
 
@@ -97,7 +97,7 @@ admin verbs). Server→client: `OnAuthorization`, `OnWhitelistUpdated`,
 ## 6. Authorization edge behavior (upstream parity, 2026-08-25)
 
 Implemented in `handle_authorization` / `route_message` / `handler`,
-covered by `protocol_parity_test.py` E4–E8:
+covered by `tests/protocol_parity_test.py` E4–E8:
 
 - Pre-auth verbs, unknown verbs, and binary-adjacent noise before
   `Authorization` produce **zero** frames (previously the server replied
@@ -126,7 +126,7 @@ hardening" for the options.
 
 ## 7. UDP details
 
-18-byte big-endian header (`BZRNET_TRANSPORT_HEADER_20260812.md`): flags
+18-byte big-endian header (`research/notes/BZRNET_TRANSPORT_HEADER_20260812.md`): flags
 `0x40` final / `0x80` reliable / `0xC0` both; kind `0` gameplay/keepalive,
 `2` discovery, `3` offer/probe, `4` accept, `5` confirmation, `6`
 endpoint-update, `7` ack; unix-ms timestamp; send-seq; ack-seq.
@@ -144,10 +144,10 @@ classifies discovery traffic (`DISCOVERY_KIND=0x2`).
    merge `docker-compose.pair-ports.yml` with the base file. A fully relayed `n`-player lobby needs
    `n*(n-1)/2` ports; the 30-port example is shared across all active lobbies. Ephemeral `0`/`0`
    bounds remain available for private loopback tests. See `README.md` for failure/capacity details.
-2. Validate without the game: `python smoke_test.py --host 127.0.0.1`
+2. Validate without the game: `python tests/smoke_test.py --host 127.0.0.1`
    (WS/UDP/decoder/HTTP/protocol/capture checks),
-   `python protocol_parity_test.py` (edge parity E1–E8),
-   `python stock_client_compat_test.py` (45-check stock profile).
+   `python tests/protocol_parity_test.py` (edge parity E1–E8),
+   `python tests/stock_client_compat_test.py` (45-check stock profile).
 3. Validate with a real client: `Battlezone_LobbyMonitor` against
    `127.0.0.1:1337`, or the game with `net.ini [OpenShimSocket]
    MatchmakingRedirectAddress=<host>` (hostname/IP only, stock ports
@@ -167,12 +167,12 @@ classifies discovery traffic (`DISCOVERY_KIND=0x2`).
 
 ## 10. Tooling map
 
-- `server.py` — the server. `probe.py` — UDP probe client/fake-server
-  for RE work. `smoke_test.py`, `protocol_parity_test.py`,
-  `stock_client_compat_test.py`, `relay_faultinject_test.py`,
-  `soak_test.py`, `oracle_drift_check.py` — validation. `build/run/render
-  _protocol_contract.py` + `protocol_contract.json` — generated contract.
-  `run_capture_consensus_workflow.py`, `compare_capture_consensus.py` —
+- `server.py` — the server. `tools/probe.py` — UDP probe client/fake-server
+  for RE work. `tests/smoke_test.py`, `tests/protocol_parity_test.py`,
+  `tests/stock_client_compat_test.py`, `tests/relay_faultinject_test.py`,
+  `tests/soak_test.py`, `tools/oracle_drift_check.py` — validation. `build/run/render
+  _protocol_contract.py` + `tools/protocol_contract.json` — generated contract.
+  `tools/run_capture_consensus_workflow.py`, `tools/compare_capture_consensus.py` —
   capture workflows. OpenShim side: `bzrnet_capture_windows.ps1`
   (Start/Mark/Stop, `-RelayCapture`, `-PrivateForensic`, `-AllUdp`) and
   the `analyze/align/compare/validate/correlate/session_report` scripts.

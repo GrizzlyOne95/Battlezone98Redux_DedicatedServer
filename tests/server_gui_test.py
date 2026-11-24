@@ -12,6 +12,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT)]
+
 from server import parse_args
 from server_gui import DEFAULTS, GUIDE, ServerGUI, build_guide, split_extra_args, access_badge, clean_host, mask_command, pair_port_notice, pending_texts, reachability_report
 import server_gui

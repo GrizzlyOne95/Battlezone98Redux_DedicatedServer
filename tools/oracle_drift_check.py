@@ -15,8 +15,8 @@ Philosophy (per the interoperability work order):
     failure. Hard failures are reserved for the local compat suite.
 
 Usage:
-  python oracle_drift_check.py --target official
-  python oracle_drift_check.py --target community --host 127.0.0.1 --ws-port 1337 --udp-port 1338
+  python tools/oracle_drift_check.py --target official
+  python tools/oracle_drift_check.py --target community --host 127.0.0.1 --ws-port 1337 --udp-port 1338
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit("pip install websockets") from exc
 
 HERE = Path(__file__).parent
-BASELINE = HERE / "fixtures" / "official_live_20260824.json"
+BASELINE = HERE.parent / "fixtures" / "official_live_20260824.json"
 
 OFFICIAL_HOST = "battlezone98mp.webdev.rebellion.co.uk"
 

@@ -7,7 +7,7 @@ Layers covered:
   3. In-match game payload opcodes (2-char ASCII tags dispatched natively by
      the Net::OnP2PReceived-equivalent dispatcher at VA 0x570500 in GOG 2.2.301).
 
-Evidence provenance: BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md (this repo).
+Evidence provenance: research/notes/BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md (this repo).
 Byte order is big-endian for all transport header fields; game-payload
 multi-byte fields are little-endian unless a specific opcode says otherwise.
 

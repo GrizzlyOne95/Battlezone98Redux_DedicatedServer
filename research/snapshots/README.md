@@ -1,6 +1,6 @@
 # BZRNet Research Artifacts
 
-Protocol research outputs accompanying `BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md`.
+Protocol research outputs accompanying `research/notes/BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md`.
 
 | Path | Contents |
 |---|---|
@@ -11,7 +11,7 @@ Protocol research outputs accompanying `BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md`
 
 ## Evidence standards
 
-1. Raw captures containing tickets, public IPs, Steam IDs, or stable identifiers stay local and are **never committed**. Committed artifacts must be synthetic or structurally sanitized (documentation-range values only), per the rule set established in `BZRNET_PHASE2_CAPTURE_GUIDE_20260716.md`.
+1. Raw captures containing tickets, public IPs, Steam IDs, or stable identifiers stay local and are **never committed**. Committed artifacts must be synthetic or structurally sanitized (documentation-range values only), per the rule set established in `docs/BZRNET_PHASE2_CAPTURE_GUIDE_20260716.md`.
 2. Every protocol claim carries a label — PROVEN-native, PROVEN-capture, CORRELATED, INFERRED, UNKNOWN — as defined in the archaeology report.
 3. PDB-derived names/addresses are advisory; native anchors in this directory come from decompiling the authority binary itself and are recorded as VAs so future builds can re-validate prologue bytes at each site.
 4. The decoder self-test uses only already-published sanitized capture bytes; extend it whenever a new message family is proven.

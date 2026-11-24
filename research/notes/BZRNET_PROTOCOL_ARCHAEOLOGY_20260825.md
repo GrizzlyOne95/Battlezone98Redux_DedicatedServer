@@ -3,7 +3,7 @@
 **Date:** 2026-08-25
 **Branch:** `agent/bzrnet-interoperability-research`
 **Binary authority:** Battlezone 98 Redux **GOG 2.2.301**, SHA-256 `8D71F56C1314E69A8AD38F4EEAF20A8FF825965A84CF196E5F77EA4CC3377413` (clean, unpacked; runtime memory verified byte-identical to disk on 2026-08-20 via OpenShim runtime capture, base `0x400000`, no relocation delta).
-**Companion artifacts:** [`research/bzrnet_message_map.csv`](research/bzrnet_message_map.csv) (machine-readable), [`research/bzrnet_packet_decoder.py`](research/bzrnet_packet_decoder.py) (deterministic decoder + self-test), [`research/decomp_evidence_20260825/`](research/decomp_evidence_20260825/) (46 decompiled native functions cited below).
+**Companion artifacts:** [`research/bzrnet_message_map.csv`](../bzrnet_message_map.csv) (machine-readable), [`research/bzrnet_packet_decoder.py`](../bzrnet_packet_decoder.py) (deterministic decoder + self-test), [`research/decomp_evidence_20260825/`](../decomp_evidence_20260825/) (46 decompiled native functions cited below).
 
 **Phase status:** this document closes **Protocol Archaeology Phase 1** (commit `67e4689` + layering addendum). Generic packet archaeology is frozen; the successor milestone is **"Stock Client Interoperability & Fault-Injection Matrix"** — defined in [`BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md`](BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md). Remaining unknowns (§14) are to be resolved experimentally, not by another broad decompile sweep.
 
@@ -168,7 +168,7 @@ Captured 37-byte packets `40 03|04|05 …` carrying NUL-terminated ASCII Steam I
 
 ## 5. Message taxonomy
 
-Full table: [`research/bzrnet_message_map.csv`](research/bzrnet_message_map.csv). Research IDs are stable wire tags (the two ASCII chars themselves) — no MSG_nn aliases needed anymore; promotion is complete for the previously heuristic markers:
+Full table: [`research/bzrnet_message_map.csv`](../bzrnet_message_map.csv). Research IDs are stable wire tags (the two ASCII chars themselves) — no MSG_nn aliases needed anymore; promotion is complete for the previously heuristic markers:
 
 | Captured marker (Mar 21 heuristic) | Native verdict (this pass) | Confidence change |
 |---|---|---|

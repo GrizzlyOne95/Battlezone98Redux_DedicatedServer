@@ -19,7 +19,7 @@ This repository now contains a practical BZR failover stack:
 ## Failover Cutover Checklist
 
 1. Start server (`python server.py` or `docker compose up -d --build`).
-2. Validate using `python smoke_test.py --host <server-ip>`.
+2. Validate using `python tests/smoke_test.py --host <server-ip>`.
 3. Update DNS/hosts for `battlezone98mp.webdev.rebellion.co.uk` to your failover host.
 4. Ensure firewall/NAT forwards:
    - TCP 1337

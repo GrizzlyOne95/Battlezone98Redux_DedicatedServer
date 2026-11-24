@@ -99,7 +99,7 @@ scan's replies cannot populate a later scan with a new nonce.
 
 ## Validation boundary
 
-`python lan_discovery_test.py -v` checks malformed queries, local-source ranges,
+`python tests/lan_discovery_test.py -v` checks malformed queries, local-source ranges,
 nonce/port encoding, response size, rate/cache bounds, defaults/CLI guards,
 actual loopback UDP and WebSocket readiness, stdin/EOF shutdown, released socket
 ports, and discovery bind failure. These are host tests. Physical two-PC

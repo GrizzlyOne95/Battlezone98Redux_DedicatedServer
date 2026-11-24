@@ -4124,7 +4124,7 @@ class RelayRoute:
 def _is_reliable_nonfinal_fragment(data: bytes) -> bool:
     """True when a datagram is a reliable BZRNet fragment that is not the final one.
 
-    PROVEN-native flag semantics (BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md Â§4.1):
+    PROVEN-native flag semantics (research/notes/BZRNET_PROTOCOL_ARCHAEOLOGY_20260825.md Â§4.1):
     bit 0x80 marks reliable traffic; bit 0x40 is added only on the final
     fragment (or on single-packet unreliable sends).  A bare 0x80 therefore
     identifies a middle reliable fragment.  This predicate is the ONLY packet
@@ -4140,7 +4140,7 @@ def _is_reliable_nonfinal_fragment(data: bytes) -> bool:
 class RelayFaultInjector:
     """Opt-in Phase-2 impairment hook for the UDP relay (default OFF).
 
-    Contract: BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md Â§4.  The single
+    Contract: research/notes/BZRNET_STOCK_CLIENT_INTEROP_MATRIX_20260825.md Â§4.  The single
     supported mode drops the k-th bare-0x80 (reliable, non-final) datagram per
     directed peer stream.  It never rewrites, reorders, reassembles, or
     retransmits anything; when inactive it is not consulted at all so the hot

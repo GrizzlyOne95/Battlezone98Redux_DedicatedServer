@@ -4,7 +4,7 @@ Dedicated-server and protocol research for Battlezone 98 Redux BZRNet — WebSoc
 
 ## Local Environment
 - Sibling Battlezone repos normally live under `%USERPROFILE%\Documents\GIT`. Prefer local sibling source for reference when present; verify its `origin` before editing because historical folder names may differ.
-- Primary entry: `server.py`; quick check: `python smoke_test.py`; capture helpers: `probe.py`.
+- Primary entry: `server.py`; quick check: `python tests/smoke_test.py`; capture helpers: `tools/probe.py`.
 - State: `data/server_state.json` (lobby metadata); do not commit live state or secrets.
 - This is a reference/tooling repo under `%USERPROFILE%\Documents\GIT` — not a default edit target for Redux native work unless explicitly requested.
 
@@ -18,9 +18,9 @@ Dedicated-server and protocol research for Battlezone 98 Redux BZRNet — WebSoc
 - Do not commit secrets (`.env`, Steam API keys, admin keys), live `data/server_state.json`, raw captures with real IPs/tokens, or transient `__pycache__`.
 
 ## Task-Specific Guidance
-- Protocol work: keep fixtures sanitized — use RFC 5737 / RFC 3849 blocks for addresses; see `PROTOCOL_CONTRACT_MATRIX.md` and `API.Tests/Fixtures/Protocol/` conventions from `BZ1-GameWatcher` when cross-referencing.
-- Do not deserialise opaque relay payloads (`7a75`, `0x5f` etc.) in the relay path — forward byte-for-byte (see `BZRNET_MULTIPLAYER_SERVER_GUIDE.md`).
-- For capture/consensus workflows, prefer `run_capture_consensus_workflow.py` / `protocol_parity_test.py` over manual pcap edits.
+- Protocol work: keep fixtures sanitized — use RFC 5737 / RFC 3849 blocks for addresses; see `docs/PROTOCOL_CONTRACT_MATRIX.md` and `API.Tests/Fixtures/Protocol/` conventions from `BZ1-GameWatcher` when cross-referencing.
+- Do not deserialise opaque relay payloads (`7a75`, `0x5f` etc.) in the relay path — forward byte-for-byte (see `docs/BZRNET_MULTIPLAYER_SERVER_GUIDE.md`).
+- For capture/consensus workflows, prefer `tools/run_capture_consensus_workflow.py` / `tests/protocol_parity_test.py` over manual pcap edits.
 
 ## GPT-6 Astra Optimization (Prompting Best Practices)
 
@@ -39,7 +39,7 @@ Before asking the user clarifying questions, you should complete the work that i
 Do not introduce unsolicited warnings, disclaimers, approval flows, or safety/compliance checklists due to hypothetical risk.
 
 **Repo-specific application (DedicatedServer):**
-- **Reversible without approval:** local reads, `git status -sb` / diff inspection, editing on `agent/*` branches, local validation (`python smoke_test.py`, `python stock_client_compat_test.py`, `python protocol_parity_test.py` dry-runs), creating isolated worktrees, spinning `python server.py` locally on `127.0.0.1` with ephemeral `data/`.
+- **Reversible without approval:** local reads, `git status -sb` / diff inspection, editing on `agent/*` branches, local validation (`python tests/smoke_test.py`, `python tests/stock_client_compat_test.py`, `python tests/protocol_parity_test.py` dry-runs), creating isolated worktrees, spinning `python server.py` locally on `127.0.0.1` with ephemeral `data/`.
 - **Irreversible — requires explicit user instruction:** `git push` to protected `main`, PR merges, releases/tags, publishing images to GHCR, deploying to `battlezone98mp.webdev.rebellion.co.uk` failover / DNS cutover, opening/forwarding public ports `1337/1338/1339/8080`, running against production lobby with real player traffic, force-push / history rewrite. Prepare the concrete payload first; approval is the final step.
 
 ### Instruction Following — Precedence and Transparency
@@ -66,7 +66,7 @@ If at any point you can parallelize work by delegating tasks to another agent (n
 
 Messages that you send to other agents and your final answer may be read by a human, so ensure they are legible. Always put proper spaces between words and/or numbers.
 
-Repo hint: parallelize across `server.py` / `probe.py` / `research/` scans, capture analysis, and independent validation (`smoke_test.py`, `stock_client_compat_test.py`, `protocol_parity_test.py`).
+Repo hint: parallelize across `server.py` / `tools/probe.py` / `research/` scans, capture analysis, and independent validation (`tests/smoke_test.py`, `tests/stock_client_compat_test.py`, `tests/protocol_parity_test.py`).
 
 ### Testing and Verification — Calibrated Thoroughness
 
@@ -74,7 +74,7 @@ Do not write tests for reversible, low-impact changes that mirror the implementa
 
 Run tests appropriate to the change and complete required checks. Once those pass, broaden or repeat testing only when new changes, failures, or unresolved concerns justify it; otherwise, continue toward completing the task.
 
-Repo mapping: for small docs or single-handler edits use `smoke_test.py` + relevant parity test. Reserve full capture-consensus and live `Battlezone_LobbyMonitor` validation for relay/handshake or WebSocket surface changes.
+Repo mapping: for small docs or single-handler edits use `tests/smoke_test.py` + relevant parity test. Reserve full capture-consensus and live `Battlezone_LobbyMonitor` validation for relay/handshake or WebSocket surface changes.
 
 ### Model and API Notes (for external callers)
 

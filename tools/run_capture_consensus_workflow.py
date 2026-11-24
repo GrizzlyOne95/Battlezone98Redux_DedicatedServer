@@ -4,6 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 from analyze_pcapng_udp import build_consensus_only_summary, build_targeted_summary
 from compare_capture_consensus import compare_consensus, render_markdown_report
 
